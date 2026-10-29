@@ -1,0 +1,18 @@
+name: olos-admin-homolog-simulated
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: olos_admin_homolog
+      POSTGRES_USER: homolog
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?private homologation password required}
+    ports: ["127.0.0.1:15434:5432"]
+    volumes: ["database:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U homolog -d olos_admin_homolog"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    restart: "no"
+volumes:
+  database:

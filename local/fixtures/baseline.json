@@ -1,0 +1,7 @@
+{
+ "baseline":"2026-10-28T12:00:00Z",
+ "baselineEvidence":"Synthetic fixture; not an OLOS production boundary",
+ "identityEvidence":"Synthetic IDs unique within this fixture source only",
+ "contractOrigin":"fixture",
+ "sampleFile":"sample.json"
+}

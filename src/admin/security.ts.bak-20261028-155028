@@ -1,0 +1,51 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { WorkerError } from '../errors.js';
+
+export function authorizedUsers(raw: string): string[] {
+  let users: unknown;
+  try { users = JSON.parse(raw); } catch { throw new WorkerError('ADMIN_OLOS_USERS_INVALID'); }
+  if (!Array.isArray(users) || !users.length || users.length > 100 || users.some(u =>
+    typeof u !== 'string' || !u || u.length > 128 || /[\s\x00-\x1f\x7f]/.test(u)) ||
+    new Set(users).size !== users.length) throw new WorkerError('ADMIN_OLOS_USERS_INVALID');
+  return users;
+}
+export function equal(a: string, b: string) {
+  const first = Buffer.from(a), second = Buffer.from(b);
+  return first.length === second.length && timingSafeEqual(first, second);
+}
+export class AdminAuth {
+  private sessions = new Map<string, { actor: string; csrf: string; expires: number; authenticatedAt: string }>();
+  private attempts = 0;
+  private window = 0;
+  private authenticating = false;
+  constructor(private readonly users: readonly string[],
+    private readonly authenticate: (username: string, password: string) => Promise<void>,
+    private readonly audit: (actor: string, result: 'accepted' | 'denied' | 'failed') => Promise<void>,
+    private readonly now = Date.now) {}
+  async login(username: unknown, password: unknown) {
+    if (this.now() - this.window >= 60000) { this.window = this.now(); this.attempts = 0; }
+    if (++this.attempts > 10 || this.authenticating) throw new WorkerError('LOGIN_RATE_LIMITED');
+    if (typeof username !== 'string' || !username || username.length > 128 || /[\s\x00-\x1f\x7f]/.test(username) ||
+      typeof password !== 'string' || !password || password.length > 1024) throw new WorkerError('LOGIN_FAILED');
+    this.authenticating = true;
+    try {
+      try { await this.authenticate(username, password); }
+      catch { await this.audit('unauthenticated', 'failed'); throw new WorkerError('LOGIN_FAILED'); }
+      // Identity is the exact username accepted by the OLOS password grant, not a frontend role/claim.
+      if (!this.users.includes(username)) { await this.audit('unlisted-olos-user', 'denied'); throw new WorkerError('ADMIN_ACCESS_FORBIDDEN'); }
+      await this.audit(username, 'accepted');
+      for (const [key, session] of this.sessions) if (session.expires <= this.now()) this.sessions.delete(key);
+      if (this.sessions.size >= 100) throw new WorkerError('LOGIN_RATE_LIMITED');
+      const token = randomBytes(32).toString('hex');
+      const session = { actor: username, csrf: randomBytes(32).toString('hex'), expires: this.now() + 8 * 3600000, authenticatedAt: new Date(this.now()).toISOString() };
+      this.sessions.set(token, session); return { token, session };
+    } finally { this.authenticating = false; }
+  }
+  session(cookie: string | undefined) {
+    const token = cookie?.split(';').map(x => x.trim()).find(x => x.startsWith('olos_admin='))?.slice('olos_admin='.length);
+    const value = token ? this.sessions.get(token) : undefined;
+    if (!value || value.expires <= this.now()) { if (token) this.sessions.delete(token); throw new WorkerError('AUTHENTICATION_REQUIRED'); }
+    return { ...value, token: token! };
+  }
+  logout(token: string) { this.sessions.delete(token); }
+}

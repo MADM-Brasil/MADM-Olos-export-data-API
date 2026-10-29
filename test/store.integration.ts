@@ -1,0 +1,323 @@
+import { test, before, beforeEach, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import pg from 'pg';
+import { Store } from '../src/store.js';
+import { config, type Config } from '../src/config.js';
+import type { Cache } from '../src/mapping.js';
+import { OlosApi } from '../src/api.js';
+import { OlosAuthManager } from '../src/auth.js';
+import { StaticCache } from '../src/cache.js';
+import { Worker } from '../src/worker.js';
+import { WorkerError, HttpError } from '../src/errors.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+
+const execute=promisify(execFile);
+
+const url=process.env.TEST_DATABASE_URL;
+if(!url)throw new Error('Use bash scripts/test-integration.sh; TEST_DATABASE_URL is required');
+const parsed=new URL(url);
+if(parsed.hostname!=='127.0.0.1'||parsed.pathname!=='/olos_admin_homolog')throw new Error('Disposable local database required');
+const pool=new pg.Pool({connectionString:url});
+const cfg:Config=config({DATABASE_URL:url,OLOS_SOURCE_KEY:'olos-admin-homolog',SOURCE_ID_UNIQUENESS_CONFIRMED:'true',BATCH_SIZE:'2'});
+const cache:Cache={users:new Map([['7','Agent']]),campaigns:new Map([['8','Campaign']]),dispositions:new Map([['9','Disposition']])};
+const empty:Cache={users:new Map(),campaigns:new Map(),dispositions:new Map()};
+const row=(id:string,extra:Record<string,unknown>={})=>({AttemptsRawDataID:id,CallId:'same-call-id',AgentId:'7',CampaignId:'8',DispositionId:'9',StartDate:'2026-10-01T10:00:00.123456-03:00',OriginalPhoneNumber:'001100000000',...extra});
+const stores:Store[]=[];
+async function store(options:Partial<Config>={}){const s=new Store({...cfg,...options});stores.push(s);await s.open();return s;}
+async function stage(s:Store,data:unknown[],kind:'current'|'previous'='current') {const id=await s.beginRead({kind});await s.stage(id,JSON.stringify(data),12);return id;}
+before(async()=>{await pool.query('SELECT 1');});
+beforeEach(async()=>{
+  for(const s of stores.splice(0))await s.close();
+  await pool.query('DROP SCHEMA IF EXISTS raw CASCADE; DROP SCHEMA IF EXISTS olos_http CASCADE');
+  await pool.query(await readFile(new URL('./fixture.sql',import.meta.url),'utf8'));
+  await pool.query(await readFile(new URL('../migrations/001_ingestion.sql',import.meta.url),'utf8'));
+});
+after(async()=>{for(const s of stores)await s.close();await pool.end();});
+
+test('atomic batched insert, exact source ID, same CallId is not a unique key, duplicate replay',async()=>{
+  const s=await store();await stage(s,[row('9007199254740993'),row('2'),row('3'),row('2')]);
+  assert.deepEqual(await s.drain(cache),{received:4,inserted:3,updated:0,duplicates:1});
+  const result=await pool.query("SELECT count(*)::int AS count,min(data_ligacao::text) AS date FROM raw.olos_calls");
+  assert.equal(result.rows[0].count,3);assert.match(result.rows[0].date,/\.123456/);
+  assert.equal((await pool.query('SELECT source_id FROM olos_http.records WHERE source_id=$1',['9007199254740993'])).rowCount,1);
+  await stage(s,[row('3'),row('2')],'previous');
+  assert.deepEqual(await s.drain(cache),{received:2,inserted:0,updated:0,duplicates:2});
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
+});
+test('HTTP 200 [] is a successful durable completed read',async()=>{
+  const s=await store();await stage(s,[]);assert.deepEqual(await s.drain(cache),{received:0,inserted:0,updated:0,duplicates:0});
+  assert.equal((await s.unresolved()).length,0);
+});
+test('restart after staging, partial commit and final commit cannot duplicate',async()=>{
+  const s=await store();const id=await stage(s,[row('1'),row('2'),row('3')]);
+  await s.close();stores.splice(stores.indexOf(s),1);
+  const resumed=await store();assert.equal((await resumed.unresolved())[0]!.id,id);
+  await pool.query("CREATE FUNCTION raw.fail_third() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.internal_id_olos > 2 THEN RAISE EXCEPTION 'simulated'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_third BEFORE INSERT ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION raw.fail_third()");
+  await assert.rejects(resumed.drain(cache));
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,2);
+  assert.equal((await resumed.unresolved())[0]!.processed_count,2);
+  await pool.query('DROP TRIGGER fail_third ON raw.olos_calls');
+  await resumed.close();stores.splice(stores.indexOf(resumed),1);
+  const next=await store();const counts=await next.drain(cache);assert.equal(counts.inserted,1);
+  await stage(next,[row('1'),row('2'),row('3')]);assert.equal((await next.drain(cache)).inserted,0);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
+});
+test('failed destination transaction retains raw response and rolls back marker',async()=>{
+  const s=await store();await stage(s,[row('1'),row('2')]);
+  await pool.query("ALTER TABLE raw.olos_calls ADD CONSTRAINT synthetic_failure CHECK (nome_agente IS NULL)");
+  await assert.rejects(s.drain(cache));
+  assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,0);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,0);
+  assert.equal((await s.unresolved())[0]!.state,'received');
+  await pool.query('ALTER TABLE raw.olos_calls DROP CONSTRAINT synthetic_failure');
+  assert.equal((await s.drain(cache)).inserted,2);
+});
+test('source ID collision fails without overwriting target',async()=>{
+  const s=await store();await stage(s,[row('1')]);await s.drain(cache);
+  await stage(s,[row('1',{CallId:'changed'})]);await assert.rejects(s.drain(cache),/SOURCE_ID_CONTENT_CONFLICT/);
+  assert.equal((await pool.query('SELECT olos_call_id FROM raw.olos_calls')).rows[0].olos_call_id,'same-call-id');
+  assert.equal((await s.unresolved()).length,1);
+});
+test('unknown reference IDs persist and names can be reconciled without remote reread',async()=>{
+  const s=await store();await stage(s,[row('1')]);await s.drain(empty);
+  assert.equal((await pool.query('SELECT nome_agente FROM raw.olos_calls')).rows[0].nome_agente,null);
+  assert.equal(await s.reconcileNames(cache),3);
+  assert.equal((await pool.query('SELECT nome_agente FROM raw.olos_calls')).rows[0].nome_agente,'Agent');
+  await stage(s,[row('1')]);assert.equal((await s.drain({...cache,users:new Map([['7','Updated']])})).updated,1);
+});
+test('advisory lock prevents a second consumer and unresolved read survives session loss',async()=>{
+  const s=await store();await s.beginRead({kind:'current'});
+  const second=new Store(cfg);await assert.rejects(second.open(),/CONSUMER_ALREADY_ACTIVE/);await second.close();
+  await s.close();stores.splice(stores.indexOf(s),1);
+  const next=await store();await assert.rejects(next.beginRead({kind:'current'}),/RECOVERY_REQUIRED/);
+});
+test('backfill and controlled reread share dedup; unresolved original stays blocked until evidence',async()=>{
+  const s=await store();await stage(s,[row('1')]);await s.drain(cache);
+  const lost=await s.beginRead({kind:'current'});
+  const recovery=await s.beginRead({kind:'reread',date:'2026-10-01',start:'1',end:'2'},true);
+  await s.stage(recovery,JSON.stringify([row('1'),row('2')]),10);
+  assert.deepEqual(await s.drain(cache),{received:2,inserted:1,updated:0,duplicates:1});
+  await assert.rejects(s.beginRead({kind:'current'}),/RECOVERY_REQUIRED/);
+  await s.resolve(lost,'TICKET-test: completed remote operation, exact range and count verified');
+  await stage(s,[row('2'),row('3')],'previous');assert.equal((await s.drain(cache)).inserted,1);
+});
+test('schema fails closed for legacy ungenerated ID and required unknown field',async()=>{
+  await pool.query('ALTER TABLE raw.olos_calls ALTER internal_id_olos DROP IDENTITY');
+  const s=new Store(cfg);await assert.rejects(s.open(),/DESTINATION_ID_GENERATOR_REQUIRED/);await s.close();
+  await pool.query('ALTER TABLE raw.olos_calls ALTER internal_id_olos ADD GENERATED ALWAYS AS IDENTITY; ALTER TABLE raw.olos_calls ALTER tma_origem SET NOT NULL');
+  const t=new Store(cfg);await assert.rejects(t.open(),/DESTINATION_COLUMN_REVIEW_tma_origem/);await t.close();
+});
+test('existing untracked data cannot be ingested over',async()=>{
+  await pool.query("INSERT INTO raw.olos_calls(olos_call_id) VALUES ('legacy')");
+  const s=new Store(cfg);await assert.rejects(s.open(),/EXISTING_DESTINATION_REQUIRES_BASELINE/);await s.close();
+});
+test('large response uses bounded SQL batches',async()=>{
+  const s=await store({batchSize:500});await stage(s,Array.from({length:1201},(_,i)=>row(String(i+1))));
+  const start=performance.now();const counts=await s.drain(cache);
+  assert.equal(counts.inserted,1201);
+  console.log(JSON.stringify({test:'synthetic_1201_rows',duration_ms:Math.round(performance.now()-start)}));
+  assert.equal((await pool.query('SELECT processed_count FROM olos_http.reads')).rows[0].processed_count,1201);
+});
+
+function fakeApi(response:()=>Promise<string>) {
+  let consuming=0;
+  const catalog=[{TableName:'AttemptsRawData',Columns:['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId']},{TableName:'Users',Columns:['AgentId','UserName']},{TableName:'Campaign',Columns:['CampaignId','Description']},{TableName:'Disposition',Columns:['DispositionId','Description']}];
+  const auth=new OlosAuthManager(async()=>JSON.stringify({access_token:'a',refresh_token:'r',expires_in:3600,token_type:'bearer'}),{username:'u',password:'p',clientId:'i',clientSecret:'s'});
+  const api=new OlosApi(async(path)=>{
+    if(path.endsWith('available-tables'))return JSON.stringify(catalog);
+    if(path.endsWith('/read-data'))return '[]';
+    consuming++;return response();
+  },auth,async()=>{});
+  return {api,count:()=>consuming};
+}
+test('worker PostgreSQL failure before read sends no consuming HTTP request',async()=>{
+  const s=await store();const mock=fakeApi(async()=>JSON.stringify([row('1')]));
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await s.close();stores.splice(stores.indexOf(s),1);
+  await assert.rejects(worker.cycle(),/DATABASE_SESSION_LOST/);assert.equal(mock.count(),0);
+});
+test('worker ambiguous network/500 creates persistent block, never automatic reconsume',async()=>{
+  const s=await store();const mock=fakeApi(async()=>{throw new WorkerError('NETWORK_OR_RESPONSE_FAILURE',true);});
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await assert.rejects(worker.cycle(),/RECOVERY_REQUIRED/);await assert.rejects(worker.cycle(),/RECOVERY_REQUIRED/);
+  assert.equal(mock.count(),1);assert.equal((await s.unresolved())[0]!.state,'reading');
+});
+test('worker 403 stops explicitly without unresolved successful read',async()=>{
+  const s=await store();const mock=fakeApi(async()=>{throw new HttpError(403);});
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await assert.rejects(worker.cycle(),/HTTP_403/);assert.equal(mock.count(),1);assert.equal((await s.unresolved()).length,0);
+});
+test('worker concurrent cycle is rejected',async()=>{
+  const s=await store();let release!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;});
+  const mock=fakeApi(async()=>{await gate;return JSON.stringify([row('1')]);});
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  const running=worker.cycle();await assert.rejects(worker.cycle(),/POLL_ALREADY_ACTIVE/);
+  release();await running;assert.equal(mock.count(),1);
+});
+
+test('database loss after HTTP leaves durable intent; restart cannot read again',async()=>{
+  const s=await store();
+  const mock=fakeApi(async()=>{
+    const pid=(await s.client!.query('SELECT pg_backend_pid() pid')).rows[0].pid;
+    await pool.query('SELECT pg_terminate_backend($1)',[pid]);
+    await new Promise(r=>setTimeout(r,10));
+    return JSON.stringify([row('1')]);
+  });
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await assert.rejects(worker.cycle(),/RECOVERY_REQUIRED/);
+  await s.close();stores.splice(stores.indexOf(s),1);
+  const next=await store();assert.equal((await next.unresolved())[0]!.state,'reading');
+  await assert.rejects(next.beginRead({kind:'current'}),/RECOVERY_REQUIRED/);assert.equal(mock.count(),1);
+});
+
+test('commit acknowledgement loss replays local durable state without duplicate insertion',async()=>{
+  const s=await store();await stage(s,[row('1'),row('2')]);
+  const original=s.client!.query.bind(s.client!);
+  let injected=false;
+  // Execute the actual COMMIT, then lose its acknowledgement from the caller's perspective.
+  s.client!.query=(async(...args:unknown[])=>{
+    const result=await (original as (...a:unknown[])=>Promise<unknown>)(...args);
+    if(args[0]==='COMMIT'&&!injected){injected=true;throw new Error('simulated acknowledgement loss');}
+    return result;
+  }) as pg.PoolClient['query'];
+  await assert.rejects(s.drain(cache));
+  s.client!.query=original;
+  await s.close();stores.splice(stores.indexOf(s),1);
+  const next=await store();assert.equal((await next.drain(cache)).inserted,0);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,2);
+  assert.equal((await next.unresolved()).length,0);
+});
+
+test('malformed record remains durable without target writes',async()=>{
+  const s=await store();const id=await stage(s,[row('1'),{CallId:'missing-id'}]);
+  await assert.rejects(s.drain(cache),/SOURCE_ID_INVALID/);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,0);
+  assert.equal((await s.unresolved())[0]!.id,id);
+});
+
+test('recovery validates the requested PK range before writing',async()=>{
+  const s=await store();const id=await s.beginRead({kind:'reread',date:'2026-10-01',start:'1',end:'2'},true);
+  await s.stage(id,JSON.stringify([row('3')]),1);
+  await assert.rejects(s.drain(cache),/RECOVERY_RESPONSE_OUTSIDE_RANGE/);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,0);
+});
+
+test('compiled check succeeds with read-only PostgreSQL sessions and sends zero HTTP requests',async()=>{
+  let requests=0;
+  const http=createServer((_req,res)=>{requests++;res.writeHead(500);res.end();});
+  http.listen(0,'127.0.0.1');await once(http,'listening');
+  const address=http.address();assert(address&&typeof address!=='string');
+  const readonly=new URL(url!);readonly.searchParams.set('options','-c default_transaction_read_only=on');
+  try {
+    const result=await execute(process.execPath,['dist/main.js','check'],{env:{...process.env,
+      DATABASE_URL:readonly.href,OLOS_SOURCE_KEY:'olos-admin-homolog',OLOS_BASE_URL:`http://127.0.0.1:${address.port}`,
+      OLOS_USERNAME:'fixture',OLOS_PASSWORD:'fixture',OLOS_CLIENT_ID:'fixture',OLOS_CLIENT_SECRET:'fixture',
+      DESTINATION_SCHEMA:'raw',DESTINATION_TABLE:'olos_calls'},timeout:10000});
+    assert.match(result.stdout,/database_preflight_passed/);assert.equal(requests,0);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.reads')).rows[0].n,0);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,0);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,0);
+    assert.equal((await pool.query('SELECT is_called FROM raw.olos_calls_internal_id_olos_seq')).rows[0].is_called,false);
+  } finally {await new Promise<void>((resolve,reject)=>http.close(e=>e?reject(e):resolve()));}
+});
+
+test('homologation probe only authenticates, refreshes, discovers and reads three static tables; outputs no secrets',async()=>{
+  const calls:string[]=[];
+  const catalog=[{TableName:'AttemptsRawData',Columns:['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId']},
+    {TableName:'Users',Columns:['AgentId','UserName']},{TableName:'Campaign',Columns:['CampaignId','Description']},{TableName:'Disposition',Columns:['DispositionId','Description']}];
+  const http=createServer(async(req,res)=>{
+    const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(chunk as Buffer);
+    const body=Buffer.concat(chunks).toString();
+    if(req.url==='/api/auth') {
+      const refresh=body.includes('\r\nrefresh_token\r\n');calls.push(refresh?'refresh':'password');
+      res.end(JSON.stringify({access_token:'TOKEN_MUST_NOT_APPEAR',refresh_token:'REFRESH_MUST_NOT_APPEAR',token_type:'bearer',expires_in:3600}));
+    } else if(req.url==='/api/export-data/available-tables') {calls.push('catalog');res.end(JSON.stringify(catalog));}
+    else if(req.url==='/api/export-data/read-data') {
+      const table=['Users','Campaign','Disposition'].find(name=>body.includes(`\r\n${name}\r\n`));calls.push(table??'invalid');
+      if(table==='Users')res.end('[{"UserId":"1","AgentId":"7","UserName":"NAME_MUST_NOT_APPEAR","Password":"PASSWORD_MUST_NOT_APPEAR"}]');
+      else if(table==='Campaign')res.end('[{"CampaignId":"8","Description":"NAME_MUST_NOT_APPEAR","CampaignCode":"08"}]');
+      else res.end('[{"DispositionId":"9","Description":"NAME_MUST_NOT_APPEAR"}]');
+    } else {calls.push('FORBIDDEN');res.writeHead(400);res.end('{}');}
+  });
+  http.listen(0,'127.0.0.1');await once(http,'listening');
+  const address=http.address();assert(address&&typeof address!=='string');
+  try {
+    const result=await execute(process.execPath,['scripts/homologate-http.mjs'],{env:{...process.env,
+      OLOS_BASE_URL:`http://127.0.0.1:${address.port}`,OLOS_USERNAME:'fixture',OLOS_PASSWORD:'PASSWORD_MUST_NOT_APPEAR',
+      OLOS_CLIENT_ID:'fixture',OLOS_CLIENT_SECRET:'SECRET_MUST_NOT_APPEAR'},timeout:10000});
+    assert.deepEqual(calls,['password','refresh','catalog','Disposition','Campaign','Users']);
+    assert.doesNotMatch(result.stdout+result.stderr,/MUST_NOT_APPEAR|Password/);
+    assert.match(result.stdout,/available_tables_passed/);
+    assert.equal(result.stdout.split('\n').filter(line=>line.includes('static_table_result')).length,3);
+  } finally {await new Promise<void>((resolve,reject)=>http.close(e=>e?reject(e):resolve()));}
+});
+
+test('baseline descarta registros antigos e preserva os novos', async () => {
+  const s = await store({
+    ingestionBaseline: '2026-10-01T10:00:00-03:00'
+  });
+
+  const id = await stage(s, [
+    row('100', { StartDate: '2026-10-01T09:59:59-03:00' }),
+    row('101', { StartDate: '2026-10-01T10:00:00-03:00' }),
+    row('102', { StartDate: '2026-10-01T10:00:01-03:00' })
+  ]);
+
+  const result = await s.drain(cache);
+
+  assert.equal(result.inserted, 2);
+
+  const saved = await pool.query(
+    'SELECT olos_call_id FROM raw.olos_calls'
+  );
+
+  assert.equal(saved.rowCount, 2);
+
+  const progress = await pool.query(
+    'SELECT processed_count, state FROM olos_http.reads WHERE id=$1',
+    [id]
+  );
+
+  assert.equal(progress.rows[0].processed_count, 3);
+  assert.equal(progress.rows[0].state, 'done');
+});
+
+test('baseline com lote totalmente antigo avança checkpoint', async () => {
+  const s = await store({
+    ingestionBaseline: '2026-10-02T00:00:00Z'
+  });
+
+  const id = await stage(s, [
+    row('200'),
+    row('201')
+  ]);
+
+  const result = await s.drain(cache);
+
+  assert.equal(result.inserted, 0);
+
+  const calls = await pool.query(
+    'SELECT count(*)::int AS total FROM raw.olos_calls'
+  );
+
+  assert.equal(calls.rows[0].total, 0);
+
+  const markers = await pool.query(
+    'SELECT count(*)::int AS total FROM olos_http.records'
+  );
+
+  assert.equal(markers.rows[0].total, 0);
+
+  const progress = await pool.query(
+    'SELECT processed_count, state FROM olos_http.reads WHERE id=$1',
+    [id]
+  );
+
+  assert.equal(progress.rows[0].processed_count, 2);
+  assert.equal(progress.rows[0].state, 'done');
+});

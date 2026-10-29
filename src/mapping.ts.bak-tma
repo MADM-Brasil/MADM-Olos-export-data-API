@@ -1,0 +1,74 @@
+import { createHash } from 'node:crypto';
+import { DateTime } from 'luxon';
+import { WorkerError } from './errors.js';
+
+export const columns = ['olos_call_id', 'data_ligacao', 'telefone', 'nome_agente', 'id_campanha_olos',
+  'nome_campanha_olos', 'id_tabulacao_olos', 'nome_tabulacao_olos', 'cpf', 'lead_id_origem', 'tma_origem',
+  'razao_desligamento', 'email', 'raw_olos_call_id', 'telefone_match_key'] as const;
+export const sourceColumns = ['AttemptsRawDataID', 'CallId', 'AgentId', 'CampaignId', 'DispositionId', 'StartDate',
+  'EndWrap', 'TableName', 'EndCall', 'OriginalPhoneNumber', 'Dnis', 'PhoneTypeId', 'Route', 'CampaignData',
+  'CustomerId', 'MailingRecordId', 'MailingPhoneNumberId', 'CallIdTelecom'] as const;
+export type Cache = { users: Map<string, string>; campaigns: Map<string, string>; dispositions: Map<string, string> };
+export function textValue(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+  throw new WorkerError('SOURCE_VALUE_INVALID');
+}
+export function timestamp(value: unknown, zone?: string): string | null {
+  const raw = textValue(value);
+  if (raw === null) return null;
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})?$/.exec(raw);
+  if (!match) throw new WorkerError('SOURCE_DATE_INVALID');
+  if (!match[4] && !zone) throw new WorkerError('SOURCE_TIME_ZONE_REQUIRED');
+  const dt = DateTime.fromISO(raw.replace(' ', 'T'), { zone: zone ?? 'UTC', setZone: true });
+  if (!dt.isValid || dt.getPossibleOffsets().length !== 1 || dt.toFormat('yyyy-MM-dd HH:mm:ss') !== `${match[1]} ${match[2]}`) throw new WorkerError('SOURCE_DATE_INVALID_OR_AMBIGUOUS');
+  return `${match[1]}T${match[2]}${match[3] ?? ''}${match[4] ?? dt.toFormat('ZZ')}`;
+}
+function campaignField(
+  xml: string | null | undefined,
+  tag: 'cpf' | 'email'
+): string | null {
+  if (!xml) return null;
+
+  const pattern = new RegExp(
+    `<${tag}>([^<]*)</${tag}>`,
+    'i'
+  );
+
+  const match = xml.match(pattern);
+  if (!match) return null;
+
+  const value = match[1]?.trim();
+  return value || null;
+}
+
+export function mapRecord(row: Record<string, unknown>, cache: Cache, zone?: string) {
+  const source: Record<string, string | null> = {};
+  for (const key of sourceColumns) source[key] = textValue(row[key]);
+  const id = source.AttemptsRawDataID;
+  if (!id || !/^\d{1,19}$/.test(id) || BigInt(id) > 9223372036854775807n) throw new WorkerError('SOURCE_ID_INVALID');
+  const sourceId = BigInt(id).toString();
+  const agentId = source.AgentId ?? null;
+  const campaignId = source.CampaignId ?? null;
+  const dispositionId = source.DispositionId ?? null;
+  return {
+    source_id: sourceId,
+    source_hash: createHash('sha256').update(JSON.stringify(source)).digest('hex'),
+    agent_id: agentId, campaign_id: campaignId, disposition_id: dispositionId,
+    olos_call_id: source.CallId ?? null, data_ligacao: timestamp(source.StartDate, zone),
+    telefone: source.OriginalPhoneNumber ?? null, nome_agente: agentId ? cache.users.get(agentId) ?? null : null,
+    id_campanha_olos: campaignId, nome_campanha_olos: campaignId ? cache.campaigns.get(campaignId) ?? null : null,
+    id_tabulacao_olos: dispositionId, nome_tabulacao_olos: dispositionId ? cache.dispositions.get(dispositionId) ?? null : null,
+    cpf: campaignField(source.CampaignData, 'cpf'),
+    lead_id_origem: null,
+    tma_origem: null,
+    razao_desligamento:
+      dispositionId === '3' || dispositionId === '4'
+        ? dispositionId
+        : '0',
+    email: campaignField(source.CampaignData, 'email'),
+    raw_olos_call_id: null, telefone_match_key: null,
+  };
+}
+export type MappedRecord = ReturnType<typeof mapRecord>;

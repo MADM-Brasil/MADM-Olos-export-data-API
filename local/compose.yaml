@@ -1,0 +1,49 @@
+name: olos-exportdata-local
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: olos_http_local
+      POSTGRES_USER: local_admin
+      POSTGRES_PASSWORD: ${LOCAL_ADMIN_PASSWORD:?generate local/.env}
+      LOCAL_APP_PASSWORD: ${LOCAL_APP_PASSWORD:?generate local/.env}
+    volumes:
+      - local-postgres:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/01-local-role.sh:ro
+    networks: [local-only]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U local_admin -d olos_http_local']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: "no"
+    mem_limit: 512m
+  lab:
+    profiles: [manual]
+    build:
+      context: ..
+      dockerfile: local/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LOCAL_DATABASE_URL: postgresql://olos_local:${LOCAL_APP_PASSWORD:?generate local/.env}@postgres:5432/olos_http_local
+      LOCAL_SOURCE_KEY: ${LOCAL_SOURCE_KEY:-olos-local-fixture}
+      BATCH_SIZE: ${BATCH_SIZE:-500}
+      SOURCE_TIME_ZONE: ${SOURCE_TIME_ZONE:-}
+      OLOS_TLS_VERIFY: "true"
+    command: [node, local/dist/local/src/main.js, status]
+    networks: [local-only]
+    volumes:
+      - ./inputs:/inputs:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+    mem_limit: 512m
+networks:
+  local-only:
+    internal: true
+volumes:
+  local-postgres:

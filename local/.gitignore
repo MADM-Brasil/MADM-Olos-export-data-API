@@ -1,0 +1,5 @@
+.env
+generated/
+dist/
+inputs/
+*.private.json

@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+datasource db {
+  provider = "postgresql"
+  schemas  = ["local_olos"]
+}
+
+model Checkpoint {
+  sourceKey          String   @id @map("source_key")
+  baseline           String
+  baselineEvidence   String   @map("baseline_evidence")
+  contractOrigin     String   @map("contract_origin")
+  contractDigest     String   @map("contract_digest")
+  identityEvidence   String   @map("identity_evidence")
+  sourceTimeZone     String?  @map("source_time_zone")
+  completedRuns      Int      @default(0) @map("completed_runs")
+  committedRecords   Int      @default(0) @map("committed_records")
+  lastCompletedRunId String?  @map("last_completed_run_id") @db.Uuid
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  @@map("checkpoints")
+  @@schema("local_olos")
+}
+
+model IngestionRun {
+  id                 String   @id @default(uuid()) @db.Uuid
+  sourceKey          String   @map("source_key")
+  responseHash       String   @map("response_hash")
+  responseBody       String   @map("response_body") @db.Text
+  state              String   @default("received")
+  processedCount     Int      @default(0) @map("processed_count")
+  receivedCount      Int?     @map("received_count")
+  normalizedCount    Int      @default(0) @map("normalized_count")
+  excludedCount      Int      @default(0) @map("excluded_count")
+  duplicateCount     Int      @default(0) @map("duplicate_count")
+  errorCode          String?  @map("error_code")
+  startedAt          DateTime @default(now()) @map("started_at") @db.Timestamptz(6)
+  completedAt        DateTime? @map("completed_at") @db.Timestamptz(6)
+  rawRecords         RawRecord[]
+  @@unique([sourceKey,responseHash])
+  @@index([sourceKey,state,startedAt])
+  @@map("ingestion_runs")
+  @@schema("local_olos")
+}
+
+model RawRecord {
+  id          String   @id @default(uuid()) @db.Uuid
+  sourceKey   String   @map("source_key")
+  sourceId    String   @map("source_id")
+  payloadHash String   @map("payload_hash")
+  payload     Json     @db.JsonB
+  firstRunId  String   @map("first_run_id") @db.Uuid
+  firstRun    IngestionRun @relation(fields:[firstRunId],references:[id],onDelete:Restrict)
+  receivedAt  DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  normalized  NormalizedRecord[]
+  @@unique([sourceKey,sourceId])
+  @@map("raw_records")
+  @@schema("local_olos")
+}
+
+model NormalizedRecord {
+  rawId       String   @map("raw_id") @db.Uuid
+  version     Int
+  raw         RawRecord @relation(fields:[rawId],references:[id],onDelete:Restrict)
+  disposition String
+  document    Json     @db.JsonB
+  normalizedAt DateTime @default(now()) @map("normalized_at") @db.Timestamptz(6)
+  @@id([rawId,version])
+  @@map("normalized_records")
+  @@schema("local_olos")
+}

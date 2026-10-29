@@ -1,0 +1,37 @@
+:root{font-family:Inter,system-ui,sans-serif;color:#172c37;background:#f3f6f7;font-size:15px}*{box-sizing:border-box}body{margin:0}[hidden]{display:none!important}h1{font-size:30px;margin:8px 0}h2{font-size:18px;margin:0 0 16px}p{color:#526975;line-height:1.6}button,input{font:inherit}button{cursor:pointer;border:1px solid transparent;background:#096d67;color:white;border-radius:8px;padding:11px 16px;font-weight:600}button:hover{filter:brightness(.94)}button:disabled{opacity:.5;cursor:wait}button:focus-visible,input:focus-visible{outline:3px solid #58bdb3;outline-offset:3px}.secondary{background:white;border-color:#cfdbdf;color:#28454e}.danger{background:#a52f3f}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login form{width:min(420px,100%)}.card{background:#fff;border:1px solid #dce5e8;border-radius:12px;padding:28px;box-shadow:0 2px 6px #173e4410}.eyebrow{font-size:11px;letter-spacing:1.8px;font-weight:700;color:#567581}label{display:block;margin:18px 0;color:#344f59;font-weight:600}input{display:block;width:100%;margin-top:8px;padding:11px;border:1px solid #b8cbcf;border-radius:7px;color:#172c37;background:#fff}aside{position:fixed;inset:0 auto 0 0;width:244px;background:#12343c;color:#e7f3f2;padding:32px 20px;display:flex;flex-direction:column}.brand{font-size:26px;letter-spacing:3px;padding:0 12px 34px;font-weight:800}.brand span{display:block;font-size:11px;color:#93bbb9;letter-spacing:1px;font-weight:500;margin-top:7px}nav{display:grid;gap:8px}nav button{text-align:left;background:transparent;color:#b8d0d3;font-size:14px}.selected{background:#24545b;color:white}.actions{margin-top:auto;display:grid;gap:10px}.actions span{font-size:12px;margin:12px 0 0;color:#a6c1c4}main{
+  margin-left:244px;
+  padding:38px;
+  width:calc(100% - 244px);
+  max-width:none;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+}
+main > header,
+main > #notice,
+main > section{
+  width:100%;
+  max-width:1440px;
+  min-width:0;
+}
+main > section > .grid{
+  width:100%;
+}
+main > section > .card{
+  width:100%;
+}
+main > section > .card.narrow{
+  max-width:690px;
+}
+@media(max-width:650px){
+  main{
+    margin:0;
+    width:100%;
+    padding:20px;
+  }
+}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;gap:20px}.badge{background:#e1f0ed;border:1px solid #bed8d3;color:#18594f;font-size:12px;font-weight:700;letter-spacing:1px;border-radius:24px;padding:10px 16px}.badge.error{color:#8d2735;background:#fbe7ea;border-color:#edbac2}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}strong{display:block;font-size:23px;margin:18px 0}.narrow{max-width:690px}.row{display:flex;gap:12px;flex-wrap:wrap}hr{border:0;border-top:1px solid #e3eaed;margin:25px 0}#notice{min-height:25px;color:#176b63}#notice.error,#login-error{color:#a52f3f}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;text-align:left}th{font-size:11px;letter-spacing:.5px;color:#577580;background:#f4f8f8;text-transform:uppercase}td,th{padding:13px 10px;border-bottom:1px solid #e5eded;white-space:nowrap}dl{display:grid;grid-template-columns:180px 1fr;gap:14px;margin-bottom:32px}dt{color:#526975}dd{margin:0;overflow-wrap:anywhere}dialog{border:0;border-radius:14px;padding:30px;max-width:480px;box-shadow:0 20px 80px #112d3c40}dialog::backdrop{background:#15323d80}@media(max-width:1000px){.grid{grid-template-columns:1fr}main{padding:24px}}@media(max-width:650px){aside{position:static;width:auto;padding:20px}.brand{padding-bottom:15px}nav{grid-template-columns:1fr 1fr}.actions{margin-top:20px;grid-template-columns:1fr 1fr}main{margin:0;padding:20px}h1{font-size:24px}.card{padding:20px}header{align-items:start}dl{grid-template-columns:1fr}dd{margin-bottom:10px}}
+
+.health{margin-bottom:18px}.health strong{font-size:20px}.cycle-summary{margin-top:20px}#worker-error{overflow-wrap:anywhere}#worker-error.error{color:#a52f3f}
+
+.event-output{max-height:24rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.8rem;line-height:1.6}

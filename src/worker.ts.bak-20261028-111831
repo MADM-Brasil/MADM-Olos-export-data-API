@@ -1,0 +1,102 @@
+import { type ReadSpec, OlosApi, readFields } from './api.js';
+import { StaticCache } from './cache.js';
+import { Store } from './store.js';
+import { AuthUnavailable, HttpError, WorkerError, errorCode, log } from './errors.js';
+import { sleep } from './http.js';
+
+export async function sequentialPolling(cycle: () => Promise<void>, intervalMs: number, signal: AbortSignal,
+  wait: (ms: number) => Promise<unknown> = ms => sleep(ms, signal), maxFailures = 5,
+  report: (error: unknown, delayMs: number) => void = (e, ms) => log('poll_retry', { error: errorCode(e), retry_ms: ms })) {
+  let failures = 0;
+  while (!signal.aborted) {
+    let next = intervalMs;
+    try { await cycle(); failures = 0; }
+    catch (error) {
+      if (signal.aborted) break;
+      if (!(error instanceof WorkerError) || !error.retryable || ++failures >= maxFailures) throw error;
+      next = Math.max(intervalMs, Math.min(60000, 1000 * 2 ** failures),
+        error instanceof HttpError ? error.retryAfterMs : error instanceof AuthUnavailable && error.original instanceof HttpError ? error.original.retryAfterMs : 0);
+      report(error, next);
+    }
+    if (!signal.aborted) await wait(next);
+  }
+}
+
+export class Worker {
+  private active = false;
+  private initialized = false;
+  constructor(readonly store: Store, readonly api: OlosApi, readonly cache: StaticCache) {}
+  async captureOnce() {
+    if (this.active) throw new WorkerError('POLL_ALREADY_ACTIVE');
+    this.active = true;
+    try {
+      await this.store.ping();
+      if ((await this.store.unresolved()).length) throw new WorkerError('RECOVERY_REQUIRED');
+      await this.api.auth.getToken();
+      await this.api.validateCaptureCatalog();
+      // open() holds the source lock; beginRead rechecks pending reads and commits intent.
+      const id = await this.store.beginRead({ kind: 'current' });
+      const start = performance.now();
+      try {
+        const body = await this.api.captureCurrentDayOnce();
+        const requestMs = Math.round(performance.now() - start);
+        const persistStart = performance.now();
+        await this.store.stage(id, body, requestMs);
+        log('capture_received', { read_id: id, state: 'received', response_bytes: Buffer.byteLength(body),
+          request_ms: requestMs, persistence_ms: Math.round(performance.now() - persistStart) });
+        return id;
+      } catch (error) {
+        // Never resolve/retry automatically, including an uncertain acknowledgement of stage().
+        await this.store.markError(id, errorCode(error)).catch(() => {});
+        log('recovery_required', { read_id: id, error: errorCode(error) });
+        throw new WorkerError('RECOVERY_REQUIRED');
+      }
+    } finally { this.active = false; }
+  }
+  async initialize() {
+    if (this.initialized) return;
+    await this.api.available();
+    await this.cache.refresh();
+    await this.store.reconcileNames(this.cache.value);
+    this.initialized = true;
+  }
+  async cycle(spec: ReadSpec = { kind: 'current' }, recovery = false) {
+    if (this.active) throw new WorkerError('POLL_ALREADY_ACTIVE');
+    this.active = true;
+    try {
+      readFields(spec);
+      await this.store.ping();
+      const existing = await this.store.unresolved();
+      if (existing.some(r => r.state === 'reading') && !recovery) throw new WorkerError('RECOVERY_REQUIRED');
+      await this.initialize();
+      const recovered = await this.store.drain(this.cache.value);
+      if (recovered.received) log('local_recovery_completed', recovered);
+      if (await this.cache.refresh()) {
+        const updated = await this.store.reconcileNames(this.cache.value);
+        log('reference_cache_refreshed', { updated });
+      }
+      if (!this.store.cfg.sourceIdConfirmed) throw new WorkerError('SOURCE_ID_UNIQUENESS_UNCONFIRMED');
+      // Authentication outages before the consuming request must not create remote uncertainty.
+      try { await this.api.auth.getToken(); } catch (error) { throw new AuthUnavailable(error); }
+      const id = await this.store.beginRead(spec, recovery);
+      const start = performance.now();
+      try {
+        const body = await this.api.read(spec);
+        const requestMs = Math.round(performance.now() - start);
+        const persistStart = performance.now();
+        await this.store.stage(id, body, requestMs);
+        const counts = await this.store.drain(this.cache.value);
+        log('batch_completed', { read_id: id, ...counts, request_ms: requestMs,
+          persistence_ms: Math.round(performance.now() - persistStart), duration_ms: Math.round(performance.now() - start) });
+      } catch (error) {
+        if (error instanceof AuthUnavailable || error instanceof HttpError && [400,401,403,429].includes(error.status)) {
+          await this.store.rejected(id, errorCode(error));
+          throw error;
+        }
+        await this.store.markError(id, errorCode(error)).catch(() => {});
+        log('recovery_required', { read_id: id, error: errorCode(error) });
+        throw new WorkerError('RECOVERY_REQUIRED');
+      }
+    } finally { this.active = false; }
+  }
+}

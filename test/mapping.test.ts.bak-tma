@@ -1,0 +1,45 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mapRecord, timestamp, type Cache } from '../src/mapping.js';
+import { rows } from '../src/api.js';
+import { StaticCache } from '../src/cache.js';
+import { OlosApi } from '../src/api.js';
+import { OlosAuthManager } from '../src/auth.js';
+
+const cache:Cache={users:new Map([['7','Agent']]),campaigns:new Map([['03','Campaign']]),dispositions:new Map([['9','Disposition']])};
+test('column mapping preserves IDs, phone and microseconds; unconfirmed fields remain NULL',()=>{
+  const input=rows('[{"AttemptsRawDataID":9007199254740993,"CallId":"0004","OriginalPhoneNumber":"001155500001","AgentId":7,"CampaignId":"03","DispositionId":9,"StartDate":"2026-10-01T10:11:12.123456-03:00","CallIdTelecom":"88","CampaignData":"cpf=123"}]')[0]!;
+  const result=mapRecord(input,cache);
+  assert.equal(result.source_id,'9007199254740993');assert.equal(result.olos_call_id,'0004');assert.equal(result.telefone,'001155500001');
+  assert.equal(result.nome_agente,'Agent');assert.equal(result.nome_campanha_olos,'Campaign');assert.equal(result.nome_tabulacao_olos,'Disposition');
+  assert.equal(result.data_ligacao,'2026-10-01T10:11:12.123456-03:00');
+  assert.equal(result.razao_desligamento, '0');
+  for(const field of ['cpf','email','lead_id_origem','tma_origem','raw_olos_call_id','telefone_match_key'] as const) assert.equal(result[field],null);
+});
+test('missing optional fields and reference IDs do not discard calls',()=>{
+  const result=mapRecord({AttemptsRawDataID:'1',AgentId:'404',CampaignId:'999'},cache);
+  assert.equal(result.nome_agente,null);assert.equal(result.nome_campanha_olos,null);assert.equal(result.id_campanha_olos,'999');assert.equal(result.data_ligacao,null);
+});
+test('rejects missing source ID, unsafe numeric value and unknown timestamps',()=>{
+  assert.throws(()=>mapRecord({},cache),/SOURCE_ID_INVALID/);
+  assert.throws(()=>mapRecord({AttemptsRawDataID:9007199254740992},cache),/SOURCE_VALUE_INVALID/);
+  assert.throws(()=>timestamp('2026-10-01 01:02:03'),/SOURCE_TIME_ZONE_REQUIRED/);
+  assert.throws(()=>timestamp('2026-02-30T01:02:03Z'),/SOURCE_DATE_INVALID/);
+  assert.throws(()=>timestamp('2026-11-01T01:30:00','America/New_York'),/AMBIGUOUS/);
+  assert.throws(()=>timestamp('2026-03-08T02:30:00','America/New_York'),/INVALID/);
+  assert.equal(timestamp('2026-10-01 01:02:03.123456','America/Sao_Paulo'),'2026-10-01T01:02:03.123456-03:00');
+});
+test('static cache TTL, password removal and atomic refresh',async()=>{
+  let now=0,calls=0,fail=false;
+  const auth=new OlosAuthManager(async()=>JSON.stringify({access_token:'a',expires_in:3600,token_type:'bearer'}),{username:'u',password:'p',clientId:'i',clientSecret:'s'});
+  const api=new OlosApi(async(_,fields)=>{
+    calls++;if(fail && fields!.TableName==='Campaign')return '{}';
+    if(fields!.TableName==='Users')return '[{"AgentId":7,"UserName":"Agent","Password":"NEVER_PERSIST"}]';
+    if(fields!.TableName==='Campaign')return '[{"CampaignId":"03","Description":"Campaign"}]';
+    return '[{"DispositionId":9,"Description":"Disposition"}]';
+  },auth);
+  const c=new StaticCache(api,1000,()=>now);
+  assert.equal(await c.refresh(),true);assert.equal(await c.refresh(),false);assert.equal(calls,3);
+  assert.deepEqual(c.value,cache);assert.equal(JSON.stringify([...c.value.users]).includes('NEVER_PERSIST'),false);
+  now=1000;fail=true;await assert.rejects(c.refresh());assert.deepEqual(c.value,cache);
+});

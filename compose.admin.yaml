@@ -1,0 +1,18 @@
+# Optional replacement command for the SAME worker service. Never run beside the CLI consumer.
+services:
+  worker:
+    ports:
+      - "127.0.0.1:8082:8080"
+    command: ["node", "dist/main.js", "admin"]
+    environment:
+      ADMIN_ORIGIN: ${ADMIN_ORIGIN:?set ADMIN_ORIGIN}
+      ADMIN_BIND: 0.0.0.0
+      ADMIN_PORT: 8080
+      ADMIN_ENCRYPTION_KEY: ${ADMIN_ENCRYPTION_KEY:?set ADMIN_ENCRYPTION_KEY}
+      ADMIN_OLOS_USERS_JSON: ${ADMIN_OLOS_USERS_JSON:?set ADMIN_OLOS_USERS_JSON}
+      ADMIN_OLOS_ALLOWED_ORIGINS: ${ADMIN_OLOS_ALLOWED_ORIGINS:-}
+    # Dokploy routes HTTPS to this internal port on the same service's proxy network.
+    # No administrative HTTP port is published on the host.
+    expose: ["8080"]
+    # Allows an existing finite HTTP request/DB batch to finish. Verify with production volumes.
+    stop_grace_period: 10m

@@ -1,0 +1,62 @@
+'use strict';
+const $=id=>document.getElementById(id);
+let csrf='',revision=0,logged=false,refreshing=false,currentPage='dashboard';
+const titles={dashboard:'Dashboard',logs:'Terminal / Logs',schedule:'Agendamento',credentials:'Credenciais OLOS',status:'Status operacional'};
+const errors={AUTHENTICATION_REQUIRED:'Sua sessão expirou. Entre novamente.',LOGIN_FAILED:'Não foi possível autenticar na OLOS. Confira usuário e senha ou tente novamente mais tarde.',ADMIN_ACCESS_FORBIDDEN:'Identidade OLOS autenticada, mas sem autorização administrativa.',SOURCE_ID_UNIQUENESS_UNCONFIRMED:'Consumo bloqueado: a unicidade da identidade de origem ainda não foi confirmada. O painel continua disponível.',SCHEDULER_ALREADY_ACTIVE:'Já existe um administrador/agendador para esta fonte e este banco. Não abra uma segunda instância.',DESTINATION_ID_GENERATOR_REQUIRED:'Estrutura de destino ausente ou incompatível: geração de ID não validada.',RECOVERY_REQUIRED:'Há leituras pendentes. É necessária reconciliação antes de iniciar.',CONSUMER_ALREADY_ACTIVE:'Já existe um consumidor para esta origem.',CREDENTIAL_REVISION_CONFLICT:'A configuração mudou. Recarregue antes de salvar.',OLOS_URL_NOT_ALLOWED:'A origem da URL não está autorizada no servidor.',LOGIN_RATE_LIMITED:'Muitas tentativas. Aguarde um minuto.'};
+function notice(message,error=false){$('notice').textContent=message;$('notice').classList.toggle('error',error);}
+async function api(path,method='GET',body){
+  const res=await fetch('/api'+path,{method,credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},...(body===undefined?{}:{body:JSON.stringify(body)})});
+  const result=await res.json();
+  if(!res.ok){if(res.status===401&&path!=='/login')showLogin();throw new Error(errors[result.error]||result.error||'Falha na operação.');}return result;
+}
+function showLogin(){logged=false;csrf='';$('app').hidden=true;$('login').hidden=false;$('credentials-form').reset();}
+function date(value){return value?new Date(value).toLocaleString('pt-BR'):'—';}
+function describe(id,details){$(id).replaceChildren();for(const [name,value]of details){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=name;dd.textContent=value??'Não medido';$(id).append(dt,dd);}}
+function table(id,rows){const root=$(id);root.replaceChildren();for(const values of rows){const tr=document.createElement('tr');for(const value of values){const td=document.createElement('td');td.textContent=value??'—';tr.append(td);}root.append(tr);}}
+let scheduleDirty=false;
+$('minutes').addEventListener('input',()=>{scheduleDirty=true;});
+async function refresh(){
+  if(!logged||refreshing)return;refreshing=true;
+  try{
+    const s=await api('/status');$('state').textContent=s.state;$('state').classList.toggle('error',s.state==='ERROR');
+    $('next').textContent=date(s.next_run_at);$('interval').textContent=s.interval_ms?`${s.interval_ms/60000} min`:'—';$('in-flight').textContent=s.cycle_in_progress?'Leitura / persistência em andamento':'Sem ciclo em andamento';
+    const last=s.ingestion?.last_completed,latest=s.ingestion?.latest;
+    $('auth-health').textContent=s.authentication?.status==='ACCEPTED'?'Aceita nesta sessão':'Não verificada';
+    $('db-health').textContent=s.database?.reachable?(s.database.schema_valid?'Estrutura validada':'Acessível, estrutura inválida'):'Indisponível';
+    $('db-detail').textContent=s.database?.error?(errors[s.database.error]||s.database.error):'Verificação somente leitura, sem iniciar consumidor.';
+    $('ingestion-health').textContent=({CONFIRMED:'Persistência confirmada',PENDING:'Leituras pendentes',NOT_OBSERVED:'Sem ciclo confirmado',UNKNOWN:'Não verificável'})[s.ingestion?.status]||'Não verificável';
+    $('pending-summary').textContent=s.ingestion?.pending===null?'Não foi possível consultar pendências.':(s.ingestion?.pending?.map(p=>`${p.state}: ${p.count}`).join(' · ')||'Nenhuma leitura pendente.');
+    describe('cycle-details',[['Estado real / desejado',`${s.state} / ${s.desired_state}`],['Última execução',date(latest?.started_at)],['Estado da última leitura',latest?.state||'Nenhuma'],['Último ciclo confirmado',date(last?.finished_at)],['Recebidos no último ciclo',last?.received_count],['Inseridos no PostgreSQL',last?.inserted],['Duplicidades',last?.duplicates],['Tempo de processamento',last?.duration_ms==null?'Não medido':`${last.duration_ms} ms`]]);
+    const lastError=s.error||s.ingestion?.last_error?.code||latest?.error_code;$('worker-error').textContent=lastError?`Último erro: ${errors[lastError]||lastError}`:'Nenhum erro registrado.';$('worker-error').classList.toggle('error',!!lastError);
+    if(!scheduleDirty)$('minutes').value=s.interval_ms?s.interval_ms/60000:'';
+    $('schedule-by').textContent=s.updated_by?`Última alteração: ${s.updated_by} · ${date(s.updated_at)}`:'';
+    $('start').disabled=!['STOPPED','ERROR'].includes(s.state);$('stop').disabled=['STOPPED','STOPPING'].includes(s.state);
+    $('pause').disabled=s.state!=='RUNNING';$('resume').disabled=s.state!=='PAUSED';
+    const details=[['Estado real',s.state],['Estado solicitado',s.desired_state],['Ciclo ativo',s.cycle_in_progress?'Sim':'Não'],['Próxima execução',date(s.next_run_at)],['Último erro',errors[s.error]||s.error||'Nenhum']];
+    describe('operational',details);
+    if(currentPage==='logs')await logs();
+    if(currentPage==='status'){const rows=await api('/audit');table('audit-rows',rows.map(r=>[date(r.occurred_at),r.actor,r.action]));}
+  }catch(e){notice(e.message,true);}finally{refreshing=false;}
+}
+async function credentials(){const c=await api('/credentials');revision=c.revision;const f=$('credentials-form');for(const key of ['baseUrl','username'])f.elements.namedItem(key).value=c[key];f.elements.namedItem('password').value='';$('credentials-complete').textContent=`Configuração ${c.complete?'completa':'incompleta'} · ${c.origin==='environment'?'origem: variáveis de ambiente':'origem: banco criptografado'}. Campos secretos vazios preservam os valores atuais.`;$('password-configured').textContent=c.passwordConfigured?'Senha configurada no backend.':'Senha ainda não configurada.';testResult(c.lastTest);}
+function testResult(r){$('test-result').textContent=r?`${r.ok?'Autenticação validada':'Falha no teste'} · ${r.code} · ${r.duration_ms} ms · ${date(r.at)}`:'Nenhum teste registrado para esta configuração.';}
+async function logs(){const [rows,events]=await Promise.all([api('/logs'),api('/events')]);table('log-rows',rows.map(r=>[r.id,date(r.started_at),r.state,r.processed_count,r.received_count,r.request_ms,r.error_code]));$('event-output').textContent=events.length?events.map(e=>JSON.stringify(e)).join('\n'):'Nenhum evento observado neste processo.';}
+async function enter(session){csrf=session.csrf;logged=true;$('actor').textContent=session.actor;$('login').hidden=true;$('app').hidden=false;await refresh();}
+async function action(fn,button){if(button)button.disabled=true;try{await fn();}catch(e){notice(e.message,true);}finally{if(button)button.disabled=false;}}
+$('login-form').addEventListener('submit',async e=>{e.preventDefault();const f=e.currentTarget,b=f.querySelector('button');b.disabled=true;try{const input=Object.fromEntries(new FormData(f));f.elements.namedItem('password').value='';await enter(await api('/login','POST',input));f.reset();$('login-error').textContent='';}catch(err){$('login-error').textContent=err.message;f.elements.namedItem('password').value='';}finally{b.disabled=false;}});
+document.querySelectorAll('[data-page]').forEach(button=>button.addEventListener('click',()=>action(async()=>{currentPage=button.dataset.page;document.querySelectorAll('[data-view]').forEach(s=>s.hidden=s.dataset.view!==currentPage);document.querySelectorAll('[data-page]').forEach(b=>b.classList.toggle('selected',b===button));$('title').textContent=titles[currentPage];$('breadcrumb').textContent=currentPage==='credentials'?'CONFIGURAÇÕES':'OPERAÇÃO';notice('');if(currentPage==='credentials')await credentials();if(currentPage==='logs')await logs();await refresh();})));
+$('schedule-form').addEventListener('submit',e=>{e.preventDefault();action(async()=>{
+  const minutes=Number($('minutes').value);
+  const result=await api('/schedule','PATCH',{interval_ms:minutes*60000});
+  if(result.interval_ms!==minutes*60000)throw new Error('Intervalo retornado diferente do solicitado.');
+  scheduleDirty=false;
+  notice('Intervalo salvo e confirmado pelo backend.');
+  await refresh();
+},e.currentTarget.querySelector('button'));});
+$('credentials-form').addEventListener('submit',e=>{e.preventDefault();const f=e.currentTarget;action(async()=>{await api('/credentials','PUT',{...Object.fromEntries(new FormData(f)),revision});f.elements.namedItem('password').value='';await credentials();notice('Credenciais salvas. A operação atual não será interrompida.');},f.querySelector('button'));});
+$('test-connection').addEventListener('click',e=>action(async()=>testResult(await api('/credentials/test','POST',{})),e.currentTarget));
+for(const name of ['start','pause','resume'])$(name).addEventListener('click',e=>action(async()=>{await api('/worker/'+name,'POST',{});notice('Solicitação registrada. Acompanhe o estado real no painel.');await refresh();},e.currentTarget));
+$('stop').addEventListener('click',()=>$('stop-dialog').showModal());$('cancel-stop').addEventListener('click',()=>$('stop-dialog').close());
+$('confirm-stop').addEventListener('click',e=>action(async()=>{await api('/worker/stop','POST',{confirm:true});$('stop-dialog').close();notice('Parada solicitada. Aguardando a conclusão efetiva do consumidor.');await refresh();},e.currentTarget));
+$('refresh-logs').addEventListener('click',e=>action(logs,e.currentTarget));$('logout').addEventListener('click',e=>action(async()=>{await api('/logout','POST',{});showLogin();},e.currentTarget));
+api('/session').then(enter).catch(()=>showLogin());setInterval(refresh,2000);

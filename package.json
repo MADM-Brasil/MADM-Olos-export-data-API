@@ -1,0 +1,30 @@
+{
+  "name": "olos-exportdata-v3-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "test:integration": "tsx --test test/*.integration.ts",
+    "start": "node dist/main.js start",
+    "cli": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "lossless-json": "4.3.3",
+    "luxon": "3.7.2",
+    "pg": "8.23.1",
+    "undici": "8.12.3"
+  },
+  "devDependencies": {
+    "@types/luxon": "3.7.6",
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}
