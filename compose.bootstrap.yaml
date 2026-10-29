@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: olos_exportdata
+      POSTGRES_USER: olos_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+    - exportdata-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U olos_app -d olos_exportdata
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+    - backend
+    mem_limit: 1g
+networks:
+  backend: null
+volumes:
+  exportdata-postgres: null
