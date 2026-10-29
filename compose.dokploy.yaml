@@ -21,6 +21,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    extra_hosts:
+      - "oloschannel.com.br:10.196.234.4"
     command: ["node", "dist/main.js", "admin"]
     restart: unless-stopped
     init: true
