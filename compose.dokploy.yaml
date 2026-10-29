@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: olos_exportdata
+      POSTGRES_USER: olos_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+      - exportdata-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U olos_app -d olos_exportdata"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend
+    mem_limit: 1g
+
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "dist/main.js", "admin"]
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?required}
+      OLOS_SOURCE_KEY: olos-production
+      OLOS_BASE_URL: ${OLOS_BASE_URL:-}
+      OLOS_USERNAME: ${OLOS_USERNAME:-}
+      OLOS_PASSWORD: ${OLOS_PASSWORD:-}
+      OLOS_CLIENT_ID: ${OLOS_CLIENT_ID:-}
+      OLOS_CLIENT_SECRET: ${OLOS_CLIENT_SECRET:-}
+      OLOS_TLS_VERIFY: "true"
+      SOURCE_ID_UNIQUENESS_CONFIRMED: ${SOURCE_ID_UNIQUENESS_CONFIRMED:-false}
+      SOURCE_TIME_ZONE: ${SOURCE_TIME_ZONE:?required}
+      INGESTION_BASELINE: ${INGESTION_BASELINE:?required}
+      DESTINATION_SCHEMA: raw
+      DESTINATION_TABLE: olos_calls
+      POLL_INTERVAL_MS: "120000"
+      ADMIN_ORIGIN: ${ADMIN_ORIGIN:?required}
+      ADMIN_BIND: 0.0.0.0
+      ADMIN_PORT: "8080"
+      ADMIN_ENCRYPTION_KEY: ${ADMIN_ENCRYPTION_KEY:?required}
+      ADMIN_OLOS_USERS_JSON: ${ADMIN_OLOS_USERS_JSON:?required}
+      ADMIN_OLOS_ALLOWED_ORIGINS: ${ADMIN_OLOS_ALLOWED_ORIGINS:-}
+    expose:
+      - "8080"
+    networks:
+      - backend
+      - dokploy-network
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10m
+    mem_limit: 2g
+    cpus: 1.0
+
+networks:
+  backend:
+  dokploy-network:
+    external: true
+
+volumes:
+  exportdata-postgres:
