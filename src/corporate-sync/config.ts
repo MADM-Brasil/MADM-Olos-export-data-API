@@ -15,6 +15,7 @@ export interface Config {
   destinationCa: string | undefined;
   batchSize: number;
   intervalMs: number;
+  batchDelayMs: number;
   maxRetries: number;
   backoffMs: number;
   timeoutMs: number;
@@ -68,6 +69,7 @@ export function config(mode: string, env: NodeJS.ProcessEnv = process.env): Conf
     destinationCa: env.CORPORATE_SYNC_DESTINATION_CA_FILE || undefined,
     batchSize: integer(env, 'BATCH_SIZE', 250, 1, 2000),
     intervalMs: integer(env, 'INTERVAL_MS', 30000, 100, 3600000),
+    batchDelayMs: integer(env, 'BATCH_DELAY_MS', 2000, 0, 60000),
     maxRetries: integer(env, 'MAX_RETRIES', 3, 0, 10),
     backoffMs: integer(env, 'BACKOFF_MS', 500, 1, 60000),
     timeoutMs: integer(env, 'TIMEOUT_MS', 15000, 100, 300000),

@@ -205,6 +205,65 @@ test('corporate-sync isolated PostgreSQL integration', { skip: !enabled }, async
       for (const outcome of outcomes) if (outcome.status === 'rejected') assert.match(String(outcome.reason), /SYNC_ALREADY_RUNNING/);
       assert.equal(await count(destination), 1); assert.equal(await count(source, 'corporate_sync.receipts'), 1);
     });
+    await t.test('start waits between committed batches', async () => {
+      await reset();
+      await insert(source, row('1'));
+      await insert(source, { ...row('2'), telefone: 'second-call' });
+
+      const abort = new AbortController();
+      const commits: number[] = [];
+      const config = {
+        ...cfg({
+          CORPORATE_SYNC_BATCH_SIZE: '1',
+          CORPORATE_SYNC_BATCH_DELAY_MS: '250'
+        }),
+        mode: 'start' as const
+      };
+
+      await run(config, abort.signal, {
+        afterRemoteCommit: async () => {
+          commits.push(Date.now());
+          if (commits.length === 2) abort.abort();
+        }
+      });
+
+      assert.equal(commits.length, 2);
+      assert.ok(
+        commits[1]! - commits[0]! >= 200,
+        'start must wait between committed batches'
+      );
+      assert.equal(await count(destination), 2);
+      assert.equal(await count(source, 'corporate_sync.receipts'), 2);
+    });
+
+    await t.test('once finishes without waiting for batch delay', async () => {
+      await reset();
+      await insert(source, row('1'));
+
+      const abort = new AbortController();
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        abort.abort();
+      }, 1500);
+
+      try {
+        await run({
+          ...cfg({
+            CORPORATE_SYNC_BATCH_SIZE: '1',
+            CORPORATE_SYNC_BATCH_DELAY_MS: '60000'
+          }),
+          mode: 'once'
+        }, abort.signal);
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      assert.equal(timedOut, false);
+      assert.equal(await count(destination), 1);
+      assert.equal(await count(source, 'corporate_sync.receipts'), 1);
+    });
+
     await t.test('binding prevents silently changing conversion policy on existing control', async () => {
       await reset(); await insert(source, row()); await sync();
       await assert.rejects(sync(cfg({ CORPORATE_SYNC_TMA_POLICY: 'truncate', CORPORATE_SYNC_TMA_CONFIRMATION: 'CONFIRM_TMA_truncate' })), /CHECKPOINT_BINDING_MISMATCH/);

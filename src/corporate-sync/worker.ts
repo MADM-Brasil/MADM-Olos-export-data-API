@@ -199,7 +199,19 @@ export async function run(cfg: Config, signal: AbortSignal, hooks: Hooks = {}): 
     do {
       const count = await runBatch(local, cfg, shape, signal, hooks);
       if (cfg.mode === 'once') return;
-      if (!count) { log('idle'); await pause(cfg.intervalMs, signal); }
+
+      // Controle de ritmo: aplica intervalo também com backlog.
+      // Não interfere no commit, recibos ou checkpoint.
+      if (!count) log('idle');
+
+      const waitMs = count ? cfg.batchDelayMs : cfg.intervalMs;
+
+      try {
+        if (waitMs > 0) await pause(waitMs, signal);
+      } catch (error) {
+        if (signal.aborted) break;
+        throw error;
+      }
     } while (!signal.aborted);
   } finally { await local.end().catch(() => {}); }
 }
