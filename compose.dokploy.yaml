@@ -23,6 +23,12 @@ services:
       dockerfile: Dockerfile
     extra_hosts:
       - "oloschannel.com.br:10.196.234.4"
+      - "ip-172-31-1-161.sa-east-1.compute.internal:15.229.217.74"
+    env_file:
+      - path: /etc/dokploy/private/madm-exportdata/credentials.env
+        format: raw
+    volumes:
+      - /opt/madm-corporate-sync/certs/madm-postgres-ca.pem:/run/secrets/madm-postgres-ca.pem:ro
     command: ["node", "dist/main.js", "admin"]
     restart: unless-stopped
     init: true
