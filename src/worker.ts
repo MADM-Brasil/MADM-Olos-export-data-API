@@ -108,11 +108,20 @@ export class Worker {
   async cycle(spec: ReadSpec = { kind: 'current' }, recovery = false) {
     if (this.active) throw new WorkerError('POLL_ALREADY_ACTIVE');
     this.active = true;
+    let historical = spec.kind === 'history';
     try {
       readFields(spec);
       await this.store.ping();
-      await this.store.captureReady();
+      if (spec.kind === 'history') {
+        await this.store.assertHistoryReady();
+      } else {
+        await this.store.captureReady();
+      }
       const existing = await this.store.unresolved();
+      if (existing.some(read => read.spec.kind === 'history')) {
+        historical = true;
+        throw new WorkerError('HISTORY_RECOVERY_REQUIRED');
+      }
       if (existing.some(r => r.state === 'reading') && !recovery) throw new WorkerError('RECOVERY_REQUIRED');
       await this.initialize();
       const recovered = await this.store.drain(this.cache.value);
@@ -124,10 +133,16 @@ export class Worker {
       if (!this.store.cfg.sourceIdConfirmed) throw new WorkerError('SOURCE_ID_UNIQUENESS_UNCONFIRMED');
       // Authentication outages before the consuming request must not create remote uncertainty.
       try { await this.api.auth.getToken(); } catch (error) { throw new AuthUnavailable(error); }
+      // Revalidate historical authorization and operational state
+      // immediately before persisting the consuming-read intent.
+      if (spec.kind === 'history') {
+        await this.store.assertHistoryReady();
+      }
       const id = await this.store.beginRead(spec, recovery);
       const start = performance.now();
       try {
-        const body = await this.api.read(spec);
+        const body = await this.api.read(spec, spec.kind === 'history'
+          ? () => this.store.assertHistoryReady({ id, state: 'reading' }) : undefined);
         const requestMs = Math.round(performance.now() - start);
         const persistStart = performance.now();
         await this.store.stage(id, body, requestMs);
@@ -137,7 +152,7 @@ export class Worker {
         log('batch_completed', report);
         return report; // Evidence only, returned after the existing persistence path has completed.
       } catch (error) {
-        if (error instanceof AuthUnavailable || error instanceof HttpError && [400,401,403,429].includes(error.status)) {
+        if (spec.kind !== 'history' && (error instanceof AuthUnavailable || error instanceof HttpError && [400,401,403,429].includes(error.status))) {
           await this.store.rejected(id, errorCode(error));
           throw error;
         }
@@ -145,6 +160,6 @@ export class Worker {
         log('recovery_required', { read_id: id, error: errorCode(error) });
         throw new WorkerError('RECOVERY_REQUIRED');
       }
-    } finally { this.active = false; this.store.delivery?.kick(); }
+    } finally { this.active = false; if (!historical) this.store.delivery?.kick(); }
   }
 }

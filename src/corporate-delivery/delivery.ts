@@ -69,6 +69,11 @@ export class CorporateDelivery {
     await assertLocalConsumersCompatible(local, this.source);
     await local.query('BEGIN');
     try {
+      // A historical capture/recovery holds the exclusive session lock until Store.close().
+      if (!(await local.query('SELECT pg_try_advisory_xact_lock_shared(hashtextextended($1,0)) AS ok',
+        [`olos-http:history:${this.source}`])).rows[0].ok) throw new SyncError('HISTORY_CAPTURE_ACTIVE');
+      if ((await local.query("SELECT 1 FROM olos_http.reads WHERE source_key=$1 AND spec->>'kind'='history' AND state IN ('reading','received') LIMIT 1",
+        [this.source])).rowCount) throw new SyncError('HISTORY_RECOVERY_REQUIRED');
       // Lock before checking: a concurrently finishing delivery may have just discovered a conflict.
       const state = await this.state(local, true);
       if (state.blocked && !['DATABASE_TRANSIENT_FAILURE','CORPORATE_COMMIT_UNKNOWN'].includes(state.last_code)) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');

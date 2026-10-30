@@ -15,6 +15,7 @@ export class Store {
   client: pg.PoolClient | undefined;
   private sequence = '';
   private alive = false;
+  private historyLockHeld = false;
   readonly target: string;
   readonly delivery: CorporateDelivery | undefined;
   constructor(readonly cfg: Config, private readonly onDisconnect: () => void = () => {}) {
@@ -54,6 +55,73 @@ export class Store {
   }
   async ping() { await this.db().query('SELECT 1'); }
   async captureReady() { await this.delivery?.captureReady(this.db()); }
+  async assertHistoryReady(read?: { id: string; state: 'reading' | 'received' }, lockRows = false): Promise<void> {
+    // Replaying a durable response is local recovery, not authorization for another remote read.
+    if (read?.state !== 'received' && !this.cfg.historyCaptureAuthorized) {
+      throw new WorkerError('HISTORY_CAPTURE_NOT_AUTHORIZED');
+    }
+
+    if (!this.delivery || this.cfg.corporateDelivery?.connection.writeEnabled) {
+      throw new WorkerError('HISTORY_REQUIRES_CORPORATE_WRITE_DISABLED');
+    }
+
+    const db = this.db();
+
+    // Hold this session lock until Store.close().
+    // Prevent a running Admin from admitting another capture.
+    if (!this.historyLockHeld) {
+      const lock = await db.query(
+        'SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired',
+        [`olos-admin:${this.cfg.sourceKey}`]
+      );
+
+      if (!lock.rows[0]?.acquired) {
+        throw new WorkerError('HISTORY_ADMIN_ACTIVE');
+      }
+
+      const historyLock = await db.query(
+        'SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired',
+        [`olos-http:history:${this.cfg.sourceKey}`]
+      );
+      if (!historyLock.rows[0]?.acquired) throw new WorkerError('HISTORY_CONTROL_BUSY');
+
+      this.historyLockHeld = true;
+      this.delivery.suspend();
+    }
+
+    const settings = (await db.query(
+      `SELECT enabled,desired_state,runtime_state
+       FROM olos_http.worker_settings
+       WHERE source_key=$1${lockRows ? ' FOR SHARE' : ''}`,
+      [this.cfg.sourceKey]
+    )).rows[0];
+
+    if (!settings ||
+        settings.enabled ||
+        settings.desired_state !== 'STOPPED' ||
+        settings.runtime_state !== 'STOPPED') {
+      throw new WorkerError('HISTORY_SCHEDULER_NOT_STOPPED');
+    }
+
+    const control = (await db.query(
+      `SELECT ready,paused,blocked
+       FROM olos_http.corporate_control
+       WHERE singleton${lockRows ? ' FOR SHARE' : ''}`
+    )).rows[0];
+
+    if (!control?.ready || !control.paused || control.blocked) {
+      throw new WorkerError('HISTORY_CORPORATE_STATE_INVALID');
+    }
+
+    await this.captureReady(); // Also verify binding and local consumer compatibility.
+    const pending = await this.unresolved();
+    if (read ? pending.length !== 1 || pending[0]!.id !== read.id ||
+      pending[0]!.state !== read.state || pending[0]!.spec.kind !== 'history' : pending.length !== 0) {
+      throw new WorkerError('HISTORY_RECOVERY_REQUIRED');
+    }
+  }
+
+
   async reconcileCorporate() {
     if (!this.delivery) throw new WorkerError('CORPORATE_MODE_REQUIRED');
     return this.delivery.reconcile(this.db(), this.sequence);
@@ -62,6 +130,19 @@ export class Store {
     return (await this.db().query<Read>("SELECT id,spec,state,response_body,processed_count,request_ms FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at", [this.cfg.sourceKey])).rows;
   }
   async beginRead(spec: ReadSpec, recovery = false) {
+    if (spec.kind === 'history') {
+      const db = this.db();
+      await db.query('BEGIN');
+      try {
+        // Validation and intention are one transaction; session locks survive its COMMIT.
+        await this.assertHistoryReady(undefined, true);
+        const id = randomUUID();
+        await db.query('INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)',
+          [id, this.cfg.sourceKey, this.target, JSON.stringify(spec)]);
+        await db.query('COMMIT');
+        return id;
+      } catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
+    }
     await this.captureReady();
     const pending = await this.unresolved();
     if (pending.some(r => r.state === 'received') || (!recovery && pending.length)) throw new WorkerError('RECOVERY_REQUIRED');
@@ -137,9 +218,15 @@ export class Store {
     await this.db().query("UPDATE olos_http.reads SET state='resolved',finished_at=clock_timestamp(),error_code=$2,resolution='HTTP explicit rejection; no successful response' WHERE id=$1 AND source_key=$3 AND state='reading'", [id, code, this.cfg.sourceKey]);
   }
   async drain(cache: Cache) {
+    const pending = await this.unresolved();
+    const historical = pending.find(read => read.spec.kind === 'history');
+    if (historical) {
+      if (historical.state !== 'received') throw new WorkerError('HISTORY_RECOVERY_REQUIRED');
+      await this.assertHistoryReady({ id: historical.id, state: 'received' });
+    }
     const total: { received: number; inserted: number; updated: number; duplicates: number; queued?: number } =
       { received: 0, inserted: 0, updated: 0, duplicates: 0, ...(this.delivery ? { queued: 0 } : {}) };
-    for (const read of await this.unresolved()) {
+    for (const read of pending) {
       if (read.state !== 'received') continue;
       const data = rows(read.response_body!);
       total.received += data.length;
@@ -153,12 +240,15 @@ export class Store {
           .map(row => mapRecord(row, cache, this.cfg.sourceTimeZone, !!this.delivery));
 
         const baseline = this.cfg.ingestionBaseline;
+        const historicalRead = read.spec.kind === 'history';
 
-        const batch = baseline
-          ? mapped.filter(row =>
+        // History is an explicit, durable read policy stored in olos_http.reads.spec.
+        // Normal ingestion and recovery retain the production baseline.
+        const batch = historicalRead || !baseline
+          ? mapped
+          : mapped.filter(row =>
               row.data_ligacao !== null &&
-              Date.parse(row.data_ligacao) >= Date.parse(baseline))
-          : mapped;
+              Date.parse(row.data_ligacao) >= Date.parse(baseline));
 
         const result = await this.persist(
           read.id,
@@ -273,6 +363,7 @@ export class Store {
     finally {
       this.alive = false;
       if (this.client) { this.client.release(true); this.client = undefined; }
+      this.historyLockHeld = false;
       await this.pool.end();
     }
   }

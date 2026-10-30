@@ -2,8 +2,10 @@
 set -euo pipefail
 # Always creates a disposable PostgreSQL. Never uses DATABASE_URL or an existing container.
 container="olos-http-test-$(date +%s)-$$"
-trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+trap 'docker rm -fv "$container" >/dev/null 2>&1 || true' EXIT
+printf 'DISPOSABLE_RESOURCES container=%s\n' "$container"
 docker run --detach --name "$container" --label olos-http.disposable-test=true \
+  --tmpfs /var/lib/postgresql/data:rw,size=512m \
   -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=olos_admin_homolog \
   -p 127.0.0.1::5432 postgres:16-bookworm >/dev/null
 ready=false

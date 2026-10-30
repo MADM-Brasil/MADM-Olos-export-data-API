@@ -16,8 +16,13 @@ async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
   const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
-    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once'];
+    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','capture-history'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
+  if (command === 'capture-history') {
+    if (args.length !== 0) throw new WorkerError('HISTORY_PARAMETERS_INVALID');
+    if (!cfg.historyCaptureAuthorized) throw new WorkerError('HISTORY_CAPTURE_NOT_AUTHORIZED');
+    if (!cfg.corporateDelivery || cfg.corporateDelivery.connection.writeEnabled) throw new WorkerError('HISTORY_REQUIRES_CORPORATE_WRITE_DISABLED');
+  }
   if (['corporate-check','corporate-status','corporate-pause','corporate-resume'].includes(command)) { await corporateControl(cfg, command); return; }
   if (command === 'start' || command === 'admin') { await runManaged(cfg, command === 'admin'); return; }
   if (command === 'inspect-schema') {
@@ -42,6 +47,7 @@ async function main() {
   let databaseDisconnected = false;
   const store = new Store(cfg, () => { databaseDisconnected = true; stop(); });
   let http: HttpTransport | undefined;
+  let historicalRecovery = false;
   try {
     await store.open();
     if (command.startsWith('corporate-')) {
@@ -63,6 +69,13 @@ async function main() {
       await store.resolve(args[0], args[1]); log('read_manually_resolved', { read_id: args[0] }); return;
     }
     if (command === 'recover-local') {
+      const pending = await store.unresolved();
+      const history = pending.find(read => read.spec.kind === 'history');
+      if (history) {
+        historicalRecovery = true;
+        if (history.state !== 'received') throw new WorkerError('HISTORY_RECOVERY_REQUIRED');
+        await store.assertHistoryReady({ id: history.id, state: 'received' });
+      }
       if (!cfg.ingestionBaseline || !cfg.sourceTimeZone) {
         throw new WorkerError('RECOVERY_CONFIGURATION_REQUIRED');
       }
@@ -83,7 +96,7 @@ async function main() {
       });
 
       const counts = await store.drain(cache.value);
-      store.delivery?.kick();
+      if (!historicalRecovery) store.delivery?.kick();
       log('local_recovery_completed', counts);
       return;
     }
@@ -108,14 +121,23 @@ async function main() {
       if (command === 'reread') {
         if (!args[0] || !args[1] || !args[2]) throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
         spec = { kind: 'reread', date: args[0], start: args[1], end: args[2] }; readFields(spec);
-      } else spec = { kind: command === 'previous' ? 'previous' : 'current' };
+      } else spec = {
+        kind: command === 'capture-history'
+          ? 'history'
+          : command === 'previous'
+            ? 'previous'
+            : 'current'
+      };
       await worker.cycle(spec, command === 'reread');
     }
     if (databaseDisconnected) throw new WorkerError('DATABASE_SESSION_LOST');
   } finally {
     abort.abort();
-    await http?.close(); await store.close();
-    process.removeListener('SIGTERM', stop); process.removeListener('SIGINT', stop);
+    try { await http?.close(); }
+    finally {
+      try { await store.close(); }
+      finally { process.removeListener('SIGTERM', stop); process.removeListener('SIGINT', stop); }
+    }
   }
 }
 main().catch(error => {

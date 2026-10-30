@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import pg from 'pg';
 import { config, type Config } from '../src/config.js';
 import { Store } from '../src/store.js';
+import { AdminRepository } from '../src/admin/repository.js';
 import { Worker } from '../src/worker.js';
 import { OlosApi } from '../src/api.js';
 import { OlosAuthManager } from '../src/auth.js';
@@ -16,6 +17,10 @@ import { assertNoDirectOwnership } from '../src/corporate-sync/ownership.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { SyncError } from '../src/corporate-sync/errors.js';
 import { fixture } from './corporate-sync.fixture.js';
+import { HttpError, WorkerError } from '../src/errors.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createServer } from 'node:http';
 
 const enabled = process.env.OLOS_DIRECT_DISPOSABLE_TEST === 'true';
 const pause = (ms = 5) => new Promise(resolve => setTimeout(resolve, ms));
@@ -85,7 +90,534 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
   }
   async function ready(cfg = makeConfig()) { const s = await open(cfg); await s.reconcileCorporate(); await s.delivery!.resume(s.client!); return s; }
   async function destinationCount() { return count(remote, 'raw.olos_calls'); }
+  async function pausedQueue(n = 7) {
+    await reset();
+    const cfg = makeConfig(2, { OLOS_CORPORATE_WRITE_ENABLED: 'false' });
+    const s = await open(cfg); await s.reconcileCorporate();
+    await stage(s, Array.from({ length: n }, (_, i) => record(900001 + i)));
+    await close(s); return cfg;
+  }
+  const control = async () => (await local.query('SELECT * FROM olos_http.corporate_control')).rows[0];
+  const outbox = async () => (await local.query('SELECT * FROM olos_http.corporate_outbox ORDER BY target_id')).rows;
+  const historyCatalog = [
+    { TableName: 'AttemptsRawData', Columns: ['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId'] },
+    { TableName: 'Users', Columns: ['AgentId','UserName'] }, { TableName: 'Campaign', Columns: ['CampaignId','Description'] },
+    { TableName: 'Disposition', Columns: ['DispositionId','Description'] },
+  ];
+  async function historyConfig() {
+    const cfg = await pausedQueue(0);
+    await local.query(await readFile(new URL('../admin/migrations/002_worker_administration.sql', import.meta.url), 'utf8'));
+    const admin = new AdminRepository(localUrl.toString(), base.OLOS_SOURCE_KEY);
+    try { await admin.open(120000, 'STOPPED'); } finally { await admin.close(); }
+    return { ...cfg, historyCaptureAuthorized: true, ingestionBaseline: '2026-10-28T14:42:14Z', sourceTimeZone: 'America/Sao_Paulo' };
+  }
+  function historyWorker(s: Store, response: () => Promise<string>) {
+    const auth = new OlosAuthManager(async () => JSON.stringify({ access_token: 'synthetic', expires_in: 3600, token_type: 'bearer' }),
+      { username: 'synthetic', password: 'synthetic', clientId: 'synthetic', clientSecret: 'synthetic' });
+    const api = new OlosApi(async path => {
+      if (path.endsWith('/available-tables')) return JSON.stringify(historyCatalog);
+      if (path.endsWith('/read-data')) return '[]';
+      if (path.endsWith('/read-data-previous-days')) return response();
+      throw new Error('Unexpected synthetic API request');
+    }, auth, async () => {});
+    return new Worker(s, api, new StaticCache(api, 3600000));
+  }
   try {
+    await t.test('history anterior ao baseline entra na outbox sem entrega, preserva recibos e mantém current/previous', async () => {
+      const cfg = await historyConfig(), s = await open(cfg);
+      const before = await outbox(), state = await control();
+      const receipts = (await local.query('SELECT * FROM corporate_sync.receipts ORDER BY internal_id_olos')).rows;
+      const remoteBefore = (await remote.query('SELECT * FROM raw.olos_calls ORDER BY internal_id_olos')).rows;
+      const old = record(301, { StartDate: '2026-09-15T10:00:00-03:00', EndWrap: '2026-09-15T10:00:00.4-03:00' });
+      let requests = 0, kicks = 0;
+      s.delivery!.kick = () => { kicks++; };
+      const worker = historyWorker(s, async () => {
+        requests++;
+        const pending = await s.unresolved(); assert.equal(pending.length, 1); assert.equal(pending[0]!.state, 'reading');
+        assert.equal(pending[0]!.spec.kind, 'history');
+        return JSON.stringify([old, record(302), old, record(100001)]);
+      });
+      const result = await worker.cycle({ kind: 'history' });
+      assert.equal(requests, 1); assert.equal(kicks, 0); assert.equal(result.queued, 2); assert.equal(result.duplicates, 2);
+      const after = await outbox(); assert.deepEqual(after.slice(0,2), before);
+      assert.equal(after.filter(r => r.state === 'pending').length, 2);
+      assert.deepEqual((await local.query('SELECT * FROM corporate_sync.receipts ORDER BY internal_id_olos')).rows, receipts);
+      assert.deepEqual(await control(), state);
+      assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls ORDER BY internal_id_olos')).rows, remoteBefore);
+      assert.equal(await count(local,'raw.olos_calls'), 2);
+      const saved = (await local.query('SELECT spec,state,processed_count,response_body FROM olos_http.reads WHERE id=$1',[result.read_id])).rows[0];
+      assert.equal(saved.spec.kind, 'history'); assert.equal(saved.state, 'done'); assert.equal(saved.processed_count, 4); assert.ok(saved.response_body);
+      for (const kind of ['current','previous'] as const) {
+        const id = await s.beginRead({ kind });
+        await s.stage(id, JSON.stringify([record(kind === 'current' ? 304 : 305)]), 1);
+        assert.equal((await s.drain(cache)).queued, 0);
+      }
+      assert.equal((await outbox()).length, 4);
+    });
+    await t.test('history recupera received após commit parcial sem autorização de novo consumo e sem reaplicar baseline', async () => {
+      const cfg = { ...await historyConfig(), batchSize: 1 }, first = await open(cfg);
+      const id = await first.beginRead({ kind: 'history' });
+      await first.stage(id, JSON.stringify([record(401),record(402)]), 1);
+      await local.query("ALTER TABLE olos_http.corporate_outbox ADD CONSTRAINT synthetic_failure CHECK (source_id <> '402')");
+      await assert.rejects(first.drain(cache));
+      assert.equal((await local.query('SELECT processed_count FROM olos_http.reads WHERE id=$1',[id])).rows[0].processed_count, 1);
+      assert.equal((await first.unresolved())[0]!.state, 'received');
+      const committed = (await outbox()).find(r => r.source_id === '401');
+      await close(first);
+      await assert.rejects(corporateControl(makeConfig(), 'corporate-resume'), /HISTORY_RECOVERY_REQUIRED/);
+      await local.query('ALTER TABLE olos_http.corporate_outbox DROP CONSTRAINT synthetic_failure');
+      const resumed = await open({ ...cfg, historyCaptureAuthorized: false });
+      await assert.rejects(historyWorker(resumed, async () => { throw new Error('must not consume'); }).cycle(), /HISTORY_RECOVERY_REQUIRED/);
+      const result = await resumed.drain(cache);
+      assert.equal(result.queued, 1); assert.equal((await resumed.unresolved()).length, 0);
+      assert.deepEqual((await outbox()).find(r => r.source_id === '401'), committed);
+      assert.equal((await outbox()).filter(r => r.state === 'pending').length, 2);
+      assert.equal(await destinationCount(), 2); assert.equal((await control()).paused, true);
+    });
+    await t.test('history divergente anterior ao baseline não é descartado nem sobrescreve comprovante conciliado', async () => {
+      const cfg = await historyConfig(), s = await open(cfg), before = await outbox();
+      const records = (await local.query('SELECT * FROM olos_http.records ORDER BY target_id')).rows;
+      let requests = 0;
+      const worker = historyWorker(s, async () => {
+        requests++;
+        return JSON.stringify([record(100001,{ CallId: 'divergent-synthetic-call' }),record(601)]);
+      });
+      await assert.rejects(worker.cycle({ kind: 'history' }), /RECOVERY_REQUIRED/);
+      assert.equal(requests, 1); assert.deepEqual(await outbox(), before);
+      assert.deepEqual((await local.query('SELECT * FROM olos_http.records ORDER BY target_id')).rows, records);
+      const read = (await s.unresolved())[0]!;
+      assert.equal(read.state, 'received'); assert.equal(read.processed_count, 0);
+      assert.equal((await local.query('SELECT error_code FROM olos_http.reads WHERE id=$1',[read.id])).rows[0].error_code, 'SOURCE_ID_CONTENT_CONFLICT');
+      assert.equal(await destinationCount(), 2);
+    });
+    await t.test('history valida estado e intenção atomicamente e bloqueia resume durante autenticação e resposta', async () => {
+      const cfg = await historyConfig(), s = await open(cfg);
+      await s.assertHistoryReady();
+      await assert.rejects(corporateControl(makeConfig(), 'corporate-resume'), /HISTORY_CAPTURE_ACTIVE/);
+      const original = s.beginRead.bind(s); let requests = 0;
+      s.beginRead = async (...args) => {
+        await local.query('UPDATE olos_http.corporate_control SET paused=false');
+        return original(...args);
+      };
+      const worker = historyWorker(s, async () => { requests++; return '[]'; });
+      await assert.rejects(worker.cycle({ kind: 'history' }), /HISTORY_CORPORATE_STATE_INVALID/);
+      assert.equal(requests, 0); assert.equal((await s.unresolved()).length, 0);
+      s.beginRead = original;
+      await local.query('UPDATE olos_http.corporate_control SET paused=true');
+      const query = s.client!.query.bind(s.client!);
+      s.client!.query = (async (sql: any, values?: any) => {
+        if (typeof sql === 'string' && sql.startsWith('INSERT INTO olos_http.reads')) {
+          await local.query("SET lock_timeout='50ms'");
+          try {
+            await assert.rejects(local.query('UPDATE olos_http.corporate_control SET paused=false'), (e: any) => e.code === '55P03');
+            await assert.rejects(local.query("UPDATE olos_http.worker_settings SET desired_state='RUNNING',enabled=true"), (e: any) => e.code === '55P03');
+          } finally { await local.query('SET lock_timeout=0'); }
+        }
+        return query(sql,values);
+      }) as pg.PoolClient['query'];
+      const result = await historyWorker(s, async () => {
+        await assert.rejects(corporateControl(makeConfig(), 'corporate-resume'), /HISTORY_CAPTURE_ACTIVE/);
+        requests++; return '[]';
+      }).cycle({ kind: 'history' });
+      s.client!.query = query;
+      assert.equal(result.received, 0); assert.equal(requests, 1); assert.equal((await s.unresolved()).length, 0);
+      assert.equal((await control()).paused, true);
+    });
+    await t.test('history 401/429/timeout/incompleta mantém evidência e bloqueia consumo depois de reinício', async () => {
+      for (const failure of ['401','429','timeout','incomplete','stage-ack'] as const) {
+        const cfg = await historyConfig(); let s = await open(cfg), requests = 0;
+        if (failure === 'stage-ack') {
+          const stageResponse = s.stage.bind(s);
+          s.stage = async (...args) => { await stageResponse(...args); throw new Error('synthetic lost local acknowledgement'); };
+        }
+        const worker = historyWorker(s, async () => {
+          requests++;
+          if (failure === '401' || failure === '429') throw new HttpError(Number(failure));
+          if (failure === 'timeout') throw new WorkerError('NETWORK_OR_RESPONSE_FAILURE',true);
+          return failure === 'incomplete' ? '[{"AttemptsRawDataID":' : JSON.stringify([record(501)]);
+        });
+        await assert.rejects(worker.cycle({ kind: 'history' }), /RECOVERY_REQUIRED/);
+        const pending = (await s.unresolved())[0]!;
+        assert.equal(pending.state, ['incomplete','stage-ack'].includes(failure) ? 'received' : 'reading');
+        assert.equal(requests, 1); await close(s); s = await open(cfg);
+        await assert.rejects(historyWorker(s, async () => { requests++; return '[]'; }).cycle({ kind: 'history' }), /HISTORY_RECOVERY_REQUIRED/);
+        assert.equal(requests, 1);
+        if (failure === 'stage-ack') { assert.equal((await s.drain(cache)).queued, 1); }
+        else await assert.rejects(s.drain(cache), failure === 'incomplete' ? /JSON_INVALID/ : /HISTORY_RECOVERY_REQUIRED/);
+        assert.equal(await destinationCount(), 2); assert.equal((await control()).paused, true);
+      }
+    });
+    await t.test('history bloqueia enabled/runtime e escrita corporativa sem admitir entrega no finally', async () => {
+      const cfg = await historyConfig(), s = await open(cfg);
+      let requests = 0, kicks = 0; s.delivery!.kick = () => { kicks++; };
+      const worker = historyWorker(s, async () => { requests++; return '[]'; });
+      for (const change of ["enabled=true,desired_state='RUNNING'", "runtime_state='RUNNING'", "desired_state='PAUSED'", "runtime_state='PAUSED'"]) {
+        await local.query(`UPDATE olos_http.worker_settings SET ${change}`);
+        await assert.rejects(worker.cycle({ kind: 'history' }), /HISTORY_SCHEDULER_NOT_STOPPED/);
+        await local.query("UPDATE olos_http.worker_settings SET enabled=false,desired_state='STOPPED',runtime_state='STOPPED'");
+      }
+      s.cfg.corporateDelivery!.connection.writeEnabled = true;
+      await assert.rejects(worker.cycle({ kind: 'history' }), /HISTORY_REQUIRES_CORPORATE_WRITE_DISABLED/);
+      assert.equal(requests, 0); assert.equal(kicks, 0); assert.equal((await s.unresolved()).length, 0);
+      assert.equal(await destinationCount(), 2);
+    });
+    await t.test('history CLI usa HTTP simulado, preserva resposta antes de falha local e recover-local não consome novamente', async () => {
+      await historyConfig();
+      await local.query("ALTER TABLE olos_http.corporate_outbox ADD CONSTRAINT synthetic_cli_failure CHECK (source_id <> '801')");
+      let requests = 0, fields = '';
+      const server = createServer((request, response) => {
+        const chunks: Buffer[] = [];
+        request.on('data', chunk => chunks.push(chunk));
+        request.on('end', () => {
+          if (request.url === '/api/auth') response.end(JSON.stringify({ access_token: 'synthetic', expires_in: 3600, token_type: 'bearer' }));
+          else if (request.url?.endsWith('/available-tables')) response.end(JSON.stringify(historyCatalog));
+          else if (request.url?.endsWith('/read-data')) response.end('[]');
+          else if (request.url?.endsWith('/read-data-previous-days')) { requests++; fields = Buffer.concat(chunks).toString(); response.end(JSON.stringify([record(801)])); }
+          else { response.writeHead(500); response.end(); }
+        });
+      });
+      await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve));
+      const env = { ...base, ATTEMPTS_PERSISTENCE_MODE: 'corporate',
+        OLOS_CORPORATE_DATABASE_URL: remoteUrl.toString(), OLOS_CORPORATE_CA_FILE: process.env.OLOS_DIRECT_TEST_CA_FILE!,
+        OLOS_CORPORATE_WRITE_ENABLED: 'false', SOURCE_TIME_ZONE: 'America/Sao_Paulo', INGESTION_BASELINE: '2026-10-28T14:42:14Z',
+        OLOS_HISTORY_CAPTURE_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_HISTORY_CAPTURE',
+        OLOS_BASE_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+        OLOS_USERNAME: 'synthetic', OLOS_PASSWORD: 'synthetic', OLOS_CLIENT_ID: 'synthetic', OLOS_CLIENT_SECRET: 'synthetic' };
+      const cli = (command: string, extra: NodeJS.ProcessEnv = {}) => promisify(execFile)(process.execPath, ['dist/main.js',command], { env: { ...env,...extra }, timeout: 15000 });
+      try {
+        await assert.rejects(cli('capture-history'), (e: any) => e.code === 1 && e.stdout.includes('RECOVERY_REQUIRED'));
+        assert.equal(requests, 1); assert.match(fields,/TableName/); assert.doesNotMatch(fields,/DateExport|PKIDStart|PKIDEnd/);
+        const saved = (await local.query("SELECT * FROM olos_http.reads WHERE spec->>'kind'='history'")).rows[0];
+        assert.equal(saved.state, 'received'); assert.equal(saved.response_body, JSON.stringify([record(801)]));
+        await assert.rejects(cli('capture-history'), (e: any) => e.code === 1 && e.stdout.includes('HISTORY_RECOVERY_REQUIRED'));
+        await local.query('ALTER TABLE olos_http.corporate_outbox DROP CONSTRAINT synthetic_cli_failure');
+        await cli('recover-local', { OLOS_HISTORY_CAPTURE_CONFIRMATION: '' });
+        assert.equal(requests, 1);
+        assert.equal((await local.query('SELECT state FROM olos_http.reads WHERE id=$1',[saved.id])).rows[0].state, 'done');
+        assert.equal((await outbox()).find(r => r.source_id === '801').state, 'pending');
+        assert.equal((await control()).paused, true); assert.equal(await destinationCount(), 2);
+        const admin = new AdminRepository(localUrl.toString(),base.OLOS_SOURCE_KEY);
+        try { await admin.open(120000,'STOPPED'); } finally { await admin.close(); }
+      } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+    });
+    await t.test('history perda de sessão depois da intenção impede POST e mantém reading para reconciliação', async () => {
+      const cfg = await historyConfig(); let s = await open(cfg), requests = 0;
+      const begin = s.beginRead.bind(s);
+      s.beginRead = async (...args) => {
+        const id = await begin(...args);
+        const pid = (await s.client!.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+        await local.query('SELECT pg_terminate_backend($1)',[pid]);
+        await pause(20); return id;
+      };
+      await assert.rejects(historyWorker(s,async () => { requests++; return '[]'; }).cycle({ kind: 'history' }),/RECOVERY_REQUIRED/);
+      await close(s); s = await open(cfg);
+      assert.equal(requests, 0); assert.equal((await s.unresolved())[0]!.state, 'reading');
+      await assert.rejects(historyWorker(s,async () => { requests++; return '[]'; }).cycle({ kind: 'history' }),/HISTORY_RECOVERY_REQUIRED/);
+      assert.equal(requests, 0); assert.equal(await destinationCount(), 2);
+    });
+    await t.test('history timeout HTTP e SIGTERM preservam intenção, não repetem POST e liberam locks', async () => {
+      for (const mode of ['timeout','signal'] as const) {
+        await historyConfig(); let requests = 0, received!: () => void;
+        const consuming = new Promise<void>(resolve => { received = resolve; });
+        const server = createServer((request,response) => {
+          request.resume();
+          request.on('end', () => {
+            if (request.url === '/api/auth') response.end(JSON.stringify({ access_token: 'synthetic', expires_in: 3600, token_type: 'bearer' }));
+            else if (request.url?.endsWith('/available-tables')) response.end(JSON.stringify(historyCatalog));
+            else if (request.url?.endsWith('/read-data')) response.end('[]');
+            else if (request.url?.endsWith('/read-data-previous-days')) { requests++; response.write('['); received(); }
+            else { response.writeHead(500); response.end(); }
+          });
+        });
+        await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve));
+        const env = { ...base, ATTEMPTS_PERSISTENCE_MODE: 'corporate',
+          OLOS_CORPORATE_DATABASE_URL: remoteUrl.toString(), OLOS_CORPORATE_CA_FILE: process.env.OLOS_DIRECT_TEST_CA_FILE!,
+          OLOS_CORPORATE_WRITE_ENABLED: 'false', HTTP_TIMEOUT_MS: '1000',
+          OLOS_HISTORY_CAPTURE_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_HISTORY_CAPTURE',
+          OLOS_BASE_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+          OLOS_USERNAME: 'synthetic', OLOS_PASSWORD: 'synthetic', OLOS_CLIENT_ID: 'synthetic', OLOS_CLIENT_SECRET: 'synthetic' };
+        const cli = () => promisify(execFile)(process.execPath,['dist/main.js','capture-history'],{ env,timeout:15000 });
+        try {
+          const running = cli();
+          const failed = assert.rejects(running,(e: any) => e.code === 1 && e.stdout.includes('RECOVERY_REQUIRED'));
+          if (mode === 'signal') { await consuming; running.child.kill('SIGTERM'); }
+          await failed;
+          assert.equal(requests, 1);
+          const rows = (await local.query("SELECT state,response_body FROM olos_http.reads WHERE spec->>'kind'='history'")).rows;
+          assert.deepEqual(rows, [{ state: 'reading', response_body: null }]);
+          await assert.rejects(cli(), (e: any) => e.code === 1 && e.stdout.includes('HISTORY_RECOVERY_REQUIRED'));
+          assert.equal(requests, 1); assert.equal((await outbox()).length, 2);
+          assert.equal((await control()).paused, true); assert.equal(await destinationCount(), 2);
+          assert.equal((await local.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS ok', [`olos-http:history:${base.OLOS_SOURCE_KEY}`])).rows[0].ok,true);
+          await local.query('SELECT pg_advisory_unlock_all()');
+          const admin = new AdminRepository(localUrl.toString(),base.OLOS_SOURCE_KEY);
+          try { await admin.open(120000,'STOPPED'); } finally { await admin.close(); }
+        } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+      }
+    });
+    await t.test('history exige exclusividade com o Admin', async () => {
+      const cfg = await pausedQueue();
+
+      await local.query(await readFile(
+        new URL('../admin/migrations/002_worker_administration.sql', import.meta.url),
+        'utf8'
+      ));
+
+      const admin = new AdminRepository(localUrl.toString(), 'synthetic-direct');
+      await admin.open(120000, 'STOPPED');
+
+      let adminActive = true;
+      const s = await open({ ...cfg, historyCaptureAuthorized: true });
+
+      try {
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_ADMIN_ACTIVE/
+        );
+
+        await admin.close();
+        adminActive = false;
+
+        await s.assertHistoryReady();
+        await s.assertHistoryReady();
+
+        const competing = new AdminRepository(
+          localUrl.toString(),
+          'synthetic-direct'
+        );
+
+        try {
+          await assert.rejects(
+            competing.open(120000, 'STOPPED'),
+            /SCHEDULER_ALREADY_ACTIVE/
+          );
+        } finally {
+          await competing.close();
+        }
+      } finally {
+        await close(s);
+        if (adminActive) await admin.close();
+      }
+
+      const restarted = new AdminRepository(
+        localUrl.toString(),
+        'synthetic-direct'
+      );
+
+      try {
+        await restarted.open(120000, 'STOPPED');
+        assert.equal((await restarted.settings()).runtime_state, 'STOPPED');
+      } finally {
+        await restarted.close();
+      }
+    });
+
+    await t.test('history bloqueia estados corporativos inválidos e leituras pendentes', async () => {
+      const cfg = await pausedQueue();
+
+      await local.query(await readFile(
+        new URL('../admin/migrations/002_worker_administration.sql', import.meta.url),
+        'utf8'
+      ));
+
+      const admin = new AdminRepository(localUrl.toString(), 'synthetic-direct');
+      await admin.open(120000, 'STOPPED');
+      await admin.close();
+
+      const unauthorized = await open(cfg);
+      try {
+        await assert.rejects(
+          unauthorized.assertHistoryReady(),
+          /HISTORY_CAPTURE_NOT_AUTHORIZED/
+        );
+      } finally {
+        await close(unauthorized);
+      }
+
+      const s = await open({ ...cfg, historyCaptureAuthorized: true });
+
+      try {
+        await s.assertHistoryReady();
+
+        await local.query(
+          `UPDATE olos_http.worker_settings
+           SET desired_state='PAUSED'
+           WHERE source_key='synthetic-direct'`
+        );
+
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_SCHEDULER_NOT_STOPPED/
+        );
+
+        await local.query(
+          `UPDATE olos_http.worker_settings
+           SET desired_state='STOPPED'
+           WHERE source_key='synthetic-direct'`
+        );
+
+        await s.assertHistoryReady();
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET paused=false'
+        );
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_CORPORATE_STATE_INVALID/
+        );
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET paused=true,blocked=true'
+        );
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_CORPORATE_STATE_INVALID/
+        );
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET blocked=false,ready=false'
+        );
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_CORPORATE_STATE_INVALID/
+        );
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET ready=true'
+        );
+
+        const pending = await s.beginRead({ kind: 'history' });
+
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_RECOVERY_REQUIRED/
+        );
+
+        assert.equal(
+          (await local.query(
+            'SELECT state FROM olos_http.reads WHERE id=$1',
+            [pending]
+          )).rows[0].state,
+          'reading'
+        );
+      } finally {
+        await close(s);
+      }
+    });
+
+    await t.test('history falha remota não repete consumo após reinício', async () => {
+      const cfg = await pausedQueue();
+
+      await local.query(await readFile(
+        new URL('../admin/migrations/002_worker_administration.sql', import.meta.url),
+        'utf8'
+      ));
+
+      const admin = new AdminRepository(
+        localUrl.toString(), 'synthetic-direct'
+      );
+      await admin.open(120000, 'STOPPED');
+      await admin.close();
+
+      let consuming = 0;
+
+      const catalog = [
+        { TableName: 'AttemptsRawData', Columns: [
+          'AttemptsRawDataID', 'CallId', 'StartDate',
+          'OriginalPhoneNumber', 'AgentId', 'CampaignId', 'DispositionId'
+        ] },
+        { TableName: 'Users', Columns: ['AgentId', 'UserName'] },
+        { TableName: 'Campaign', Columns: ['CampaignId', 'Description'] },
+        { TableName: 'Disposition', Columns: ['DispositionId', 'Description'] }
+      ];
+
+      const auth = new OlosAuthManager(
+        async () => JSON.stringify({
+          access_token: 'synthetic-token',
+          refresh_token: 'synthetic-refresh',
+          expires_in: 3600,
+          token_type: 'bearer'
+        }),
+        {
+          username: 'fixture',
+          password: 'fixture',
+          clientId: 'fixture',
+          clientSecret: 'fixture'
+        }
+      );
+
+      const api = new OlosApi(async path => {
+        if (path.endsWith('/available-tables')) {
+          return JSON.stringify(catalog);
+        }
+        if (path.endsWith('/read-data')) {
+          return '[]';
+        }
+        if (path.endsWith('/read-data-previous-days')) {
+          consuming++;
+          throw new Error('synthetic uncertain remote response');
+        }
+        throw new Error('Unexpected synthetic API request');
+      }, auth, async () => {});
+
+      const options = {
+        ...cfg,
+        historyCaptureAuthorized: true
+      };
+
+      const first = await open(options);
+
+      try {
+        const worker = new Worker(
+          first, api, new StaticCache(api, 3600000)
+        );
+
+        await assert.rejects(
+          worker.cycle({ kind: 'history' }),
+          /RECOVERY_REQUIRED/
+        );
+
+        assert.equal(consuming, 1);
+
+        const pending = await first.unresolved();
+        assert.equal(pending.length, 1);
+        assert.equal(pending[0]!.state, 'reading');
+        assert.equal(pending[0]!.spec.kind, 'history');
+
+        await assert.rejects(
+          worker.cycle({ kind: 'history' }),
+          /HISTORY_RECOVERY_REQUIRED/
+        );
+
+        assert.equal(consuming, 1);
+      } finally {
+        await close(first);
+      }
+
+      const restarted = await open(options);
+
+      try {
+        const worker = new Worker(
+          restarted, api, new StaticCache(api, 3600000)
+        );
+
+        await assert.rejects(
+          worker.cycle({ kind: 'history' }),
+          /HISTORY_RECOVERY_REQUIRED/
+        );
+
+        assert.equal(consuming, 1);
+        assert.equal((await restarted.unresolved()).length, 1);
+
+        const state = await control();
+        assert.equal(state.paused, true);
+
+        assert.equal((await outbox()).length, 9);
+      } finally {
+        await close(restarted);
+      }
+    });
+
     await t.test('migration is local/idempotent; activation requires reconciliation and explicit write permission', async () => {
       await reset(); await local.query(await readFile(new URL('../migrations/002_corporate_delivery.sql', import.meta.url), 'utf8'));
       const s = await open(makeConfig(2, { OLOS_CORPORATE_WRITE_ENABLED: 'false' }));

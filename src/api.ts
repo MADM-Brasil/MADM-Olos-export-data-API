@@ -11,7 +11,7 @@ export function rows(raw: string): Record<string, unknown>[] {
   if (!Array.isArray(value) || value.some(r => !r || typeof r !== 'object' || Array.isArray(r))) throw new WorkerError('ARRAY_RESPONSE_REQUIRED');
   return value as Record<string, unknown>[];
 }
-export type ReadSpec = { kind: 'current' | 'previous' } | { kind: 'reread'; date: string; start: string; end: string };
+export type ReadSpec = { kind: 'current' | 'previous' | 'history' } | { kind: 'reread'; date: string; start: string; end: string };
 export function readFields(spec: ReadSpec) {
   if (spec.kind !== 'reread') return { TableName: 'AttemptsRawData' };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(spec.date) || !Number.isFinite(Date.parse(spec.date)) || new Date(spec.date).toISOString().slice(0,10) !== spec.date ||
@@ -38,9 +38,16 @@ export class OlosApi {
       }
     }
   }
-  read(spec: ReadSpec) {
+  read(spec: ReadSpec, beforeHistoryRead?: () => Promise<void>) {
+    if (spec.kind === 'history') return this.historyOnce(beforeHistoryRead);
     const path = spec.kind === 'current' ? 'read-data-current-day' : spec.kind === 'previous' ? 'read-data-previous-days' : 're-read-data';
     return this.call(`/api/export-data/${path}`, readFields(spec), true);
+  }
+  private async historyOnce(beforeRead?: () => Promise<void>) {
+    const token = await this.auth.getToken();
+    // Revalidate ownership after authentication, with the durable intent already committed.
+    await beforeRead?.();
+    return this.request('/api/export-data/read-data-previous-days', readFields({ kind: 'history' }), token);
   }
   // Capture is evidence gathering: never replay even an explicitly rejected POST.
   async captureRereadOnce(spec: Extract<ReadSpec, { kind: 'reread' }>) {

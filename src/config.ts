@@ -41,6 +41,9 @@ export function config(env: NodeJS.ProcessEnv = process.env) {
 
       return value;
     })(),
+    historyCaptureAuthorized:
+      env.OLOS_HISTORY_CAPTURE_CONFIRMATION ===
+      'AUTHORIZE_EXPORTDATA_HISTORY_CAPTURE',
     sourceIdConfirmed: env.SOURCE_ID_UNIQUENESS_CONFIRMED === 'true',
     pollMs: integer('POLL_INTERVAL_MS', 2000, 100, 3_600_000),
     timeoutMs: integer('HTTP_TIMEOUT_MS', 10000, 100, 300000),
