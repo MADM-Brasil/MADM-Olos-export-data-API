@@ -5,6 +5,7 @@ import { connect, lock, rollback } from './database.js';
 import { log, retryable, SyncError } from './errors.js';
 import { columns, compare, digest, identityColumns, mapRow, projection, quote, type Row, type Shape } from './mapping.js';
 import { schema } from './schema.js';
+import { assertNoDirectOwnership } from './ownership.js';
 
 function stopped(signal: AbortSignal): void {
   if (signal.aborted) throw new SyncError('STOP_REQUESTED');
@@ -193,6 +194,7 @@ export async function run(cfg: Config, signal: AbortSignal, hooks: Hooks = {}): 
     if (cfg.mode === 'check') { log('checked'); return; }
     if (cfg.mode === 'dry-run') { log('preview', await preview(local, cfg, shape)); return; }
     await lock(local);
+    await assertNoDirectOwnership(local);
     if (!(await controlsExist(local))) throw new SyncError('LOCAL_MIGRATION_REQUIRED');
     await local.query('INSERT INTO corporate_sync.control(singleton,binding) VALUES(true,$1) ON CONFLICT(singleton) DO NOTHING', [cfg.binding]);
     await assertBinding(local, cfg);

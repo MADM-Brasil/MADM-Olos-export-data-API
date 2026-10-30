@@ -35,6 +35,7 @@ function database() {
       async query(sql: string, values: unknown[] = []) {
         queries.push(sql);
         const result = (rows: unknown[] = [], rowCount = rows.length) => ({ rows, rowCount });
+        if (sql.includes("to_regclass('olos_http.corporate_control')")) return result([{ present: false }]);
         if (sql.includes('pg_try_advisory_lock')) {
           ownsLock = !state.locked; state.locked = true;
           return result([{ acquired: ownsLock }]);

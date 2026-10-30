@@ -132,6 +132,7 @@ export class AdminRepository implements SchedulerRepository {
         FROM olos_http.reads WHERE source_key=$1 ORDER BY started_at DESC,id DESC LIMIT 1`, [this.source])).rows[0] ?? null;
       const completed = (await db.query(`SELECT r.id,r.finished_at,r.received_count,
         a.metadata->'inserted' AS inserted,a.metadata->'duplicates' AS duplicates,a.metadata->'duration_ms' AS duration_ms,
+        a.metadata->'queued' AS queued,
         a.id IS NOT NULL AS measured
         FROM olos_http.reads r LEFT JOIN LATERAL (
           SELECT id,metadata FROM olos_http.admin_audit WHERE source_key=$1 AND action='ingestion_cycle_completed'
@@ -143,8 +144,15 @@ export class AdminRepository implements SchedulerRepository {
           WHERE source_key=$1 AND action='scheduler_state' AND metadata->>'state'='ERROR'
         UNION ALL SELECT error_code,started_at FROM olos_http.reads WHERE source_key=$1 AND error_code IS NOT NULL
       ) errors WHERE code IS NOT NULL ORDER BY at DESC LIMIT 1`, [this.source])).rows[0] ?? null;
+      let corporateDelivery = null;
+      if ((await db.query("SELECT to_regclass('olos_http.corporate_control') IS NOT NULL AS present")).rows[0].present) {
+        corporateDelivery = (await db.query(`SELECT ready,paused,blocked,legacy_count::text,confirmed_count::text,
+          failure_count,next_attempt_at,last_code,
+          (SELECT count(*)::text FROM olos_http.corporate_outbox WHERE source_key=$1 AND state='pending') AS pending
+          FROM olos_http.corporate_control WHERE source_key=$1`, [this.source])).rows[0] ?? null;
+      }
       await db.query('ROLLBACK');
-      return { database: { reachable, schema_valid: schemaValid, error: dbError }, ingestion: {
+      return { database: { reachable, schema_valid: schemaValid, error: dbError }, ...(corporateDelivery ? { corporate_delivery: corporateDelivery } : {}), ingestion: {
         status: pending.length ? 'PENDING' : completed ? 'CONFIRMED' : 'NOT_OBSERVED', latest, last_completed: completed, pending, last_error: lastError,
       } };
     } catch (error) {

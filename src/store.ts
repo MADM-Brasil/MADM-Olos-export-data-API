@@ -6,6 +6,8 @@ import { columns, type Cache, type MappedRecord, mapRecord } from './mapping.js'
 import { WorkerError } from './errors.js';
 import { assertSchema, quote } from './schema.js';
 import { lockSource } from './source-lock.js';
+import { CorporateDelivery } from './corporate-delivery/delivery.js';
+import { assertNoDirectOwnership } from './corporate-sync/ownership.js';
 
 type Read = { id: string; spec: ReadSpec; state: string; response_body: string | null; processed_count: number; request_ms: number | null };
 export class Store {
@@ -14,18 +16,24 @@ export class Store {
   private sequence = '';
   private alive = false;
   readonly target: string;
+  readonly delivery: CorporateDelivery | undefined;
   constructor(readonly cfg: Config, private readonly onDisconnect: () => void = () => {}) {
     this.target = `${quote(cfg.schema)}.${quote(cfg.table)}`;
     this.pool = new pg.Pool({ connectionString: cfg.databaseUrl, max: cfg.poolMax,
       connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000, statement_timeout: 30000,
       application_name: 'olos-exportdata-v3-http' });
     this.pool.on('error', () => { this.alive = false; this.onDisconnect(); });
+    if (cfg.corporateDelivery && cfg.poolMax < 2) throw new WorkerError('CORPORATE_LOCAL_POOL_REQUIRES_TWO_CONNECTIONS');
+    this.delivery = cfg.corporateDelivery ? new CorporateDelivery(cfg.corporateDelivery, cfg.sourceKey, this.target, this.pool,
+      () => this.alive, () => { this.alive = false; this.onDisconnect(); }) : undefined;
   }
   async open() {
     this.client = await this.pool.connect();
     this.client.on('error', () => { this.alive = false; this.onDisconnect(); });
     await lockSource(this.client, this.cfg.sourceKey);
     this.alive = true;
+    if (this.delivery) await this.delivery.open(this.client);
+    else await assertNoDirectOwnership(this.client);
     const schema = await assertSchema(this.client, this.cfg.schema, this.cfg.table);
     this.sequence = schema.sequence!;
     for (const table of ['olos_http.reads', 'olos_http.records']) {
@@ -45,10 +53,16 @@ export class Store {
     return this.client;
   }
   async ping() { await this.db().query('SELECT 1'); }
+  async captureReady() { await this.delivery?.captureReady(this.db()); }
+  async reconcileCorporate() {
+    if (!this.delivery) throw new WorkerError('CORPORATE_MODE_REQUIRED');
+    return this.delivery.reconcile(this.db(), this.sequence);
+  }
   async unresolved() {
     return (await this.db().query<Read>("SELECT id,spec,state,response_body,processed_count,request_ms FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at", [this.cfg.sourceKey])).rows;
   }
   async beginRead(spec: ReadSpec, recovery = false) {
+    await this.captureReady();
     const pending = await this.unresolved();
     if (pending.some(r => r.state === 'received') || (!recovery && pending.length)) throw new WorkerError('RECOVERY_REQUIRED');
     const id = randomUUID();
@@ -102,6 +116,7 @@ export class Store {
   }
 
   async beginRecoveryRead(parentId: string, spec: ReadSpec) {
+    await this.captureReady();
     await this.validateRecoveryRead(parentId, spec);
     const id = randomUUID();
     await this.db().query(
@@ -122,19 +137,20 @@ export class Store {
     await this.db().query("UPDATE olos_http.reads SET state='resolved',finished_at=clock_timestamp(),error_code=$2,resolution='HTTP explicit rejection; no successful response' WHERE id=$1 AND source_key=$3 AND state='reading'", [id, code, this.cfg.sourceKey]);
   }
   async drain(cache: Cache) {
-    const total = { received: 0, inserted: 0, updated: 0, duplicates: 0 };
+    const total: { received: number; inserted: number; updated: number; duplicates: number; queued?: number } =
+      { received: 0, inserted: 0, updated: 0, duplicates: 0, ...(this.delivery ? { queued: 0 } : {}) };
     for (const read of await this.unresolved()) {
       if (read.state !== 'received') continue;
       const data = rows(read.response_body!);
       total.received += data.length;
       // Validate the whole response before writing any target rows. Raw response is already durable.
       for (const row of data) {
-        const mapped = mapRecord(row, cache, this.cfg.sourceTimeZone);
+        const mapped = mapRecord(row, cache, this.cfg.sourceTimeZone, !!this.delivery);
         if (read.spec.kind === 'reread' && (BigInt(mapped.source_id) < BigInt(read.spec.start) || BigInt(mapped.source_id) > BigInt(read.spec.end))) throw new WorkerError('RECOVERY_RESPONSE_OUTSIDE_RANGE');
       }
       for (let offset = read.processed_count; offset < data.length; offset += this.cfg.batchSize) {
         const mapped = data.slice(offset, offset + this.cfg.batchSize)
-          .map(row => mapRecord(row, cache, this.cfg.sourceTimeZone));
+          .map(row => mapRecord(row, cache, this.cfg.sourceTimeZone, !!this.delivery));
 
         const baseline = this.cfg.ingestionBaseline;
 
@@ -151,6 +167,7 @@ export class Store {
           data.length
         );
         total.inserted += result.inserted; total.updated += result.updated; total.duplicates += result.duplicates;
+        if ('queued' in result && result.queued !== undefined) total.queued = (total.queued ?? 0) + result.queued;
       }
       await this.db().query("UPDATE olos_http.reads SET state='done',finished_at=clock_timestamp(),received_count=$2 WHERE id=$1 AND source_key=$3 AND processed_count=$2", [read.id, data.length, this.cfg.sourceKey]);
     }
@@ -164,6 +181,17 @@ export class Store {
       unique.set(row.source_id, row);
     }
     const batch = [...unique.values()];
+
+    if (this.delivery) {
+      await db.query('BEGIN');
+      try {
+        const result = await this.delivery.enqueue(db, this.sequence, batch);
+        await db.query('UPDATE olos_http.reads SET processed_count=$2,received_count=$3 WHERE id=$1', [readId, processed, received]);
+        await db.query('COMMIT');
+        // Queued locally is not a corporate INSERT or acknowledgement.
+        return { inserted: 0, updated: 0, queued: result.queued, duplicates: input.length - result.queued };
+      } catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
+    }
 
     if (batch.length === 0) {
       await db.query('BEGIN');
@@ -221,6 +249,7 @@ export class Store {
     } catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
   }
   async reconcileNames(cache: Cache) {
+    if (this.delivery) return 0; // Frozen corporate calls are never rewritten by reference-cache refreshes.
     let updated = 0;
     const db = this.db();
     for (const [refs, refColumn, destColumn] of [[cache.users,'agent_id','nome_agente'],[cache.campaigns,'campaign_id','nome_campanha_olos'],[cache.dispositions,'disposition_id','nome_tabulacao_olos']] as const) {
@@ -240,8 +269,11 @@ export class Store {
     if (result.rowCount !== 1) throw new WorkerError('UNRESOLVED_READ_NOT_FOUND');
   }
   async close() {
-    this.alive = false;
-    if (this.client) { this.client.release(true); this.client = undefined; }
-    await this.pool.end();
+    try { await this.delivery?.close(); }
+    finally {
+      this.alive = false;
+      if (this.client) { this.client.release(true); this.client = undefined; }
+      await this.pool.end();
+    }
   }
 }

@@ -2,7 +2,10 @@ import { AuthUnavailable, HttpError, WorkerError, errorCode, log } from './error
 import { sleep } from './http.js';
 import { interval, type Mode, type State, type SchedulerRepository, type Settings } from './admin/repository.js';
 
-export interface ScheduledConsumer { cycle(): Promise<void>; close(): Promise<void> }
+export interface ScheduledConsumer {
+  cycle(): Promise<void>; close(): Promise<void>;
+  suspendDelivery?(): void; resumeDelivery?(): void; settleDelivery?(): Promise<void>;
+}
 export class DynamicScheduler {
   private running = false;
   private terminating = false;
@@ -47,6 +50,7 @@ export class DynamicScheduler {
     if (this.terminating) return Promise.reject(new WorkerError('SCHEDULER_SHUTTING_DOWN'));
     if (patch.interval_ms !== undefined) interval(patch.interval_ms);
     // Close admission synchronously, before the persistence await.
+    if (patch.mode && patch.mode !== 'RUNNING') this.consumer?.suspendDelivery?.();
     this.mutations++;
     const request = this.requests.then(async () => {
       await this.repository.change(actor, patch);
@@ -59,7 +63,7 @@ export class DynamicScheduler {
     this.requests = request.catch(() => {});
     return request.finally(() => { this.mutations--; this.notify(); });
   }
-  shutdown() { this.terminating = true; this.notify(); }
+  shutdown() { this.terminating = true; this.consumer?.suspendDelivery?.(); this.notify(); }
   private async release() { if (this.consumer) { await this.consumer.close(); this.consumer = undefined; } }
   async run() {
     if (this.running) throw new WorkerError('SCHEDULER_ALREADY_ACTIVE');
@@ -84,7 +88,11 @@ export class DynamicScheduler {
             if (this.actual === 'ERROR') { await this.release(); await this.state('STOPPED'); }
           }
           if (mode === 'STOPPED') { await this.release(); await this.state('STOPPED'); this.next = null; await this.wait(); continue; }
-          if (mode === 'PAUSED') { await this.state('PAUSED'); this.next = null; await this.wait(); continue; }
+          if (mode === 'PAUSED') {
+            this.consumer?.suspendDelivery?.();
+            await this.consumer?.settleDelivery?.();
+            await this.state('PAUSED'); this.next = null; await this.wait(); continue;
+          }
           if (!this.consumer) {
             this.consumer = await this.createConsumer(); // validates source lock, pending reads and configuration
             continue; // re-read settings after async preflight, before any consuming request
@@ -99,6 +107,7 @@ export class DynamicScheduler {
           if (due > this.clock.now()) { await this.wait(due - this.clock.now()); continue; }
           // No await between admission and starting the only consumer cycle.
           this.active = true; this.next = null;
+          this.consumer.resumeDelivery?.();
           try {
             await this.consumer.cycle(); this.failures = 0; this.retryNotBefore = 0;
           } catch (error) {

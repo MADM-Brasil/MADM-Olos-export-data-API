@@ -20,6 +20,7 @@ export async function createScheduledConsumer(cfg: Config,
   let http: HttpTransport | undefined, worker: Worker | undefined, revision = -1;
   try {
     await store.open();
+    await store.captureReady();
     if ((await store.unresolved()).length) throw new WorkerError('RECOVERY_REQUIRED');
     const initial = await snapshot();
     if (!Object.values(initial.credentials).every(Boolean)) throw new WorkerError('OLOS_CONFIG_REQUIRED');
@@ -43,6 +44,9 @@ export async function createScheduledConsumer(cfg: Config,
       // Telemetry failure must not replay a committed remote read; caller stops on this local failure.
       if (completed) await completed(report);
     },
+    suspendDelivery() { store.delivery?.suspend(); },
+    resumeDelivery() { store.delivery?.allow(); },
+    async settleDelivery() { await store.delivery?.settle(); },
     async close() { await http?.close(); await store.close(); },
   };
 }

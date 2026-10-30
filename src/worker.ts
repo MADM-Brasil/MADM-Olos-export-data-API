@@ -4,7 +4,7 @@ import { Store } from './store.js';
 import { AuthUnavailable, HttpError, WorkerError, errorCode, log } from './errors.js';
 import { sleep } from './http.js';
 
-export type CycleReport = { read_id: string; received: number; inserted: number; updated: number; duplicates: number; request_ms: number; persistence_ms: number; duration_ms: number };
+export type CycleReport = { read_id: string; received: number; inserted: number; updated: number; duplicates: number; queued?: number; request_ms: number; persistence_ms: number; duration_ms: number };
 
 export async function sequentialPolling(cycle: () => Promise<void>, intervalMs: number, signal: AbortSignal,
   wait: (ms: number) => Promise<unknown> = ms => sleep(ms, signal), maxFailures = 5,
@@ -111,6 +111,7 @@ export class Worker {
     try {
       readFields(spec);
       await this.store.ping();
+      await this.store.captureReady();
       const existing = await this.store.unresolved();
       if (existing.some(r => r.state === 'reading') && !recovery) throw new WorkerError('RECOVERY_REQUIRED');
       await this.initialize();
@@ -144,6 +145,6 @@ export class Worker {
         log('recovery_required', { read_id: id, error: errorCode(error) });
         throw new WorkerError('RECOVERY_REQUIRED');
       }
-    } finally { this.active = false; }
+    } finally { this.active = false; this.store.delivery?.kick(); }
   }
 }

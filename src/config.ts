@@ -1,4 +1,5 @@
 import { WorkerError } from './errors.js';
+import { deliveryConfig } from './corporate-delivery/config.js';
 export function olosTlsVerify(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = env.OLOS_TLS_VERIFY ?? 'true';
   if (value !== 'true' && value !== 'false') throw new WorkerError('CONFIG_INVALID_OLOS_TLS_VERIFY');
@@ -21,6 +22,7 @@ export function config(env: NodeJS.ProcessEnv = process.env) {
     return value;
   };
   return {
+    corporateDelivery: deliveryConfig(env),
     databaseUrl: required('DATABASE_URL'),
     baseUrl: env.OLOS_BASE_URL ?? '', username: env.OLOS_USERNAME ?? '', password: env.OLOS_PASSWORD ?? '',
     clientId: env.OLOS_CLIENT_ID ?? '', clientSecret: env.OLOS_CLIENT_SECRET ?? '',

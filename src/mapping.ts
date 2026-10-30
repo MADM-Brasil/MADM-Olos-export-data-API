@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { DateTime } from 'luxon';
 import { WorkerError } from './errors.js';
+import { tma } from './corporate-sync/mapping.js';
 
 export const columns = ['olos_call_id', 'data_ligacao', 'telefone', 'nome_agente', 'id_campanha_olos',
   'nome_campanha_olos', 'id_tabulacao_olos', 'nome_tabulacao_olos', 'cpf', 'lead_id_origem', 'tma_origem',
@@ -47,7 +48,8 @@ function campaignField(
 export function handlingSeconds(
   start: unknown,
   end: unknown,
-  zone?: string
+  zone?: string,
+  corporate = false
 ): number | null {
   if (start == null || end == null || start === '' || end === '') {
     return null;
@@ -55,6 +57,19 @@ export function handlingSeconds(
 
   const startIso = timestamp(start, zone)!;
   const endIso = timestamp(end, zone)!;
+
+  if (corporate) {
+    // Avoid the legacy centisecond rounding before the approved corporate integer conversion.
+    const micros = (iso: string) => {
+      const fraction = /\.(\d{1,6})/.exec(iso)?.[1] ?? '';
+      const seconds = Math.floor(DateTime.fromISO(iso, { setZone: true }).toSeconds());
+      return BigInt(seconds) * 1_000_000n + BigInt(fraction.padEnd(6, '0'));
+    };
+    const duration = micros(endIso) - micros(startIso);
+    if (duration < 0n) return null;
+    return Number(tma(`${duration / 1_000_000n}.${(duration % 1_000_000n).toString().padStart(6, '0')}`,
+      { tmaPolicy: 'round-half-away', tmaConfirmed: true }));
+  }
 
   const startMs = DateTime.fromISO(startIso, { setZone: true }).toMillis();
   const endMs = DateTime.fromISO(endIso, { setZone: true }).toMillis();
@@ -66,7 +81,7 @@ export function handlingSeconds(
   return Number(seconds.toFixed(2));
 }
 
-export function mapRecord(row: Record<string, unknown>, cache: Cache, zone?: string) {
+export function mapRecord(row: Record<string, unknown>, cache: Cache, zone?: string, corporate = false) {
   const source: Record<string, string | null> = {};
   for (const key of sourceColumns) source[key] = textValue(row[key]);
   const id = source.AttemptsRawDataID;
@@ -87,7 +102,7 @@ export function mapRecord(row: Record<string, unknown>, cache: Cache, zone?: str
     lead_id_origem: null,
     tma_origem:
       agentId && agentId !== '0' && agentId !== '-1'
-        ? handlingSeconds(source.StartDate, source.EndWrap, zone)
+        ? handlingSeconds(source.StartDate, source.EndWrap, zone, corporate)
         : null,
     razao_desligamento:
       dispositionId === '3' || dispositionId === '4'

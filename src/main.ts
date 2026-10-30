@@ -10,12 +10,15 @@ import { Worker } from './worker.js';
 import { runManaged } from './admin/main.js';
 import { WorkerError, errorCode, log } from './errors.js';
 import { inspectSchema } from './schema.js';
+import { corporateControl } from './corporate-delivery/commands.js';
 
 async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
-  const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names'];
+  const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
+    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
+  if (['corporate-check','corporate-status','corporate-pause','corporate-resume'].includes(command)) { await corporateControl(cfg, command); return; }
   if (command === 'start' || command === 'admin') { await runManaged(cfg, command === 'admin'); return; }
   if (command === 'inspect-schema') {
     const pool = new pg.Pool({ connectionString: cfg.databaseUrl, max: 1, connectionTimeoutMillis: 10000, statement_timeout: 10000 });
@@ -41,6 +44,15 @@ async function main() {
   let http: HttpTransport | undefined;
   try {
     await store.open();
+    if (command.startsWith('corporate-')) {
+      if (!store.delivery || !store.client) throw new WorkerError('CORPORATE_MODE_REQUIRED');
+      if (command === 'corporate-reconcile') log('corporate_legacy_reconciled', { confirmed: await store.reconcileCorporate() });
+      if (command === 'corporate-deliver-once') {
+        if (!cfg.corporateDelivery?.connection.writeEnabled) throw new WorkerError('CORPORATE_WRITE_NOT_AUTHORIZED');
+        await store.delivery.tick();
+      }
+      return;
+    }
     if (command === 'check') { log('database_preflight_passed'); return; }
     if (command === 'status') {
       for (const row of await store.unresolved()) log('pending_read', { read_id: row.id, state: row.state, processed: row.processed_count });
@@ -71,6 +83,7 @@ async function main() {
       });
 
       const counts = await store.drain(cache.value);
+      store.delivery?.kick();
       log('local_recovery_completed', counts);
       return;
     }
