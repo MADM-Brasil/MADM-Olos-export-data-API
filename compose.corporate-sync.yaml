@@ -15,7 +15,7 @@ services:
     volumes:
       - /opt/madm-corporate-sync/certs/madm-postgres-ca.pem:/run/secrets/madm-postgres-ca.pem:ro
     init: true
-    restart: "no"
+    restart: "${CORPORATE_SYNC_RESTART_POLICY:-no}"
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
