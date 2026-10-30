@@ -8,7 +8,7 @@ services:
     command: ["${CORPORATE_SYNC_COMMAND:-check}"]
     env_file:
       - path: .env
-      - path: /opt/madm-corporate-sync/private/corporate-sync.credentials.env
+      - path: /etc/dokploy/private/madm-corporate-sync/credentials.env
         format: raw
     networks:
       - olos-exportdata-backend
