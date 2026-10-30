@@ -7,7 +7,9 @@ services:
       dockerfile: Dockerfile.corporate-sync
     command: ["${CORPORATE_SYNC_COMMAND:-check}"]
     env_file:
-      - .env
+      - path: .env
+      - path: /opt/madm-corporate-sync/private/corporate-sync.credentials.env
+        format: raw
     networks:
       - olos-exportdata-backend
     extra_hosts:
