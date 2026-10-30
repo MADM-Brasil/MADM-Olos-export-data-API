@@ -1,0 +1,18 @@
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json tsconfig.corporate-sync.json ./
+COPY src/corporate-sync ./src/corporate-sync
+RUN ./node_modules/.bin/tsc -p tsconfig.corporate-sync.json && npm prune --omit=dev
+
+FROM node:24-bookworm-slim AS runtime
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist/corporate-sync ./dist/corporate-sync
+COPY --chown=node:node package.json ./
+COPY --chown=node:node migrations/corporate-sync ./migrations/corporate-sync
+USER node
+ENTRYPOINT ["node", "dist/corporate-sync/cli.js"]
+CMD ["check"]

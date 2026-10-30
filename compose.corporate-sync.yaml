@@ -1,0 +1,32 @@
+# Standalone project. Never combine with operational compose.yaml.
+name: olos-corporate-sync
+services:
+  corporate-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile.corporate-sync
+    command: ["${CORPORATE_SYNC_COMMAND:-check}"]
+    networks:
+      - olos-exportdata-backend
+    extra_hosts:
+      - "ip-172-31-1-161.sa-east-1.compute.internal:15.229.217.74"
+    volumes:
+      - /opt/madm-corporate-sync/certs/madm-postgres-ca.pem:/run/secrets/madm-postgres-ca.pem:ro
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 5m
+    mem_limit: 512m
+    cpus: 1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  olos-exportdata-backend:
+    external: true
+    name: olos-export-data-madmolosexportdataapi-vqrnw6_backend
