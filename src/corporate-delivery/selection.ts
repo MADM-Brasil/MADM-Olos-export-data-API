@@ -6,6 +6,7 @@ export interface DeliverySelection {
   sourceIds: readonly string[];
   confirmation: string;
   historyReadId?: string;
+  contract?: 'v1';
 }
 
 // Deliberately independent of the authorization for the general queue. Bind consent
@@ -13,6 +14,9 @@ export interface DeliverySelection {
 export function validateSelection(cfg: DeliveryConfig | undefined, selection: DeliverySelection, action: 'delivery' | 'reconciliation' = 'delivery', attemptId?: string): string[] {
   if (!cfg) throw new SyncError('CORPORATE_MODE_REQUIRED');
   if (cfg.connection.writeEnabled) throw new SyncError('SELECTIVE_REQUIRES_GENERAL_WRITE_DISABLED');
+  if (selection.contract !== undefined && (selection.contract !== 'v1' || selection.historyReadId === undefined)) {
+    throw new SyncError('SELECTIVE_CONTRACT_SCOPE_INVALID');
+  }
   const ids = [...selection.sourceIds];
   validatePreservedHistory(selection.historyReadId, ids);
   if (ids.length < 1 || ids.length > 3 || new Set(ids).size !== ids.length ||
@@ -29,8 +33,20 @@ export function validateSelection(cfg: DeliveryConfig | undefined, selection: De
   return ids;
 }
 
+// Explicit v1 is restricted to this historical exception; default/v2 callers
+// retain the existing grammar and operator adoption requirements.
+function parseContract(args: string[]): { args: string[]; historyReadId?: string; contract?: 'v1' } {
+  const parsed = parsePreservedHistory(args);
+  const index = parsed.args.indexOf('--contract');
+  if (index === -1) return parsed;
+  if (index !== parsed.args.length - 2 || parsed.args[index + 1] !== 'v1' || parsed.historyReadId === undefined) {
+    throw new SyncError('SELECTIVE_CONTRACT_SCOPE_INVALID');
+  }
+  return { ...parsed, args: parsed.args.slice(0, index), contract: 'v1' };
+}
+
 export function parseSelection(cfg: DeliveryConfig | undefined, args: string[]): DeliverySelection {
-  const { args: parameters, ...history } = parsePreservedHistory(args);
+  const { args: parameters, ...history } = parseContract(args);
   args = parameters;
   if (args.length !== 4 || args[0] !== '--source-ids' || args[2] !== '--confirm') {
     throw new SyncError('SELECTIVE_PARAMETERS_INVALID');
@@ -42,7 +58,7 @@ export function parseSelection(cfg: DeliveryConfig | undefined, args: string[]):
 
 export interface ReconciliationSelection extends DeliverySelection { attemptId: string }
 export function parseReconciliation(cfg: DeliveryConfig | undefined, args: string[]): ReconciliationSelection {
-  const { args: parameters, ...history } = parsePreservedHistory(args);
+  const { args: parameters, ...history } = parseContract(args);
   args = parameters;
   if (args.length !== 6 || args[0] !== '--source-ids' || args[2] !== '--attempt-id' || args[4] !== '--confirm') {
     throw new SyncError('SELECTIVE_PARAMETERS_INVALID');

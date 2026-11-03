@@ -104,3 +104,34 @@ test('selective reconciliation consent is distinct, bound to attempt ID and exac
   await assert.rejects(delivery.reconcileSelected({ ...request, confirmation: selectedConsent }), /WRITE_NOT_AUTHORIZED/);
   assert.equal(connections, 0);
 });
+
+test('v1 historical selection requires explicit contract, exact set/read and separate reconciliation consent before connecting', async () => {
+  const cfg = deliveryConfig(env)!;
+  const ids = ['47561569','47559439','47558756'];
+  const historyReadId = '132eb226-f4e4-419d-b79f-21dd0e6e64c1';
+  const confirmation = `AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${ids.join(',')}`;
+  const prefix = ['--source-ids',ids.join(','),'--confirm',confirmation];
+  const suffix = ['--contract','v1','--preserve-history-read',historyReadId];
+  const selection = { sourceIds: ids, confirmation, historyReadId, contract: 'v1' as const };
+  assert.deepEqual(parseSelection(cfg,[...prefix,...suffix]),selection);
+  assert.equal(parseSelection(cfg,[...prefix,'--preserve-history-read',historyReadId]).contract,undefined);
+  for (const args of [[...prefix,'--contract','v1'], [...prefix,...suffix,'extra'],
+    [...prefix,'--contract','v2','--preserve-history-read',historyReadId],
+    [...prefix,'--contract','v1','--contract','v1','--preserve-history-read',historyReadId]]) {
+    assert.throws(()=>parseSelection(cfg,args),/SCOPE_INVALID|PARAMETERS_INVALID/);
+  }
+  const attemptId='11111111-1111-4111-8111-111111111111';
+  const consent=`AUTHORIZE_EXPORTDATA_SELECTIVE_RECONCILIATION:${attemptId}:${ids.join(',')}`;
+  assert.deepEqual(parseReconciliation(cfg,['--source-ids',ids.join(','),'--attempt-id',attemptId,'--confirm',consent,...suffix]),
+    {...selection,attemptId,confirmation:consent});
+  let connections=0;
+  const pool={connect:async()=>{connections++;throw new Error('must not connect');}} as unknown as Pool;
+  const delivery=new CorporateDelivery(cfg,'synthetic','"raw"."olos_calls"',pool,()=>true,()=>{});
+  for (const sourceIds of [ids.slice(0,2),['47561569','47559439','1'],[...ids,'1'],[ids[0]!,ids[0]!,ids[1]!]]) {
+    await assert.rejects(delivery.deliverSelected({...selection,sourceIds}),/HISTORY_HOMOLOGATION_SCOPE_INVALID/);
+  }
+  await assert.rejects(delivery.deliverSelected({...selection,historyReadId:attemptId}),/HISTORY_HOMOLOGATION_SCOPE_INVALID/);
+  await assert.rejects(delivery.deliverSelected({sourceIds:ids,confirmation,contract:'v1'}),/SELECTIVE_CONTRACT_SCOPE_INVALID/);
+  await assert.rejects(delivery.reconcileSelected({...selection,attemptId}),/SELECTIVE_WRITE_NOT_AUTHORIZED/);
+  assert.equal(connections,0);
+});

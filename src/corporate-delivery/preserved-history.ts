@@ -1,12 +1,14 @@
 import type { PoolClient } from 'pg';
 import { SyncError } from '../corporate-sync/errors.js';
+import { columns } from '../corporate-sync/mapping.js';
+import { operatorColumn } from './payload.js';
 
 // Incident-scoped authorization, never a general pending-read bypass.
 export const preservedHistoryRead = '132eb226-f4e4-419d-b79f-21dd0e6e64c1';
 export const historyHomologation = [
-  { source_id: '47561569', agent_id: '1658', target_id: '725262' },
-  { source_id: '47559439', agent_id: '1467', target_id: '724965' },
-  { source_id: '47558756', agent_id: '1565', target_id: '724892' },
+  { source_id: '47561569', agent_id: '1658', target_id: '725262', olos_call_id: '1031756916' },
+  { source_id: '47559439', agent_id: '1467', target_id: '724965', olos_call_id: '1031754969' },
+  { source_id: '47558756', agent_id: '1565', target_id: '724892', olos_call_id: '1031754587' },
 ] as const;
 
 export function validatePreservedHistory(readId: string | undefined, ids?: readonly string[]): void {
@@ -28,7 +30,7 @@ export function parsePreservedHistory(args: string[]): { args: string[]; history
 
 // Source/Sync locks are owned by Store. The caller also holds delivery/history
 // session locks. This Admin session lock survives the selective intent COMMIT.
-export async function assertPreservedHistory(local: PoolClient, source: string, readId: string, requireOperator = false): Promise<void> {
+export async function assertPreservedHistory(local: PoolClient, source: string, readId: string, contract?: 'v1' | 'v2'): Promise<void> {
   validatePreservedHistory(readId);
   if (!(await local.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS ok',
     [`olos-admin:${source}`])).rows[0].ok) throw new SyncError('HISTORY_ADMIN_ACTIVE');
@@ -47,6 +49,9 @@ export async function assertPreservedHistory(local: PoolClient, source: string, 
   if (!control?.ready || !control.paused || control.source_key !== source || control.target_table !== read.target_table) {
     throw new SyncError('HISTORY_CORPORATE_STATE_INVALID');
   }
+  if (contract === 'v1' && new Map(control.destination_shape).has(operatorColumn)) {
+    throw new SyncError('HISTORY_V1_SCHEMA_REQUIRED');
+  }
   // SQL compares timestamps at full PostgreSQL precision. No record from the
   // failed read, or from a later capture, may be admitted by this exception.
   const entries = (await local.query(`SELECT r.source_id,r.agent_id,r.target_id::text,o.payload,
@@ -58,10 +63,15 @@ export async function assertPreservedHistory(local: PoolClient, source: string, 
   [source, readId, read.target_table, historyHomologation.map(row => row.source_id)])).rows;
   if (entries.length !== 3 || historyHomologation.some(expected => !entries.some(entry =>
     entry.valid && entry.source_id === expected.source_id && entry.agent_id === expected.agent_id &&
-    entry.target_id === expected.target_id && (!requireOperator || entry.payload.id_operador_olos === expected.agent_id)))) {
+    entry.target_id === expected.target_id && (contract !== 'v2' || entry.payload.id_operador_olos === expected.agent_id) &&
+    (contract !== 'v1' || entry.payload.olos_call_id === expected.olos_call_id)))) {
     throw new SyncError('HISTORY_HOMOLOGATION_RECORD_CHANGED');
   }
-  if (requireOperator && !(await local.query(`SELECT 1 FROM olos_http.corporate_operator_contracts
+  // Never strip v2 fields or rebuild a v1 payload. Hash verification remains in
+  // the existing delivery protocol, before writes and after the durable intent.
+  if (contract === 'v1' && entries.some(entry => Object.keys(entry.payload).length !== columns.length ||
+    columns.some(name => !Object.hasOwn(entry.payload, name)))) throw new SyncError('HISTORY_V1_PAYLOAD_REQUIRED');
+  if (contract === 'v2' && !(await local.query(`SELECT 1 FROM olos_http.corporate_operator_contracts
     WHERE source_key=$1 AND binding=$2 AND target_table=$3 AND schema_hash=$4`,
   [source, control.binding, control.target_table, control.schema_hash])).rowCount) {
     throw new SyncError('OPERATOR_CONTRACT_ADOPTION_REQUIRED');

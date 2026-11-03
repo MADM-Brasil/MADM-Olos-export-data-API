@@ -14,12 +14,12 @@ export interface SelectedEntry {
   state: 'pending' | 'confirmed'; remote_raw_id: string | null; source_hash: string;
   origin: string; record_hash: string; record_target_id: string; target_table: string;
 }
-export async function lockSelection(local: PoolClient, source: string, historyReadId?: string, requireOperator = false): Promise<void> {
+export async function lockSelection(local: PoolClient, source: string, historyReadId?: string, contract?: 'v1' | 'v2'): Promise<void> {
   // Session locks survive the local COMMIT intent; release(true) destroys this session.
   if (!(await local.query('SELECT pg_try_advisory_lock(17320914,4) AS ok')).rows[0].ok) throw new SyncError('CORPORATE_DELIVERY_BUSY');
   if (!(await local.query('SELECT pg_try_advisory_lock_shared(hashtextextended($1,0)) AS ok',
     [`olos-http:history:${source}`])).rows[0].ok) throw new SyncError('HISTORY_CAPTURE_ACTIVE');
-  if (historyReadId !== undefined) await assertPreservedHistory(local, source, historyReadId, requireOperator);
+  if (historyReadId !== undefined) await assertPreservedHistory(local, source, historyReadId, contract);
   else if ((await local.query("SELECT 1 FROM olos_http.reads WHERE source_key=$1 AND spec->>'kind'='history' AND state IN ('reading','received') LIMIT 1",
     [source])).rowCount) throw new SyncError('HISTORY_RECOVERY_REQUIRED');
   if (!(await local.query("SELECT to_regclass('olos_http.corporate_selective_commits') IS NOT NULL AS ok")).rows[0].ok) {

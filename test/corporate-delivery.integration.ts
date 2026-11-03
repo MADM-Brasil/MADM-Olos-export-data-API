@@ -986,19 +986,23 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       confirmation: `AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${incidentIds.join(',')}` };
     const incidentPrepare: OperatorRequest = { kind: 'prepare', ids: incidentIds, historyReadId: preservedHistoryRead,
       confirmation: `AUTHORIZE_EXPORTDATA_OPERATOR_PAYLOADS:${incidentIds.join(',')}` };
-    async function incidentFixture() {
-      const cfg = { ...await historyConfig(), ingestionBaseline: '2026-09-01T00:00:00Z' }; await operatorLocalMigrations();
+    async function incidentFixture(contract: 'v1' | 'v2' = 'v2') {
+      const cfg = { ...await historyConfig(), ingestionBaseline: '2026-09-01T00:00:00Z' };
+      // Disposable fixture provisioning only. V1 has no operator tables or column.
+      if (contract === 'v2') await operatorLocalMigrations();
+      else await local.query(await readFile(new URL('../migrations/003_selective_commit.sql', import.meta.url), 'utf8'));
       const s = await open(cfg);
       await stage(s, [record(900001)]); // Unrelated frozen v1 backlog must survive.
       for (const row of historyHomologation) {
         await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),$1)", [Number(row.target_id)-1]);
-        await stage(s, [record(Number(row.source_id), { AgentId: row.agent_id })]);
+        await stage(s, [record(Number(row.source_id), { AgentId: row.agent_id,
+          ...(contract === 'v1' ? { CallId: row.olos_call_id } : {}) })]);
       }
       await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),725262)");
       await close(s);
       await local.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,error_code)
         VALUES($1,$2,$3,'{"kind":"history"}','RESPONSE_TOO_LARGE')`, [preservedHistoryRead,cfg.sourceKey,'"raw"."olos_calls"']);
-      await operatorMigration();
+      if (contract === 'v2') await operatorMigration();
       return cfg;
     }
     async function incidentAdopt(cfg: Config) {
@@ -1015,6 +1019,160 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       receipts: (await local.query('SELECT * FROM corporate_sync.receipts ORDER BY internal_id_olos')).rows,
       others: (await local.query('SELECT * FROM olos_http.corporate_outbox WHERE NOT(source_id=ANY($1::text[])) ORDER BY target_id',[incidentIds])).rows,
       sequence: (await local.query('SELECT last_value,is_called FROM raw.olos_calls_internal_id_olos_seq')).rows,
+    });
+    const incidentV1: DeliverySelection = {...incidentSelection,contract:'v1'};
+    const v1Receipts = async () => (await local.query('SELECT * FROM olos_http.corporate_outbox WHERE source_id=ANY($1::text[]) ORDER BY target_id',[incidentIds])).rows;
+    const remoteRows = async () => (await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+    const corporateMetadata = async () => ({
+      columns:(await remote.query("SELECT * FROM information_schema.columns WHERE table_schema='raw' AND table_name='olos_calls' ORDER BY ordinal_position")).rows,
+      indexes:(await remote.query("SELECT * FROM pg_indexes WHERE schemaname='raw' AND tablename='olos_calls' ORDER BY indexname")).rows,
+      constraints:(await remote.query("SELECT conname,pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='raw.olos_calls'::regclass ORDER BY conname")).rows,
+      triggers:(await remote.query("SELECT tgname,pg_get_triggerdef(oid) AS definition FROM pg_trigger WHERE tgrelid='raw.olos_calls'::regclass ORDER BY tgname")).rows,
+      functions:(await remote.query("SELECT pg_get_functiondef('raw.fn_olos_calls_normalizar_telefone()'::regprocedure),pg_get_functiondef('core.gerar_telefone_match_key(text)'::regprocedure)")).rows,
+    });
+    await t.test('v1 preserved history CLI: exactly 14 frozen fields, unchanged schema/history/Kommo/backlog, zero OLOS and idempotent replay', async () => {
+      const cfg=await incidentFixture('v1');
+      assert.equal((await local.query("SELECT to_regclass('olos_http.corporate_operator_contracts') IS NULL AND to_regclass('olos_http.corporate_operator_payloads') IS NULL AS absent")).rows[0].absent,true);
+      await remote.query("UPDATE raw.olos_calls SET kommo_event_hash='existing',kommo_lead_id_encontrado=123,kommo_tentativas=7");
+      const before=await incidentEvidence(), frozen=await v1Receipts(), metadata=await corporateMetadata();
+      const previousRows=await remoteRows(), state=await control();
+      assert.equal(metadata.columns.some(c=>c.column_name==='id_operador_olos'),false);
+      assert.equal(columns.length,14);
+      for (const entry of frozen) {
+        assert.deepEqual(Object.keys(entry.payload).sort(),[...columns].sort());
+        assert.equal(entry.payload_hash,digest(entry.payload));
+      }
+      let calls=0; const server=createServer((_,res)=>{calls++;res.writeHead(500);res.end();});
+      await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const env={...base,ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:remoteUrl.toString(),
+        OLOS_CORPORATE_CA_FILE:process.env.OLOS_DIRECT_TEST_CA_FILE!,OLOS_CORPORATE_WRITE_ENABLED:'false',
+        OLOS_BASE_URL:`http://127.0.0.1:${(server.address() as {port:number}).port}`};
+      const cli=(command:string,args:string[]=[])=>promisify(execFile)(process.execPath,
+        ['dist/main.js',command,...args],{env,timeout:15000});
+      const args=['--source-ids',incidentIds.join(','),'--confirm',incidentSelection.confirmation,
+        '--contract','v1','--preserve-history-read',preservedHistoryRead];
+      try {
+        await cli('corporate-deliver-selected',args);
+        const delivered=await remoteRows(); assert.equal(delivered.length,previousRows.length+3);
+        assert.deepEqual(delivered.slice(0,previousRows.length),previousRows);
+        const p=projection((await corporateSchema(remote,cfg.corporateDelivery!,false)).shape,'d',false,cfg.corporateDelivery!.connection);
+        const projected=(await remote.query(`SELECT ${p.sql} FROM raw.olos_calls d WHERE internal_id_olos=ANY($1::int[]) ORDER BY internal_id_olos`,[historyHomologation.map(r=>r.target_id)])).rows;
+        assert.deepEqual(projected,frozen.map(r=>r.payload));
+        const confirmed=await v1Receipts();
+        for (let i=0;i<frozen.length;i++) {
+          const {state:oldState,remote_raw_id:oldId,confirmed_at:oldTime,...original}=frozen[i];
+          const {state:newState,remote_raw_id:newId,confirmed_at:newTime,...after}=confirmed[i];
+          assert.deepEqual(after,original); assert.equal(oldState,'pending'); assert.equal(newState,'confirmed');
+          assert.equal(oldId,null); assert.equal(oldTime,null); assert.ok(newId); assert.ok(newTime);
+        }
+        // External Kommo enrichment after delivery must also survive a replay.
+        await remote.query("UPDATE raw.olos_calls SET kommo_event_hash='selected',kommo_status_processamento='done',kommo_tentativas=9 WHERE internal_id_olos=725262");
+        const enriched=await remoteRows();
+        const sequence=(await remote.query('SELECT last_value,is_called FROM raw.olos_calls_raw_olos_call_id_seq')).rows;
+        await cli('corporate-deliver-selected',args);
+        assert.deepEqual(await remoteRows(),enriched); assert.deepEqual(await v1Receipts(),confirmed);
+        assert.deepEqual((await remote.query('SELECT last_value,is_called FROM raw.olos_calls_raw_olos_call_id_seq')).rows,sequence);
+        await assert.rejects(selectiveRun(cfg,{afterRemoteCommit:async()=>{throw new Error('lost acknowledgement on replay');}},incidentV1),/CORPORATE_COMMIT_UNKNOWN/);
+        const attempt=await unresolvedCommit();
+        await cli('corporate-reconcile-selected',['--source-ids',incidentIds.join(','),'--attempt-id',attempt.attempt_id,
+          '--confirm',`AUTHORIZE_EXPORTDATA_SELECTIVE_RECONCILIATION:${attempt.attempt_id}:${incidentIds.join(',')}`,
+          '--contract','v1','--preserve-history-read',preservedHistoryRead]);
+        assert.deepEqual(await remoteRows(),enriched); assert.deepEqual(await v1Receipts(),confirmed);
+        await assert.rejects(cli('corporate-deliver-once'),(e:any)=>e.code===1&&e.stdout.includes('CORPORATE_WRITE_NOT_AUTHORIZED'));
+        await assert.rejects(cli('corporate-resume'),(e:any)=>e.code===1&&e.stdout.includes('CORPORATE_WRITE_NOT_AUTHORIZED'));
+        assert.equal(calls,0); assert.deepEqual(await incidentEvidence(),before);
+        assert.deepEqual(await corporateMetadata(),metadata);
+        assert.equal((await control()).schema_hash,state.schema_hash); assert.equal((await control()).paused,true);
+        assert.equal((await control()).confirmed_count,String(Number(state.confirmed_count)+3));
+      } finally { await new Promise<void>(resolve=>server.close(()=>resolve())); }
+    });
+    await t.test('v1 preserved history: identity/hash/shape/scheduler changes block without rewriting payloads', async () => {
+      const cases: [string,RegExp][] = [
+        ["UPDATE olos_http.corporate_outbox SET payload=jsonb_set(payload,'{olos_call_id}','\"wrong\"') WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
+        ["UPDATE olos_http.records SET target_id=725263 WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
+        ["UPDATE olos_http.corporate_outbox SET payload_hash=repeat('f',64) WHERE source_id='47561569'",/CORPORATE_PAYLOAD_CHANGED/],
+        ["UPDATE olos_http.corporate_outbox SET payload=payload || '{\"id_operador_olos\":\"1658\"}' WHERE source_id='47561569'",/HISTORY_V1_PAYLOAD_REQUIRED/],
+        ["UPDATE olos_http.corporate_outbox SET payload=payload || '{\"kommo_event_hash\":\"forbidden\"}' WHERE source_id='47561569'",/HISTORY_V1_PAYLOAD_REQUIRED/],
+        ["UPDATE olos_http.corporate_outbox SET payload=payload - 'email' WHERE source_id='47561569'",/HISTORY_V1_PAYLOAD_REQUIRED/],
+        ["UPDATE olos_http.worker_settings SET enabled=true,desired_state='RUNNING'",/HISTORY_SCHEDULER_NOT_STOPPED/],
+        ["UPDATE olos_http.corporate_control SET paused=false",/HISTORY_CORPORATE_STATE_INVALID/],
+        ["UPDATE olos_http.reads SET processed_count=1 WHERE spec->>'kind'='history'",/HISTORY_HOMOLOGATION_READ_CHANGED/],
+      ];
+      for (const [sql,error] of cases) {
+        const cfg=await incidentFixture('v1'); await local.query(sql);
+        const frozen=await outbox(), reads=(await local.query('SELECT * FROM olos_http.reads ORDER BY id')).rows;
+        await assert.rejects(selectiveRun(cfg,{},incidentV1),error);
+        assert.deepEqual(await outbox(),frozen); assert.equal(await destinationCount(),2);
+        assert.deepEqual((await local.query('SELECT * FROM olos_http.reads ORDER BY id')).rows,reads);
+      }
+      const cfg=await incidentFixture('v1');
+      // Omitted --contract retains v2 behavior; no automatic downgrade.
+      await assert.rejects(selectiveRun(cfg,{},incidentSelection),/HISTORY_HOMOLOGATION_RECORD_CHANGED/);
+      for (const key of [`olos-admin:${cfg.sourceKey}`,`olos-http:history:${cfg.sourceKey}`]) {
+        await local.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[key]);
+        try { await assert.rejects(selectiveRun(cfg,{},incidentV1),/HISTORY_(ADMIN|CAPTURE)_ACTIVE/); }
+        finally { await local.query('SELECT pg_advisory_unlock_all()'); }
+      }
+      const s=await open(makeConfig()); // Even authorized general writing remains paused.
+      await s.delivery!.tick(); assert.equal(await destinationCount(),2); await close(s);
+      await assert.rejects(corporateControl(makeConfig(),'corporate-resume'),/HISTORY_RECOVERY_REQUIRED/);
+    });
+    await t.test('v1 preserved history: remote schema incompatibility remains a blocker; no operator adoption or DDL fallback', async () => {
+      const cfg=await incidentFixture('v1'), frozen=await outbox();
+      // Disposable corruption fixture, never an application migration.
+      await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN nome_agente TYPE varchar(200)');
+      const metadata=await corporateMetadata();
+      await assert.rejects(selectiveRun(cfg,{},incidentV1),/CORPORATE_SCHEMA_CHANGED/);
+      assert.deepEqual(await corporateMetadata(),metadata); assert.deepEqual(await outbox(),frozen);
+      assert.equal(await destinationCount(),2);
+      const v2cfg=await incidentFixture(); await incidentAdopt(v2cfg); await operatorCommand(v2cfg,incidentPrepare);
+      const v2before=await outbox();
+      await assert.rejects(selectiveRun(v2cfg,{},incidentV1),/HISTORY_V1_SCHEMA_REQUIRED/);
+      assert.deepEqual(await outbox(),v2before);
+      await selectiveRun(v2cfg,{},incidentSelection); assert.equal(await destinationCount(),5);
+    });
+    await t.test('v1 preserved history: durable intent/UNKNOWN block retries; explicit reconciliation proves presence or absence', async () => {
+      for (const committed of [true,false]) {
+        const cfg=await incidentFixture('v1'), before=await incidentEvidence(), frozen=await v1Receipts();
+        const hooks: DeliveryHooks={afterSelectiveIntent:async()=>{
+          const journal=await unresolvedCommit(); assert.ok(journal); assert.equal(journal.evidence.length,3);
+          assert.equal(await destinationCount(),2); // Remote transaction still uncommitted.
+          assert.equal((await control()).last_code,selectiveCommitBlock); assert.equal((await control()).paused,true);
+          if (!committed) throw new Error('interrupted before remote COMMIT');
+        },afterRemoteCommit:async()=>{throw new Error('lost remote acknowledgement');}};
+        await assert.rejects(selectiveRun(cfg,hooks,incidentV1),/CORPORATE_COMMIT_UNKNOWN/);
+        const attempt=await unresolvedCommit(); assert.ok(attempt);
+        assert.deepEqual(await v1Receipts(),frozen); assert.deepEqual(await incidentEvidence(),before);
+        await assert.rejects(selectiveRun(cfg,{},incidentV1),/CORPORATE_DELIVERY_BLOCKED/);
+        const request: ReconciliationSelection={...reconciliationFor(attempt.attempt_id,incidentIds),historyReadId:preservedHistoryRead,contract:'v1'};
+        await assert.rejects(reconcileRun(cfg,{}, {...request,confirmation:incidentSelection.confirmation}),/SELECTIVE_WRITE_NOT_AUTHORIZED/);
+        if (committed) {
+          await remote.query("UPDATE raw.olos_calls SET nome_agente='divergent' WHERE internal_id_olos=725262");
+          await assert.rejects(reconcileRun(cfg,{},request),/EXISTING_CALL_DIVERGES/);
+          assert.ok(await unresolvedCommit()); assert.equal((await control()).blocked,true);
+          // Restore synthetic fixture evidence only; runtime never repairs destination rows.
+          await remote.query('UPDATE raw.olos_calls SET nome_agente=$1 WHERE internal_id_olos=725262',[frozen.find(r=>r.target_id===725262)!.payload.nome_agente]);
+        }
+        await reconcileRun(cfg,{},request);
+        assert.equal(await destinationCount(),committed?5:2);
+        assert.equal((await control()).paused,true); assert.equal((await control()).blocked,false);
+        assert.deepEqual(await incidentEvidence(),before);
+        const journal=(await local.query('SELECT * FROM olos_http.corporate_selective_commits WHERE attempt_id=$1',[attempt.attempt_id])).rows[0];
+        assert.equal(journal.state,'reconciled'); assert.deepEqual(journal.evidence,attempt.evidence);
+        const after=await v1Receipts();
+        assert.deepEqual(after.map(r=>[r.payload,r.payload_hash]),frozen.map(r=>[r.payload,r.payload_hash]));
+        assert.ok(after.every(r=>r.state===(committed?'confirmed':'pending')));
+      }
+    });
+    await t.test('v1 preserved history: source evidence is revalidated after durable intent before remote COMMIT', async () => {
+      const cfg=await incidentFixture('v1'), frozen=await v1Receipts();
+      await assert.rejects(selectiveRun(cfg,{afterSelectiveIntent:async()=>{
+        await local.query("UPDATE olos_http.corporate_outbox SET payload=jsonb_set(payload,'{olos_call_id}','\"changed\"') WHERE source_id='47561569'");
+      }},incidentV1),/CORPORATE_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(),2); assert.ok(await unresolvedCommit());
+      assert.equal((await control()).blocked,true);
+      assert.ok((await v1Receipts()).every(r=>r.state==='pending'));
+      assert.deepEqual((await v1Receipts()).map(r=>r.payload_hash),frozen.map(r=>r.payload_hash));
     });
     await t.test('preserved history: exact incident adoption, preparation and delivery preserve all historical evidence and backlog', async () => {
       const cfg = await incidentFixture(), before = await incidentEvidence(), frozen = await outbox();
