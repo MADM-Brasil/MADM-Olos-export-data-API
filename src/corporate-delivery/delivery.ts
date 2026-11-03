@@ -1,7 +1,8 @@
 import type { Client, Pool, PoolClient } from 'pg';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { retryable, safeCode, SyncError } from '../corporate-sync/errors.js';
-import { columns, digest, integerValue, mapRow, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
+import { integerValue, quote, type Shape } from '../corporate-sync/mapping.js';
+import { deliveryColumns, deliveryDigest as digest, mapDeliveryRow as mapRow, hasOperator, operatorColumn } from './payload.js';
 import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
 import type { DeliveryConfig } from './config.js';
@@ -241,6 +242,8 @@ export class CorporateDelivery {
       }
       const entries = ids ? await selectEntries(local, this.source, this.target, ids) : (await local.query(`SELECT source_id,target_id::text,payload,payload_hash FROM olos_http.corporate_outbox
         WHERE source_key=$1 AND state='pending' ORDER BY target_id LIMIT $2 FOR UPDATE`, [this.source, this.cfg.connection.batchSize])).rows;
+      if (new Map(state.destination_shape).has(operatorColumn) && entries.some(entry =>
+        entry.state !== 'confirmed' && !hasOperator(entry.payload))) throw new SyncError('OPERATOR_PAYLOAD_UPGRADE_REQUIRED');
       if (!entries.length) { await local.query('COMMIT'); return; }
       let found: Map<string, string>;
       let commitIssued = false;
@@ -271,9 +274,10 @@ export class CorporateDelivery {
           this.fence();
           // Exact existing rows are never INSERTed again; even their corporate trigger is not invoked.
           if (found.has(row.internal_id_olos!)) continue;
+          const columns = deliveryColumns(row);
           await remote.query(`INSERT INTO raw.olos_calls (${columns.map(quote).join(',')})
             VALUES (${columns.map((_, i) => `$${i + 1}`).join(',')})
-            ON CONFLICT (internal_id_olos) WHERE internal_id_olos IS NOT NULL DO NOTHING`, columns.map(name => row[name]));
+            ON CONFLICT (internal_id_olos) WHERE internal_id_olos IS NOT NULL DO NOTHING`, columns.map(name => (row as Record<string, string | null>)[name]));
         }
         found = await matches(remote, rows, shape, this.cfg);
         if (found.size !== rows.length) throw new SyncError('CORPORATE_VERIFICATION_FAILED');

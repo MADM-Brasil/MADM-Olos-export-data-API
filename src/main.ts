@@ -10,6 +10,7 @@ import { Worker } from './worker.js';
 import { runManaged } from './admin/main.js';
 import { WorkerError, errorCode, log } from './errors.js';
 import { inspectSchema } from './schema.js';
+import { operatorAdmin, parseOperatorRequest } from './corporate-delivery/operator-admin.js';
 import { corporateControl } from './corporate-delivery/commands.js';
 import { parseSelection, parseReconciliation } from './corporate-delivery/selection.js';
 
@@ -17,11 +18,13 @@ async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
   const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
-    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-deliver-selected','corporate-reconcile-selected','capture-history'];
+    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-deliver-selected','corporate-reconcile-selected','corporate-operator-plan','corporate-adopt-operator','corporate-prepare-operator','capture-history'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
   // Reject missing consent and malformed IDs before opening any database or HTTP client.
   const selection = command === 'corporate-deliver-selected' ? parseSelection(cfg.corporateDelivery, args) : undefined;
   const reconciliation = command === 'corporate-reconcile-selected' ? parseReconciliation(cfg.corporateDelivery, args) : undefined;
+  const operator = ['corporate-operator-plan','corporate-adopt-operator','corporate-prepare-operator'].includes(command)
+    ? parseOperatorRequest(cfg.corporateDelivery, command, args) : undefined;
   if (command === 'capture-history') {
     if (args.length !== 0) throw new WorkerError('HISTORY_PARAMETERS_INVALID');
     if (!cfg.historyCaptureAuthorized) throw new WorkerError('HISTORY_CAPTURE_NOT_AUTHORIZED');
@@ -56,6 +59,7 @@ async function main() {
     await store.open();
     if (command.startsWith('corporate-')) {
       if (!store.delivery || !store.client) throw new WorkerError('CORPORATE_MODE_REQUIRED');
+      if (operator) log('corporate_operator_' + operator.kind, await operatorAdmin(store.client, cfg.corporateDelivery!, cfg.sourceKey, store.target, operator));
       if (selection) await store.delivery.deliverSelected(selection);
       if (reconciliation) await store.delivery.reconcileSelected(reconciliation);
       if (command === 'corporate-reconcile') log('corporate_legacy_reconciled', { confirmed: await store.reconcileCorporate() });

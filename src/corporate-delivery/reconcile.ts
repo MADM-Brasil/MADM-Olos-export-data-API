@@ -38,6 +38,7 @@ export async function reconcileLegacy(local: PoolClient, cfg: DeliveryConfig, so
     const sequenceMeta = (await local.query('SELECT seqincrement::text,seqcycle FROM pg_sequence WHERE seqrelid=$1::regclass', [sequence])).rows[0];
     if (!sequenceMeta || BigInt(sequenceMeta.seqincrement) <= 0n || sequenceMeta.seqcycle) throw new SyncError('LEGACY_ALLOCATOR_REVIEW_REQUIRED');
     const { shape, hash } = await corporateSchema(remote, cfg, false);
+    if (shape.has('id_operador_olos')) throw new SyncError('OPERATOR_REQUIRES_LEGACY_ADOPTION_FIRST');
     const p = projection(shape, 's', true, cfg.connection);
     let cursor: string | null = null, recognized = 0;
     for (;;) {

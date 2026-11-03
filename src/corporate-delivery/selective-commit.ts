@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { PoolClient, Client } from 'pg';
 import { SyncError } from '../corporate-sync/errors.js';
-import { digest, mapRow, type Shape } from '../corporate-sync/mapping.js';
+import { type Shape } from '../corporate-sync/mapping.js';
+import { deliveryDigest as digest, mapDeliveryRow as mapRow } from './payload.js';
 import { uniqueIdentities } from './contract.js';
 import type { DeliveryConfig } from './config.js';
 

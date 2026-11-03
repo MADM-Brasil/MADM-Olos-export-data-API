@@ -373,3 +373,152 @@ Trabalho restrito ao worktree `export-data-v3-history`, branch
 `feature/exportdata-history`; alterações anteriores e o arquivo não rastreado `=`
 foram preservados. Sem commit, push, deploy, acesso à VPS ou MADM real, alteração da
 branch main, Billing ou worktree original.
+
+## `id_operador_olos` — implementação e validação sobre c63b2e3
+
+Worktree `/home/madm/madm/export-data-v3-history`, branch `feature/exportdata-history`.
+HEAD inicial `c63b2e3`; checkout inicialmente limpo. Nenhuma consulta à VPS/MADM real,
+DDL de produção, captura OLOS real, habilitação operacional de entrega/scheduler,
+`corporate-resume` operacional, commit, push ou deploy. Branch main, Billing e
+worktree original não foram modificados.
+
+### Auditoria e decisão de contrato
+
+`mapRecord` já deriva `agent_id` diretamente de `AgentId`; o parser lossless mantém
+números JSON como texto e `records.agent_id` é SQL text. O hash de origem já inclui
+AgentId. A projeção corporativa v1 tem 14 campos e omite esse identificador.
+Acrescentá-lo à lista compartilhada mudaria hashes legados e invalidaria recibos.
+Essa lista e o algoritmo v1 foram preservados byte a byte.
+
+Não havia amostra transacional real utilizável no worktree: o arquivo de amostra
+está vazio e a fixture disponível tem string. Os valores reais informados (52,52,0)
+não certificam o tipo JSON ou limite numérico da API. Os relatórios históricos não
+supriram essa prova, e nenhuma fonte real foi acessada. Foi proposta a coluna
+**text NULL**, conservando a representação já preservada, sem presumir domínio
+integer/bigint. A confirmação do tipo nativo em evidência bruta existente permanece
+pré-requisito da adoção operacional; fixtures não substituem essa verificação.
+
+O contrato v2 preserva 52,1599 e 0 como textos `52`,`1599`,`0`; NULL/ausência resultam
+em SQL NULL; zeros à esquerda e sentinelas textuais não são normalizados. Não há
+substituição por nome, CallId, source ID ou ID técnico. Nome do agente, regras de
+TMA/tabulação/campanha/telefone/data e captura original permanecem independentes.
+
+### Arquivos alterados ou novos
+
+| Arquivo | Mudança |
+| --- | --- |
+| `src/corporate-delivery/payload.ts` | Contrato v2, colunas e hash versionados; v1 inalterado |
+| `src/corporate-delivery/contract.ts` | Schema opcional validado, hash anterior sem a coluna, freeze e comparação de operador |
+| `src/corporate-delivery/delivery.ts` | Adaptador de payload/colunas v2 e rejeição prévia de pendente v1 não preparado |
+| `src/corporate-delivery/selective-commit.ts` | Validação de hash/payload v1/v2; protocolo e journal mantidos |
+| `src/corporate-delivery/reconcile.ts` | Impede converter conciliação legada inicial em adoção implícita de v2 |
+| `src/corporate-delivery/operator-admin.ts` | Planejamento em leitura, adoção explícita por hashes e preparação local auditada |
+| `src/corporate-delivery/operator-complement.ts` | Gerador offline de manifesto e proposta SQL para confirmados; sem executor |
+| `src/corporate-sync/schema.ts` | Aceitação opcional estrita de text NULL, habilitada apenas no Corporate Delivery |
+| `src/main.ts` | Três comandos administrativos, sem scheduler ou chamadas OLOS |
+| `migrations/corporate/001_operator_id.sql` | Proposta DDL corporativa aditiva, manual, não aplicada em produção |
+| `migrations/004_operator_contract.sql` | Ledgers locais de adoção/revisões, sem atualização de payloads ao aplicar |
+| `test/operator.test.ts` | Tipos, valores sentinela, hashes legados, autorização e provas de complementação |
+| `test/corporate-delivery.integration.ts` | Oito cenários novos com PostgreSQL descartável e API simulada |
+| `docs/corporate-delivery/README.md` | Contrato, estratégias A/B/C, homologação e rollback |
+| `docs/corporate-delivery/validation.md` | Este relatório |
+
+As únicas mudanças no caminho seletivo homologado foram selecionar o adaptador de
+hash/projeção/colunas capaz de reconhecer v2 e recusar pendente antigo não preparado.
+Limite de três, autorização, locks, persistência anterior ao COMMIT, quarentena e
+reconciliação explícita não foram substituídos ou relaxados. O novo ID entra no hash
+v2 e na comparação remota, mas não substitui identidade ou chaves existentes.
+
+### Estratégia validada para A/B/C
+
+**A — futuros:** após adoção explícita, capturas congelam `records.agent_id` no novo
+campo e calculam hash v2 com domínio separado. Captura histórica via API simulada
+continua funcionando antes do baseline e sem entrega automática. NULL não vira zero.
+
+**B — pendentes:** adicionar a coluna não atualiza schema hash nem outbox local.
+Adoção compara o schema remoto sem a coluna nova com o hash anterior, registra
+ledger e mantém binding/pausa/contadores. Os payloads antigos permanecem íntegros.
+Preparação separada, limitada a 1–3 source IDs, valida mappings/hashes/estado e
+preserva payload/hash anterior em auditoria antes de atualizar somente payload/hash
+dos selecionados pendentes, numa única transação. Não há migração silenciosa ou
+conversão em massa. Qualquer divergência aborta todos os selecionados.
+
+**C — confirmados:** não há reinserção nem atualização de hashes/recibos antigos.
+O gerador offline produz SQL vinculado ao manifesto, com autorização separada,
+validação da PK, identidade, todos os campos gerenciados, schema, funções e trigger.
+O único UPDATE corporativo possível preenche `id_operador_olos` quando NULL;
+valor idêntico é no-op e diferente bloqueia. Campos Kommo, chaves, metadados e outros
+registros foram preservados nos testes. O procedimento de execução/quarentena/
+reconciliação local da janela DBA é proposto no runbook e não é automatizado por
+esta implementação. Não existe comando que complemente os 15.608 reais.
+
+### Testes executados
+
+| Verificação | Resultado |
+| --- | --- |
+| `npm run typecheck` — Node 24.16.0 | passou |
+| `npm run build` — Node 24.16.0 | passou |
+| `node --import tsx --test test/*.test.ts` — ambiente limpo, Node 24.16.0 | **97/97**, zero skips |
+| `bash scripts/test-corporate-delivery.sh` — PostgreSQL 16/Node 24 | **100/100**, zero skips, 33,295 s |
+| `bash scripts/test-corporate-sync.sh` — regressão do contrato compartilhado | **39/39**, zero skips |
+| `git diff --check` | passou |
+
+Os runners provisionam PostgreSQL descartável em tmpfs, rede Docker interna e
+zero portas publicadas. Corporate Delivery valida TLS com CA/hostname sintéticos.
+Somente as fixtures receberam migrations/DDL e escritas. A API é simulada e os
+comandos novos emitiram zero chamadas HTTP. Nenhum arquivo de ambiente real foi
+carregado; nenhuma imagem operacional foi iniciada contra produção.
+
+Cobertura dos requisitos:
+
+1. AgentId 52 e 1599 chegam ao novo campo; 0 permanece `0`; nulo e ausente ficam NULL.
+2. String com zeros à esquerda é preservada; número acima de precisão JS atravessa
+   parser lossless sem arredondamento; tipos incompatíveis são rejeitados.
+3. Hashes v1, chaves, binding, recibos, checkpoints e campos de chamada preservados.
+4. Migration idempotente acrescenta exatamente uma coluna (33 → 34 na fixture),
+   preservando índices; deriva adicional de schema impede adoção.
+5. Payloads pendentes não mudam durante DDL, planejamento ou adoção. A preparação
+   preserva before-image e hashes em ledger; reexecução não reescreve dados.
+6. Seleção ausente e hash inválido no segundo registro fazem rollback integral,
+   inclusive da revisão que teria sido preparada para o primeiro.
+7. Registros confirmados não podem passar pela preparação de pendentes.
+8. Complementação SQL sem token falha sem atualizar linhas; com autorização,
+   altera exclusivamente operador; reexecução não duplica nem modifica outros campos.
+9. Divergência de identidade bloqueia complementação; prova v2 com operador
+   divergente não pode ser reinterpretada pelo gerador.
+10. Aplicar schema novo não libera entrega; pendente antigo é rejeitado antes da
+    conexão remota até preparação explícita. Pausa e escrita geral desabilitada mantidas.
+11. COMMIT v2 incerto mantém a mesma quarentena; preparação fica bloqueada e
+    reconciliação rejeita operador remoto divergente antes de confirmar recibos.
+12. Fluxo histórico existente e nova captura histórica v2 passam; CLI de adoção/
+    preparação não cria scheduler, não chama a API e valida autorização previamente.
+
+A primeira rodada passou 96 unitários, 99 no runner corporativo e 39 no Sync.
+A revisão acrescentou validação da CLI, before-images/rollback parcial, contagem
+33→34 e proteção de prova v2 na proposta de complemento. Os resultados finais
+acima correspondem ao código entregue. Não houve falha de teste nessas rodadas.
+
+### Riscos, homologação e rollback
+
+- Tipos nativos/limites reais de AgentId e consumidores externos não foram auditados;
+  a escolha text é proposta preservadora, não certificação do contrato da API.
+- Os números 725.287/15.608/709.679 são fornecidos pelo solicitante. Testes usam
+  subconjuntos sintéticos e não certificam volume, WAN ou desempenho de preparação.
+- Backlog requer preparação explícita em lotes; o limite inicial é três e não há
+  executor em massa. Não habilitar a fila geral para contornar um payload v1.
+- Os arquivos corporativo e local devem ser aplicados nos bancos corretos, em
+  janela autorizada. Não aplicar DDL com journal seletivo unresolved ou captura
+  pendente. Privilégios locais dos ledgers e compatibilidade dos consumidores
+  precisam ser revisados. Não se concede UPDATE corporativo ao worker automaticamente.
+- A complementação de confirmados é uma proposta SQL testada, sem executor de
+  produção. Falta homologar o procedimento administrativo durável da janela DBA;
+  ele deve manter bloqueio em COMMIT incerto e exigir reconciliação antes de retry.
+- Não há atomicidade distribuída. Os fluxos seletivos preservam o protocolo
+  existente; a proposta manual não substitui esse journal nem autoriza desbloqueá-lo.
+- Downgrade para c63b2e3 após adoção/preparação não é transparente: schema extra e
+  hashes v2 serão rejeitados pelo código antigo. Manter pausa, preservar versões,
+  recibos e journals; não remover coluna ou resetar hashes para forçar rollback.
+
+O [runbook do operador](README.md#identificador-original-do-operador--contrato-v2)
+contém os comandos futuros, pré-condições A/B/C e rollback. Publicação e qualquer
+homologação real permanecem dependentes de revisão e autorização separadas.

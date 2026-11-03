@@ -12,6 +12,9 @@ import { StaticCache } from '../src/cache.js';
 import { DynamicScheduler, type ScheduledConsumer } from '../src/scheduler.js';
 import type { SchedulerRepository, Settings } from '../src/admin/repository.js';
 import { columns, digest, mapRow, projection, type Row } from '../src/corporate-sync/mapping.js';
+import { operatorAdmin, type OperatorRequest } from '../src/corporate-delivery/operator-admin.js';
+import { deliveryDigest } from '../src/corporate-delivery/payload.js';
+import { operatorComplementProposal } from '../src/corporate-delivery/operator-complement.js';
 import { corporateSchema } from '../src/corporate-delivery/contract.js';
 import { assertNoDirectOwnership } from '../src/corporate-sync/ownership.js';
 import { selectiveCommitBlock } from '../src/corporate-delivery/selective-commit.js';
@@ -949,6 +952,182 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
         assert.equal(requests, 0); assert.equal((await control()).paused, true);
         assert.deepEqual((await local.query('SELECT * FROM olos_http.worker_settings')).rows, settings);
       } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+    });
+
+    const operatorMigration = async () => remote.query(await readFile(new URL('../migrations/corporate/001_operator_id.sql', import.meta.url), 'utf8'));
+    async function operatorLocalMigrations() {
+      await local.query(await readFile(new URL('../migrations/003_selective_commit.sql', import.meta.url), 'utf8'));
+      await local.query(await readFile(new URL('../migrations/004_operator_contract.sql', import.meta.url), 'utf8'));
+    }
+    async function operatorCommand(cfg: Config, request: OperatorRequest) {
+      const s = new Store(cfg);
+      try { await s.open(); return await operatorAdmin(s.client!,cfg.corporateDelivery!,cfg.sourceKey,s.target,request); }
+      finally { await s.close(); }
+    }
+    async function adoptOperator(cfg: Config) {
+      const plan = await operatorCommand(cfg,{kind:'plan'});
+      const request: OperatorRequest = {kind:'adopt',previousHash:plan.previous_schema_hash,schemaHash:plan.schema_hash,
+        confirmation:`AUTHORIZE_EXPORTDATA_OPERATOR_CONTRACT:${plan.previous_schema_hash}:${plan.schema_hash}`};
+      await operatorCommand(cfg,request); return request;
+    }
+    const prepareOperator = (cfg: Config, ids = selectedIds) => operatorCommand(cfg, {kind:'prepare',ids,
+      confirmation:`AUTHORIZE_EXPORTDATA_OPERATOR_PAYLOADS:${ids.join(',')}`});
+    async function operatorFixture() {
+      const cfg = await pausedQueue(); await operatorLocalMigrations();
+      const s = await open(cfg);
+      await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),725284)");
+      await stage(s, selectedIds.map((id,i) => record(Number(id), { CallId:String(35458016+i),AgentId:[52,1599,0][i] })));
+      await close(s); return cfg;
+    }
+    await t.test('operator: additive migration/adoption preserve frozen backlog, receipts, binding and pause', async () => {
+      const cfg = await operatorFixture(), before = await outbox(), state = await control();
+      const records = (await local.query('SELECT * FROM olos_http.records ORDER BY target_id')).rows;
+      const remoteBefore = (await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+      const indexes = (await remote.query("SELECT indexdef FROM pg_indexes WHERE schemaname='raw' AND tablename='olos_calls' ORDER BY indexname")).rows;
+      assert.equal((await corporateSchema(remote,cfg.corporateDelivery!,false)).shape.size,33);
+      await operatorMigration(); await operatorMigration();
+      assert.equal((await corporateSchema(remote,cfg.corporateDelivery!,false)).shape.size,34);
+      assert.deepEqual((await remote.query("SELECT indexdef FROM pg_indexes WHERE schemaname='raw' AND tablename='olos_calls' ORDER BY indexname")).rows,indexes);
+      const plan = await operatorCommand(cfg,{kind:'plan'});
+      assert.equal(plan.previous_schema_hash, state.schema_hash); assert.notEqual(plan.schema_hash, state.schema_hash);
+      assert.deepEqual(await control(), state); assert.deepEqual(await outbox(), before);
+      const adoption = await adoptOperator(cfg); await operatorCommand(cfg,adoption);
+      assert.deepEqual(await outbox(), before); assert.deepEqual((await local.query('SELECT * FROM olos_http.records ORDER BY target_id')).rows,records);
+      const after = await control(); assert.equal(after.binding,state.binding); assert.equal(after.confirmed_count,state.confirmed_count);
+      assert.equal(after.generation,state.generation); assert.equal(after.paused,true); assert.equal(after.blocked,false);
+      const remoteAfter = (await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+      assert.deepEqual(remoteAfter.map(({id_operador_olos,...r}: any) => r),remoteBefore);
+      assert.ok(remoteAfter.every(r => r.id_operador_olos===null));
+    });
+    await t.test('operator: new schema alone cannot deliver; legacy pending requires explicit payload preparation', async () => {
+      let cfg = await operatorFixture(); await operatorMigration();
+      await assert.rejects(selectiveRun(cfg), /CORPORATE_SCHEMA_CHANGED/);
+      assert.equal(await destinationCount(),2); assert.equal((await control()).paused,true);
+      cfg = await operatorFixture(); await operatorMigration(); await adoptOperator(cfg);
+      const before = await outbox();
+      await assert.rejects(selectiveRun(cfg), /OPERATOR_PAYLOAD_UPGRADE_REQUIRED/);
+      assert.equal(await destinationCount(),2); assert.deepEqual(await outbox(),before);
+      assert.equal((await control()).paused,true); assert.equal((await control()).blocked,false);
+      await prepareOperator(cfg); await selectiveRun(cfg); assert.equal(await destinationCount(),5);
+    });
+    await t.test('operator: bounded audited pending preparation delivers 52,1599,0 and is idempotent', async () => {
+      const cfg = await operatorFixture(), before = await selectedReceipts(), others = await otherReceipts();
+      await operatorMigration(); await adoptOperator(cfg);
+      assert.equal((await prepareOperator(cfg)).prepared,3);
+      const prepared = await selectedReceipts();
+      assert.deepEqual(prepared.map(r => r.payload.id_operador_olos), ['52','1599','0']);
+      for(let i=0;i<3;i++) {
+        assert.equal(prepared[i].source_hash,before[i].source_hash); assert.equal(prepared[i].target_id,before[i].target_id);
+        assert.equal(prepared[i].payload.olos_call_id,before[i].payload.olos_call_id);
+        assert.equal(prepared[i].payload.nome_agente,before[i].payload.nome_agente);
+        assert.notEqual(prepared[i].payload_hash,before[i].payload_hash);
+        assert.equal(prepared[i].payload_hash,deliveryDigest(prepared[i].payload));
+      }
+      const audits = (await local.query('SELECT * FROM olos_http.corporate_operator_payloads ORDER BY target_id')).rows;
+      assert.deepEqual(audits.map(a=>a.previous_payload),before.map(r=>r.payload));
+      assert.deepEqual(audits.map(a=>a.previous_hash),before.map(r=>r.payload_hash));
+      assert.equal((await prepareOperator(cfg)).prepared,0); assert.deepEqual(await selectedReceipts(),prepared);
+      assert.deepEqual(await otherReceipts(),others);
+      await selectiveRun(cfg); await selectiveRun(cfg);
+      assert.deepEqual((await remote.query('SELECT id_operador_olos FROM raw.olos_calls WHERE internal_id_olos>=725285 ORDER BY internal_id_olos')).rows.map(r=>r.id_operador_olos),['52','1599','0']);
+      assert.equal(await destinationCount(),5); assert.equal((await control()).confirmed_count,'5');
+      assert.deepEqual(await otherReceipts(),others);
+      await assert.rejects(prepareOperator(cfg), /OPERATOR_RECEIPT_INVALID/);
+    });
+    await t.test('operator: future history capture preserves null/missing/zero and other mapping rules via simulated API', async () => {
+      const cfg = await historyConfig(); await operatorLocalMigrations(); await operatorMigration(); await adoptOperator(cfg);
+      const s = await open(cfg); let calls=0;
+      const input = [record(5001,{AgentId:52}),record(5002,{AgentId:1599}),record(5003,{AgentId:0}),
+        record(5004,{AgentId:null}),record(5005,{AgentId:undefined}),record(5006,{AgentId:'00052'})];
+      const worker = historyWorker(s,async()=>{calls++;return JSON.stringify(input);});
+      const report = await worker.cycle({kind:'history'}); assert.equal(report.queued,6); assert.equal(calls,1);
+      await close(s);
+      const captured = (await local.query("SELECT * FROM olos_http.corporate_outbox WHERE source_id=ANY($1::text[]) ORDER BY target_id",[input.map(r=>r.AttemptsRawDataID)])).rows;
+      assert.deepEqual(captured.map(r=>r.payload.id_operador_olos),['52','1599','0',null,null,'00052']);
+      assert.ok(captured.every(r=>r.payload_hash===deliveryDigest(r.payload)));
+      assert.equal(await destinationCount(),2); assert.equal((await control()).paused,true);
+      for(const ids of [['5001','5002','5003'],['5004','5005','5006']]) {
+        await selectiveRun(cfg,{}, {sourceIds:ids,confirmation:`AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${ids.join(',')}`});
+      }
+      assert.deepEqual((await remote.query('SELECT id_operador_olos FROM raw.olos_calls WHERE internal_id_olos>2 ORDER BY internal_id_olos')).rows.map(r=>r.id_operador_olos),['52','1599','0',null,null,'00052']);
+    });
+    await t.test('operator: v2 COMMIT unknown retains existing quarantine and authorized reconciliation proves new field', async () => {
+      const cfg = await operatorFixture(); await operatorMigration(); await adoptOperator(cfg); await prepareOperator(cfg);
+      await assert.rejects(selectiveRun(cfg,{afterRemoteCommit:async()=>{throw new Error('unknown');}}),/CORPORATE_COMMIT_UNKNOWN/);
+      await assertQuarantined(cfg);
+      await assert.rejects(prepareOperator(cfg),/OPERATOR_CONTROL_NOT_READY/);
+      await remote.query("UPDATE raw.olos_calls SET id_operador_olos='wrong' WHERE internal_id_olos=725286");
+      await assert.rejects(reconcileRun(cfg),/EXISTING_OPERATOR_DIVERGES/); await assertQuarantined(cfg);
+      // Repair is fixture-only; the application never performs this correction.
+      await remote.query("UPDATE raw.olos_calls SET id_operador_olos='1599' WHERE internal_id_olos=725286");
+      await reconcileRun(cfg); assert.equal(await destinationCount(),5); assert.equal((await control()).paused,true);
+      assert.ok((await selectedReceipts()).every(r=>r.state==='confirmed'));
+    });
+    await t.test('operator: adoption rejects drift beyond the column and wrong authorization; preparation rejects missing IDs atomically', async () => {
+      const cfg = await operatorFixture(), before=await outbox(); await operatorMigration();
+      const plan = await operatorCommand(cfg,{kind:'plan'});
+      await assert.rejects(operatorCommand(cfg,{kind:'adopt',previousHash:plan.previous_schema_hash,schemaHash:plan.schema_hash,confirmation:''}),/NOT_AUTHORIZED/);
+      await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN nome_agente TYPE varchar(200)');
+      await assert.rejects(adoptOperator(cfg),/OPERATOR_SCHEMA_CHANGE_NOT_ADDITIVE/);
+      assert.deepEqual(await outbox(),before);
+      await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN nome_agente TYPE text');
+      await adoptOperator(cfg);
+      await assert.rejects(prepareOperator(cfg,[selectedIds[0]!,'99999999']),/OPERATOR_SELECTION_INCOMPLETE/);
+      assert.deepEqual(await outbox(),before);
+      await local.query("UPDATE olos_http.corporate_outbox SET payload_hash=repeat('f',64) WHERE source_id='35091120'");
+      const corrupted=await outbox();
+      await assert.rejects(prepareOperator(cfg),/CORPORATE_PAYLOAD_CHANGED/);
+      assert.deepEqual(await outbox(),corrupted);
+      assert.equal((await local.query('SELECT count(*)::integer AS n FROM olos_http.corporate_operator_payloads')).rows[0].n,0);
+    });
+    await t.test('operator CLI: separate authorization, explicit adoption/preparation, no API or scheduler', async () => {
+      await operatorFixture(); await operatorMigration();
+      let calls=0;
+      const server=createServer((_,res)=>{calls++;res.writeHead(500);res.end();});
+      await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const env={...base,ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:remoteUrl.toString(),
+        OLOS_CORPORATE_CA_FILE:process.env.OLOS_DIRECT_TEST_CA_FILE!,OLOS_CORPORATE_WRITE_ENABLED:'false',
+        OLOS_BASE_URL:`http://127.0.0.1:${(server.address() as {port:number}).port}`};
+      const cli=(command:string,args:string[]=[],extra:NodeJS.ProcessEnv={})=>promisify(execFile)(process.execPath,
+        ['dist/main.js',command,...args],{env:{...env,...extra},timeout:15000});
+      try {
+        const before=await outbox();
+        await assert.rejects(cli('corporate-prepare-operator',['--source-ids',selectedIds.join(','),'--confirm','wrong'],
+          {DATABASE_URL:'postgresql://postgres@127.0.0.1:1/unreachable'}),(e:any)=>e.code===1&&e.stdout.includes('OPERATOR_CHANGE_NOT_AUTHORIZED'));
+        const output=await cli('corporate-operator-plan');
+        const plan=JSON.parse(output.stdout.trim()); assert.equal(plan.event,'corporate_operator_plan');
+        assert.deepEqual(await outbox(),before);
+        await cli('corporate-adopt-operator',['--expected-schema-hash',plan.previous_schema_hash,'--schema-hash',plan.schema_hash,
+          '--confirm',`AUTHORIZE_EXPORTDATA_OPERATOR_CONTRACT:${plan.previous_schema_hash}:${plan.schema_hash}`]);
+        await cli('corporate-prepare-operator',['--source-ids',selectedIds.join(','),'--confirm',`AUTHORIZE_EXPORTDATA_OPERATOR_PAYLOADS:${selectedIds.join(',')}`]);
+        assert.equal(calls,0); assert.equal(await destinationCount(),2); assert.equal((await control()).paused,true);
+        assert.equal((await local.query("SELECT to_regclass('olos_http.worker_settings') IS NULL AS absent")).rows[0].absent,true);
+      } finally {await new Promise<void>(resolve=>server.close(()=>resolve()));}
+    });
+    await t.test('operator: confirmed complement proposal changes only operator, is authorized/idempotent and keeps receipts', async () => {
+      const cfg = await operatorFixture(); await selectiveRun(cfg);
+      const receipts=await outbox();
+      await operatorMigration(); await adoptOperator(cfg);
+      await remote.query("UPDATE raw.olos_calls SET kommo_tentativas=7,kommo_status_processamento='done',arquivo_origem='corporate' WHERE internal_id_olos>=725285");
+      const before=(await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+      const proof=(await local.query(`SELECT o.*,o.target_id::text,o.remote_raw_id::text,r.agent_id
+        FROM olos_http.corporate_outbox o JOIN olos_http.records r USING(source_key,source_id)
+        WHERE o.source_id=ANY($1::text[]) ORDER BY o.target_id`,[selectedIds])).rows;
+      const contract=await corporateSchema(remote,cfg.corporateDelivery!,false);
+      const proposal=operatorComplementProposal(proof,contract.shape,contract.functions,cfg.corporateDelivery!);
+      await assert.rejects(remote.query(proposal.sql),/OPERATOR_COMPLEMENT_NOT_AUTHORIZED/); await remote.query('ROLLBACK');
+      assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows,before);
+      await remote.query("SELECT set_config('olos.operator_complement_authorization',$1,false)",[proposal.authorization]);
+      await remote.query(proposal.sql); await remote.query(proposal.sql);
+      const after=(await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+      assert.deepEqual(after.map(({id_operador_olos,...r}:any)=>r),before.map(({id_operador_olos,...r}:any)=>r));
+      assert.deepEqual(after.slice(2).map(r=>r.id_operador_olos),['52','1599','0']);
+      assert.deepEqual(await outbox(),receipts); assert.equal(await destinationCount(),5);
+      await selectiveRun(cfg); assert.deepEqual(await outbox(),receipts); assert.equal(await destinationCount(),5);
+      await remote.query("UPDATE raw.olos_calls SET olos_call_id='divergent' WHERE internal_id_olos=725286");
+      const divergent=(await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+      await assert.rejects(remote.query(proposal.sql),/EXISTING_CALL_DIVERGES/); await remote.query('ROLLBACK');
+      assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows,divergent);
     });
 
     await t.test('migration is local/idempotent; activation requires reconciliation and explicit write permission', async () => {

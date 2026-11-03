@@ -3,7 +3,7 @@ import type { Config } from './config.js';
 import { columns, type Column, type Shape } from './mapping.js';
 import { SyncError } from './errors.js';
 
-export async function schema(db: Client, side: 'source' | 'destination', cfg: Config, write = false): Promise<Shape> {
+export async function schema(db: Client, side: 'source' | 'destination', cfg: Config, write = false, allowOperator = false): Promise<Shape> {
   const meta = (await db.query(`SELECT c.relkind, c.relrowsecurity, c.relforcerowsecurity,
     EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS triggers,
     EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid) AS rules,
@@ -105,6 +105,7 @@ export async function schema(db: Client, side: 'source' | 'destination', cfg: Co
         defaultValue: string | null;
         identity: string;
       }> = {
+        ...(allowOperator ? { id_operador_olos: { type: 'text', nullable: true, defaultValue: null, identity: 'NO' } } : {}),
         raw_olos_call_id: {
           type: 'int8', nullable: false,
           defaultValue: null, identity: 'YES'

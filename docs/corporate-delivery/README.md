@@ -337,3 +337,216 @@ não restaurar apenas um lado e não reativar a fila geral. Se houver COMMIT inc
 preservar a outbox e reconciliar identidade/hash/PK remotamente em procedimento
 separadamente autorizado. Correção de dados corporativos exige decisão específica;
 não faz parte deste rollback.
+
+## Identificador original do operador — contrato v2
+
+A mudança introduz `raw.olos_calls.id_operador_olos text NULL`, independente de
+`internal_id_olos`, `olos_call_id` e `nome_agente`. Não há lookup por nome nem fallback
+para identificadores da chamada. A fonte é exclusivamente `AgentId`, preservado
+pelo mapeamento existente em `olos_http.records.agent_id`.
+
+### Evidência de tipos e limites da proposta
+
+O parser existente (`api.rows`) lê números JSON como strings sem perda e
+`mapRecord` preserva strings literalmente; `records.agent_id` já é `text`.
+Os exemplos operacionais fornecidos contêm 52 e 0, mas não provam se o JSON original
+usava número ou string nem o limite do domínio. O arquivo local
+`olos-amostra-10-registros.json` está vazio; a fixture disponível contém string.
+Os relatórios antigos não certificam o tipo JSON de AttemptsRawData.AgentId.
+Nenhuma consulta à API, VPS ou MADM real foi feita para completar essa lacuna.
+
+Por isso a migration propõe **text**, compatível com a representação preservada,
+sem inventar limite integer/bigint ou remover zeros à esquerda. O tipo nativo e o
+domínio do provedor ainda devem ser conferidos em evidência bruta já preservada,
+sem nova captura, antes da adoção operacional. A migration é uma proposta revisável,
+não uma certificação do tipo da API.
+
+| Entrada AgentId | `id_operador_olos` |
+| --- | --- |
+| número JSON 52 / string `"52"` | texto `52` |
+| número JSON 1599 | texto `1599` |
+| número JSON 0 / string `"0"` | texto `0`, sem afirmar que identifica uma pessoa |
+| NULL ou campo ausente | SQL NULL |
+| string `"00052"` | texto `00052`, sem normalização |
+| string vazia / `"-1"` | preservadas literalmente, sem inventar operador |
+| boolean, objeto, array ou Number JS impreciso | rejeitados pelo mapeamento existente |
+
+`nome_agente` continua usando o cache existente; falta de nome não remove o ID.
+Tabulação, duração (inclusive a regra atual para AgentId 0/-1), telefone, campanha,
+data e hash da resposta de origem não mudaram.
+
+### A — Capturas futuras
+
+Após adoção explícita do contrato, `freeze()` inclui o valor de `agent_id` no payload
+corporativo. A versão é identificada pela presença da propriedade
+`id_operador_olos`, inclusive quando NULL. O hash v2 tem domínio separado:
+`SHA256(JSON.stringify(['exportdata-direct-operator-v2', valoresV1, id_operador_olos]))`.
+Payloads sem a propriedade continuam v1 com o algoritmo anterior **inalterado**.
+A lista e a ordem das colunas compartilhadas do Corporate Sync não foram alteradas.
+
+As chaves da chamada continuam iguais. O binding de origem/destino também permanece
+igual; a extensão do contrato fica explicitamente registrada no ledger de adoção,
+no schema hash e no domínio do hash v2. Não se reinicializam recibos, checkpoints,
+contadores ou gerações para habilitar o campo.
+
+### Migrations e adoção explícita
+
+Arquivos revisáveis, sem execução automática pelo runtime:
+
+- `migrations/corporate/001_operator_id.sql`: **somente MADM**, ADD COLUMN nullable,
+  sem default, sem índice, sem mudança de trigger e sem UPDATE em dados existentes.
+  Verifica banco/tabela/tipo; uma coluna existente incompatível causa rollback.
+- `migrations/004_operator_contract.sql`: **somente local**, cria ledger de adoção e
+  auditoria das revisões de payload pendentes. Não modifica a outbox ao aplicar.
+
+O destino passa de 33 para 34 colunas conforme o estado informado. INSERTs nomeiam
+as colunas. O novo campo não integra a identidade composta nem índices únicos;
+vários registros podem compartilhar operador. O trigger aprovado só dispara no
+INSERT ou UPDATE de telefone/telefone_match_key; complementação do operador não
+altera sua definição. Campos Kommo/defaults permanecem omitidos dos INSERTs.
+A migration requer lock DDL e usa `lock_timeout=5s`; latência/impacto reais não foram
+medidos. Consumidores externos com SELECT *, cargas posicionais ou expectativa
+rígida de 33 colunas precisam de revisão pelo DBA. O Corporate Sync antigo continua
+rejeitando a coluna extra: não reativá-lo como alternativa de entrega.
+
+Procedimento **futuro, sujeito a autorização separada**, com os serviços parados,
+escrita geral desabilitada e entrega pausada:
+
+1. Conferir tipos de AgentId em respostas já preservadas, schema/índices/triggers/
+   funções/consumidores reais e permissões. Registrar backup e contagens informadas:
+   725.287 registros locais, 15.608 confirmados e 709.679 pendentes. Esses números
+   não foram reconsultados nesta implementação.
+2. Exigir zero intenções seletivas `unresolved`, nenhuma captura `reading/received`
+   e nenhum bloqueio/falha não reconciliado. Não aplicar DDL enquanto houver COMMIT
+   incerto: mudar o schema nesse momento impediria a reconciliação pelo contrato antigo.
+3. Aplicar as migrations nos bancos corretos, exclusivamente em janela autorizada.
+   Conceder ao papel local os privilégios necessários nos dois ledgers novos.
+   Não ampliar privilégios corporativos para UPDATE geral: complemento é separado.
+4. Com a configuração operacional já carregada, obter a proposta somente leitura:
+
+   ```sh
+   env OLOS_CORPORATE_WRITE_ENABLED=false node dist/main.js corporate-operator-plan
+   ```
+
+5. Revisar os hashes emitidos e adotar exatamente essa mudança:
+
+   ```sh
+   env OLOS_CORPORATE_WRITE_ENABLED=false node dist/main.js corporate-adopt-operator \
+     --expected-schema-hash '<HASH_ANTERIOR>' --schema-hash '<HASH_NOVO>' \
+     --confirm 'AUTHORIZE_EXPORTDATA_OPERATOR_CONTRACT:<HASH_ANTERIOR>:<HASH_NOVO>'
+   ```
+
+A adoção exige que remover **somente** a coluna nova do schema remoto reproduza o
+schema hash anterior, inclusive as funções de normalização. Qualquer outra deriva
+bloqueia. Persiste o ledger e o novo shape/hash local, após COMMIT remoto de leitura
+reconhecido; não modifica binding, recibos ou pausa. Repetição idêntica é idempotente.
+A mera aplicação da migration remota não atualiza o hash local nem libera entrega.
+Não usar entrega como preflight: uma deriva de schema detectada pela entrega
+mantém o bloqueio estrutural existente e exige revisão.
+
+Instalação ainda não conciliada deve concluir a adoção legada v1 **antes** de adicionar
+a coluna. A conciliação legada não foi convertida em migração automática de contrato.
+
+### B — Pendentes congelados
+
+A adoção não muda nenhum dos 709.679 payloads antigos. Um payload pendente v1 não
+pode ser entregue sob o schema v2 até sua preparação explícita; a rejeição ocorre
+antes da conexão remota, sem pular o registro nem alterar o controle persistente.
+
+Preparação inicial limitada a 1–3 source IDs por execução:
+
+```sh
+env OLOS_CORPORATE_WRITE_ENABLED=false node dist/main.js corporate-prepare-operator \
+  --source-ids '<ID1>,<ID2>,<ID3>' \
+  --confirm 'AUTHORIZE_EXPORTDATA_OPERATOR_PAYLOADS:<ID1>,<ID2>,<ID3>'
+```
+
+Não usar os três IDs já confirmados para essa operação: ela exige `state=pending`,
+sem PK remota nem confirmação. Não seleciona pela posição da fila ou por intervalo.
+Sob locks de origem, Sync, entrega e histórico, compara todos os mappings/hashes,
+lê `records.agent_id` e grava em `corporate_operator_payloads` o payload/hash antigo,
+o novo payload/hash, o hash de origem, operador e target. Na **mesma transação local**,
+substitui somente payload/hash da entrada pendente selecionada. O registro de origem,
+o ID técnico, CallId, estado e demais registros não mudam. Não há escrita remota.
+
+Reexecução valida a revisão e não regrava; erro ou seleção incompleta aborta o lote
+inteiro. Payloads futuros v2 compatíveis já estão preparados. Não existem preparação
+em massa, cursor que pule conflitos ou conversão silenciosa durante a entrega.
+Tratar os 709.679 em produção requer um plano de lotes autorizado e dimensionado;
+o volume total não foi ensaiado e não há executor de massa nesta alteração.
+
+Depois da preparação, a entrega seletiva já homologada recebe os mesmos source IDs
+e a autorização de entrega habitual. Somente os adaptadores de payload/colunas/hash
+passaram a entender v2; locks, limite de três, intenção durável, bloqueio e
+reconciliação de COMMIT incerto são os mesmos. Divergência em `id_operador_olos`
+também bloqueia reconhecimento remoto. Não habilitar a entrega geral nesta etapa.
+
+### C — Confirmados: proposta de complementação, sem executor automático
+
+Os 15.608 recibos v1 continuam válidos e não são convertidos ou reinseridos. O novo
+campo não é inferido como NULL no hash antigo. Uma revalidação v1 compara somente
+os campos comprovados originalmente, incluindo a mesma PK corporativa; novas
+entregas v2 comparam também o operador.
+
+`operatorComplementProposal()` em `src/corporate-delivery/operator-complement.ts`
+é um **gerador offline** de proposta SQL, não um comando de execução ou worker.
+Recebe até três recibos confirmados, payloads/hashes originais, target/PK remota,
+AgentId já preservado e contrato de schema/funções revisado. Gera manifesto, SHA-256,
+autorização vinculada ao manifesto e SQL. Não abre conexões nem grava arquivos.
+Exportação desses comprovantes, geração/salvamento privado da proposta e execução
+pelo DBA são ações futuras separadamente autorizadas. Não há CLI que complemente
+os confirmados automaticamente.
+
+Procedimento proposto para uma janela específica:
+
+1. Comprovar localmente os mappings, source hashes, payload hashes e PKs dos IDs
+   selecionados. Os três exemplos informados devem resultar em 52, 52 e 0;
+   não obter o operador pela chave técnica, CallId ou nome.
+2. Salvar manifesto/SQL em arquivos privados novos (0600, criação exclusiva),
+   pois a prova contém campos da chamada. Registrar hash do manifesto, origem,
+   binding, IDs, valores esperados e autorização em evidência durável local.
+3. **Antes** de executar SQL corporativo, manter locks/exclusividade operacional e
+   gravar em transação local uma quarentena específica: `paused=true`, `blocked=true`,
+   `last_code=OPERATOR_COMPLEMENT_RECONCILIATION_REQUIRED`, junto da referência
+   durável ao manifesto revisado. Não sobrescrever um bloqueio anterior. Esse
+   procedimento de DBA não é automatizado pelo gerador; sem evidência/quarentena
+   duráveis, a proposta não deve ser executada.
+4. Em sessão corporativa separadamente autorizada, configurar
+   `olos.operator_complement_authorization` com o token exato emitido pelo gerador
+   e executar a proposta. Ela bloqueia ausência de autorização, mudança de schema/
+   funções/trigger, identidade divergente, chamada ausente ou operador não nulo
+   divergente. Todos os selecionados são verificados antes de UPDATE.
+5. O SQL toma o fence remoto da entrega seletiva, verifica a mesma PK e todos os
+   campos gerenciados de cada chamada e executa **somente**
+   `SET id_operador_olos=<AgentId comprovado>` quando o campo atual é NULL.
+   Valor idêntico já presente não gera UPDATE. NULL de origem não inventa valor.
+   Não há INSERT, alteração de chaves, updated_at, Kommo ou recibos locais.
+6. Após COMMIT, conferir em leitura o manifesto inteiro e preservar a evidência de
+   conclusão. Só uma reconciliação administrativa explicitamente autorizada pode
+   encerrar a quarentena específica, mantendo `paused=true`. Não chamar
+   `corporate-reconcile-selected` para esse propósito: o journal seletivo não
+   representa uma complementação manual.
+7. Se o COMMIT for incerto, manter a quarentena e não repetir a escrita. Conferir
+   término da transação remota e valores/identidades/hashes por manifesto antes de
+   qualquer nova ação. Divergência bloqueia; não apagar chamadas/recibos nem inferir
+   sucesso por contagem. Mesmo sendo idempotente, a proposta não autoriza retry cego.
+
+A futura execução exige implementar/revisar o registro administrativo durável da
+janela de DBA e sua reconciliação; essa etapa permanece **manual e não homologada**.
+Os testes descartáveis validam o SQL gerado e sua preservação de campos, não uma
+operação real sobre os 15.608 registros.
+
+### Rollback do contrato de operador
+
+Antes de adotar/preparar payloads, parar a implantação e preservar evidências.
+Após adoção, manter serviços parados, escrita geral desabilitada e pausa. Não basta
+voltar a imagem `c63b2e3`: ela rejeita a coluna remota e não entende hashes v2.
+Não remover a coluna nem restaurar schema hashes para forçar compatibilidade.
+
+Preservar as duas versões de payload no ledger, recibos e journals. Revisões locais
+somente podem ser revertidas em plano específico, se ainda pendentes, sem tentativa
+remota ou COMMIT incerto e com comparação dos hashes atuais contra a revisão.
+Registros v2 confirmados não podem voltar ao formato antigo por regravação de hash.
+Complementações corporativas não são desfeitas pelo rollback de código; sua eventual
+reversão exige outra autorização e proteção contra atualização concorrente.
+Preferir correção progressiva do contrato, com homologação separada, a downgrade.
