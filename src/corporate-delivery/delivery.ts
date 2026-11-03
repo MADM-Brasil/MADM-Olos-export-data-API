@@ -1,10 +1,11 @@
+import { identityDeliveryGate } from '../identity/gates.js';
 import type { Client, Pool, PoolClient } from 'pg';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { retryable, safeCode, SyncError } from '../corporate-sync/errors.js';
-import { integerValue, quote, type Shape } from '../corporate-sync/mapping.js';
+import { quote, type Shape } from '../corporate-sync/mapping.js';
 import { deliveryColumns, deliveryDigest as digest, mapDeliveryRow as mapRow, hasOperator, operatorColumn } from './payload.js';
 import { log } from '../errors.js';
-import type { MappedRecord } from '../mapping.js';
+import { originalInternalId, type MappedRecord } from '../mapping.js';
 import type { DeliveryConfig } from './config.js';
 import { corporateSchema, freeze, matches, uniqueIdentities } from './contract.js';
 import { reconcileLegacy } from './reconcile.js';
@@ -82,6 +83,7 @@ export class CorporateDelivery {
       if ((await local.query("SELECT 1 FROM olos_http.reads WHERE source_key=$1 AND spec->>'kind'='history' AND state IN ('reading','received') LIMIT 1",
         [this.source])).rowCount) throw new SyncError('HISTORY_RECOVERY_REQUIRED');
       // Lock before checking: a concurrently finishing delivery may have just discovered a conflict.
+      await identityDeliveryGate(local,[]);
       const state = await this.state(local, true);
       if (state.blocked && !['DATABASE_TRANSIENT_FAILURE','CORPORATE_COMMIT_UNKNOWN'].includes(state.last_code)) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
       await local.query(`UPDATE olos_http.corporate_control SET paused=false,blocked=false,failure_count=0,
@@ -103,7 +105,7 @@ export class CorporateDelivery {
     if (!this.ownerAlive()) throw new SyncError('CORPORATE_OWNER_LOST');
   }
 
-  async enqueue(local: PoolClient, sequence: string, input: MappedRecord[]): Promise<{ queued: number; duplicates: number }> {
+  async enqueue(local: PoolClient, input: MappedRecord[]): Promise<{ queued: number; duplicates: number }> {
     const state = await this.state(local);
     const shape = new Map(state.destination_shape) as Shape;
     let queued = 0, duplicates = 0;
@@ -116,7 +118,12 @@ export class CorporateDelivery {
         if (!previous.payload_hash) throw new SyncError('LEGACY_RECORD_RECONCILIATION_REQUIRED');
         duplicates++; continue;
       }
-      const id = integerValue((await local.query('SELECT nextval($1::regclass)::text AS id', [sequence])).rows[0].id, 32);
+      const id = originalInternalId(record.source_id, 32);
+      if ((await local.query(`SELECT 1 FROM olos_http.records WHERE target_table=$1 AND target_id=$2
+        UNION ALL SELECT 1 FROM olos_http.corporate_outbox WHERE target_id=$2
+        UNION ALL SELECT 1 FROM ${this.target} WHERE internal_id_olos=$2 LIMIT 1`,[this.target,id])).rowCount) {
+        throw new SyncError('SOURCE_INTERNAL_ID_COLLISION');
+      }
       const payload = (await freeze(local, [{ ...record, internal_id_olos: id }], shape, this.cfg))[0]!;
       await local.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,campaign_id,disposition_id)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [this.source, record.source_id, this.target, id, record.source_hash, record.agent_id, record.campaign_id, record.disposition_id]);
@@ -245,6 +252,7 @@ export class CorporateDelivery {
         WHERE source_key=$1 AND state='pending' ORDER BY target_id LIMIT $2 FOR UPDATE`, [this.source, this.cfg.connection.batchSize])).rows;
       if (new Map(state.destination_shape).has(operatorColumn) && entries.some(entry =>
         entry.state !== 'confirmed' && !hasOperator(entry.payload))) throw new SyncError('OPERATOR_PAYLOAD_UPGRADE_REQUIRED');
+      await identityDeliveryGate(local,entries);
       if (!entries.length) { await local.query('COMMIT'); return; }
       let found: Map<string, string>;
       let commitIssued = false;

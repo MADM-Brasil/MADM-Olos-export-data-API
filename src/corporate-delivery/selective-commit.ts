@@ -1,3 +1,4 @@
+import { certifiedOriginal } from '../identity/gates.js';
 import { allowsLegacyHistoryEntry, assertPreservedHistory, validatePreservedHistory } from './preserved-history.js';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -40,8 +41,10 @@ export async function selectEntries(local: PoolClient, source: string, target: s
       r.target_id::text AS record_target_id,r.target_table,r.agent_id
     FROM olos_http.corporate_outbox o JOIN olos_http.records r USING(source_key,source_id)
     WHERE o.source_key=$1 AND o.source_id=ANY($2::text[]) ORDER BY o.target_id FOR UPDATE OF o,r NOWAIT`, [source, ids])).rows;
+  const migrated=new Set<string>();
+  if(historyReadId!==undefined&&contract==='v1')for(const entry of entries)if(await certifiedOriginal(local,source,entry))migrated.add(entry.source_id);
   if (entries.length !== ids.length || entries.some(entry =>
-    (entry.origin !== 'capture' && !allowsLegacyHistoryEntry(entry, historyReadId, contract)) ||
+    (entry.origin !== 'capture' && !allowsLegacyHistoryEntry(entry, historyReadId, contract) && !migrated.has(entry.source_id)) ||
     !['pending','confirmed'].includes(entry.state) || entry.source_hash !== entry.record_hash ||
     entry.target_id !== entry.record_target_id || entry.target_table !== target)) throw new SyncError('SELECTIVE_RECEIPT_INVALID');
   return entries;

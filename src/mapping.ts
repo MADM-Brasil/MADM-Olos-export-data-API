@@ -10,6 +10,15 @@ export const sourceColumns = ['AttemptsRawDataID', 'CallId', 'AgentId', 'Campaig
   'EndWrap', 'TableName', 'EndCall', 'OriginalPhoneNumber', 'Dnis', 'PhoneTypeId', 'Route', 'CampaignData',
   'CustomerId', 'MailingRecordId', 'MailingPhoneNumberId', 'CallIdTelecom'] as const;
 export type Cache = { users: Map<string, string>; campaigns: Map<string, string>; dispositions: Map<string, string> };
+// Used only for a new mapping. Existing mappings and their frozen hashes retain
+// their historical IDs; never infer a replacement from CallId or AgentId.
+export function originalInternalId(sourceId: string, bits: 32 | 64): string {
+  if (typeof sourceId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(sourceId) || BigInt(sourceId)>9223372036854775807n) {
+    throw new WorkerError('SOURCE_ID_INVALID');
+  }
+  if (bits === 32 && BigInt(sourceId)>2147483647n) throw new WorkerError('SOURCE_ID_OUT_OF_CORPORATE_RANGE');
+  return sourceId;
+}
 export function textValue(value: unknown): string | null {
   if (value == null) return null;
   if (typeof value === 'string') return value;

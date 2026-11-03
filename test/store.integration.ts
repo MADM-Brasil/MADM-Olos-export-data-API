@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import pg from 'pg';
 import { Store } from '../src/store.js';
 import { config, type Config } from '../src/config.js';
-import type { Cache } from '../src/mapping.js';
+import { columns, mapRecord, type Cache } from '../src/mapping.js';
 import { OlosApi } from '../src/api.js';
 import { OlosAuthManager } from '../src/auth.js';
 import { StaticCache } from '../src/cache.js';
@@ -44,6 +44,9 @@ test('atomic batched insert, exact source ID, same CallId is not a unique key, d
   const result=await pool.query("SELECT count(*)::int AS count,min(data_ligacao::text) AS date FROM raw.olos_calls");
   assert.equal(result.rows[0].count,3);assert.match(result.rows[0].date,/\.123456/);
   assert.equal((await pool.query('SELECT source_id FROM olos_http.records WHERE source_id=$1',['9007199254740993'])).rowCount,1);
+  assert.equal((await pool.query('SELECT target_id::text FROM olos_http.records WHERE source_id=$1',['9007199254740993'])).rows[0].target_id,'9007199254740993');
+  assert.equal((await pool.query('SELECT internal_id_olos::text FROM raw.olos_calls WHERE internal_id_olos=$1',['9007199254740993'])).rows[0].internal_id_olos,'9007199254740993');
+  assert.equal((await pool.query('SELECT is_called FROM raw.olos_calls_internal_id_olos_seq')).rows[0].is_called,false);
   await stage(s,[row('3'),row('2')],'previous');
   assert.deepEqual(await s.drain(cache),{received:2,inserted:0,updated:0,duplicates:2});
   assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
@@ -81,6 +84,23 @@ test('source ID collision fails without overwriting target',async()=>{
   await stage(s,[row('1',{CallId:'changed'})]);await assert.rejects(s.drain(cache),/SOURCE_ID_CONTENT_CONFLICT/);
   assert.equal((await pool.query('SELECT olos_call_id FROM raw.olos_calls')).rows[0].olos_call_id,'same-call-id');
   assert.equal((await s.unresolved()).length,1);
+});
+test('original ID allocation preserves a historical mapping and blocks a different source claiming its target',async()=>{
+  // Seed the old allocator's result directly; identity ALWAYS forbids renumbering by UPDATE.
+  const mapped=mapRecord(row('100001'),cache,cfg.sourceTimeZone);
+  await pool.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,campaign_id,disposition_id)
+    VALUES($1,$2,'"raw"."olos_calls"',1,$3,$4,$5,$6)`,[cfg.sourceKey,mapped.source_id,mapped.source_hash,mapped.agent_id,mapped.campaign_id,mapped.disposition_id]);
+  const declarations=columns.map(c=>`${c} ${c==='data_ligacao'?'timestamptz':c==='tma_origem'?'numeric':'text'}`).join(',');
+  await pool.query(`INSERT INTO raw.olos_calls(internal_id_olos,${columns.join(',')}) OVERRIDING SYSTEM VALUE
+    SELECT 1,${columns.join(',')} FROM jsonb_to_recordset($1::jsonb) AS x(${declarations})`,[JSON.stringify([mapped])]);
+  const s=await store();
+  const before=(await pool.query('SELECT * FROM raw.olos_calls')).rows;
+  await stage(s,[row('100001')]); assert.equal((await s.drain(cache)).duplicates,1);
+  assert.equal((await pool.query("SELECT target_id::text FROM olos_http.records WHERE source_id='100001'")).rows[0].target_id,'1');
+  await stage(s,[row('1')]); await assert.rejects(s.drain(cache),/SOURCE_INTERNAL_ID_COLLISION/);
+  assert.deepEqual((await pool.query('SELECT * FROM raw.olos_calls')).rows,before);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM olos_http.records')).rows[0].n,1);
+  assert.equal((await s.unresolved())[0]!.processed_count,0);
 });
 test('unknown reference IDs persist and names can be reconciled without remote reread',async()=>{
   const s=await store();await stage(s,[row('1')]);await s.drain(empty);

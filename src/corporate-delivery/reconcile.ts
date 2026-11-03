@@ -30,8 +30,10 @@ export async function reconcileLegacy(local: PoolClient, cfg: DeliveryConfig, so
     const invalid = await local.query(`SELECT 1 FROM olos_http.records r LEFT JOIN ${target} d ON d.internal_id_olos=r.target_id
       WHERE r.target_table=$1 AND (r.source_key<>$2 OR d.internal_id_olos IS NULL) LIMIT 1`, [target, source]);
     if (invalid.rowCount) throw new SyncError('LEGACY_RECORD_MAPPING_MISSING');
-    // Retain the original allocator. Never create a sequence, setval, infer IDs from OLOS or remap collisions.
-    const max = BigInt((await local.query('SELECT COALESCE(max(target_id),0)::text AS n FROM olos_http.records WHERE target_table=$1', [target])).rows[0].n);
+    // Preserve the allocator and its legacy floor; original source IDs never
+    // consume this sequence. Adoption still preserves every existing mapping.
+    const max = BigInt((await local.query(`SELECT COALESCE(max(target_id),0)::text AS n FROM olos_http.records
+      WHERE target_table=$1 AND target_id::text<>source_id`, [target])).rows[0].n);
     const allocator = (await local.query(`SELECT last_value::text,is_called FROM ${sequence}`)).rows[0];
     if (BigInt(allocator.last_value) < max || !allocator.is_called && BigInt(allocator.last_value) <= max) throw new SyncError('LEGACY_ALLOCATOR_BEHIND');
     integerValue(allocator.last_value, 32);

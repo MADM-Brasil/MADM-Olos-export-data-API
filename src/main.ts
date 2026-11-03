@@ -13,16 +13,27 @@ import { inspectSchema } from './schema.js';
 import { operatorAdmin, parseOperatorRequest } from './corporate-delivery/operator-admin.js';
 import { corporateControl } from './corporate-delivery/commands.js';
 import { parseSelection, parseReconciliation } from './corporate-delivery/selection.js';
+import { parseDrainRequest } from './corporate-delivery/drain-request.js';
+import { drainCommand } from './corporate-delivery/drain.js';
 
 async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
   const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
-    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-deliver-selected','corporate-reconcile-selected','corporate-operator-plan','corporate-adopt-operator','corporate-prepare-operator','capture-history'];
+    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-deliver-selected','corporate-reconcile-selected','corporate-operator-plan','corporate-adopt-operator','corporate-prepare-operator','capture-history',
+    'corporate-drain-plan','corporate-drain-backlog','corporate-drain-status','corporate-drain-reconcile','corporate-drain-cancel'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
   if (args.includes('--preserve-history-read') && !['corporate-operator-plan','corporate-adopt-operator',
-    'corporate-prepare-operator','corporate-deliver-selected','corporate-reconcile-selected'].includes(command)) {
+    'corporate-prepare-operator','corporate-deliver-selected','corporate-reconcile-selected','corporate-drain-plan','corporate-drain-backlog'].includes(command)) {
     throw new WorkerError('HISTORY_HOMOLOGATION_SCOPE_INVALID');
+  }
+  if (command.startsWith('corporate-drain-')) {
+    const request=parseDrainRequest(command,args);
+    const abort=new AbortController(), stop=() => abort.abort();
+    process.once('SIGTERM',stop); process.once('SIGINT',stop);
+    try { await drainCommand(cfg,request,abort.signal); }
+    finally { process.removeListener('SIGTERM',stop); process.removeListener('SIGINT',stop); }
+    return;
   }
   // Reject missing consent and malformed IDs before opening any database or HTTP client.
   const selection = command === 'corporate-deliver-selected' ? parseSelection(cfg.corporateDelivery, args) : undefined;

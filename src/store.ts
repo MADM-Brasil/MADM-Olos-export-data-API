@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { type Config } from './config.js';
 import { type ReadSpec, rows } from './api.js';
-import { columns, type Cache, type MappedRecord, mapRecord } from './mapping.js';
+import { columns, type Cache, type MappedRecord, mapRecord, originalInternalId } from './mapping.js';
 import { WorkerError } from './errors.js';
 import { assertSchema, quote } from './schema.js';
 import { lockSource } from './source-lock.js';
@@ -275,7 +275,7 @@ export class Store {
     if (this.delivery) {
       await db.query('BEGIN');
       try {
-        const result = await this.delivery.enqueue(db, this.sequence, batch);
+        const result = await this.delivery.enqueue(db, batch);
         await db.query('UPDATE olos_http.reads SET processed_count=$2,received_count=$3 WHERE id=$1', [readId, processed, received]);
         await db.query('COMMIT');
         // Queued locally is not a corporate INSERT or acknowledgement.
@@ -300,7 +300,7 @@ export class Store {
 
     await db.query('BEGIN');
     try {
-      // Prevent a concurrent destination writer/sequence collision from being mistaken for our own row.
+      // Preserve old mappings; a new source ID must not claim an occupied historical target.
       await db.query(`LOCK TABLE ${this.target} IN SHARE ROW EXCLUSIVE MODE`);
       const previous = (await db.query('SELECT source_id,target_id,source_hash,target_table FROM olos_http.records WHERE source_key=$1 AND source_id=ANY($2::text[])', [this.cfg.sourceKey, batch.map(r => r.source_id)])).rows;
       const existing = new Map(previous.map(r => [r.source_id as string, r]));
@@ -308,12 +308,17 @@ export class Store {
         const prev = existing.get(row.source_id);
         if (prev && (prev.source_hash !== row.source_hash || prev.target_table !== this.target)) throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
       }
-      const inserted = batch.filter(r => !existing.has(r.source_id)).length;
+      const newIds = batch.filter(r => !existing.has(r.source_id)).map(r => originalInternalId(r.source_id,64));
+      if ((await db.query(`SELECT 1 FROM olos_http.records WHERE target_table=$1 AND target_id=ANY($2::bigint[])
+        UNION ALL SELECT 1 FROM ${this.target} WHERE internal_id_olos=ANY($2::bigint[]) LIMIT 1`,[this.target,newIds])).rowCount) {
+        throw new WorkerError('SOURCE_INTERNAL_ID_COLLISION');
+      }
+      const inserted = newIds.length;
       const markers = (await db.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,campaign_id,disposition_id)
-        SELECT $1,x.source_id,$2,nextval($3::regclass),x.source_hash,x.agent_id,x.campaign_id,x.disposition_id
-        FROM jsonb_to_recordset($4::jsonb) AS x(source_id text,source_hash text,agent_id text,campaign_id text,disposition_id text)
+        SELECT $1,x.source_id,$2,x.source_id::bigint,x.source_hash,x.agent_id,x.campaign_id,x.disposition_id
+        FROM jsonb_to_recordset($3::jsonb) AS x(source_id text,source_hash text,agent_id text,campaign_id text,disposition_id text)
         WHERE NOT EXISTS (SELECT 1 FROM olos_http.records r WHERE r.source_key=$1 AND r.source_id=x.source_id)
-        RETURNING source_id,target_id`, [this.cfg.sourceKey, this.target, this.sequence, JSON.stringify(batch)])).rows;
+        RETURNING source_id,target_id`, [this.cfg.sourceKey, this.target, JSON.stringify(batch)])).rows;
       for (const row of markers) existing.set(row.source_id, row);
       const payload = batch.map(row => ({ ...row, internal_id_olos: existing.get(row.source_id)!.target_id }));
       const occupied = new Set((await db.query(`SELECT internal_id_olos FROM ${this.target} WHERE internal_id_olos=ANY($1::bigint[])`, [payload.map(r => r.internal_id_olos)])).rows.map(r => r.internal_id_olos));

@@ -1,12 +1,30 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mapRecord, timestamp, type Cache } from '../src/mapping.js';
+import { mapRecord, originalInternalId, timestamp, type Cache } from '../src/mapping.js';
 import { rows } from '../src/api.js';
 import { StaticCache } from '../src/cache.js';
 import { OlosApi } from '../src/api.js';
 import { OlosAuthManager } from '../src/auth.js';
 
 const cache:Cache={users:new Map([['7','Agent']]),campaigns:new Map([['03','Campaign']]),dispositions:new Map([['9','Disposition']])};
+test('new internal ID is the exact AttemptsRawDataID, independent from CallId/AgentId and bounded without Number coercion',()=>{
+  const input={AttemptsRawDataID:'47561569',CallId:'1031756916',AgentId:'1658'};
+  const mapped=mapRecord(input,cache);
+  assert.equal(originalInternalId(mapped.source_id,32),'47561569');
+  assert.equal(mapped.olos_call_id,'1031756916'); assert.equal(mapped.agent_id,'1658');
+  assert.equal(originalInternalId('2147483647',32),'2147483647');
+  for (const id of ['2147483648','9007199254740993','9223372036854775807']) {
+    assert.throws(()=>originalInternalId(id,32),/SOURCE_ID_OUT_OF_CORPORATE_RANGE/);
+    assert.equal(originalInternalId(id,64),id);
+  }
+  for (const id of ['0','-1','01','1.1','1e3',' 1','', '9223372036854775808']) {
+    assert.throws(()=>originalInternalId(id,32),/SOURCE_ID_INVALID/);
+    assert.throws(()=>originalInternalId(id,64),/SOURCE_ID_INVALID/);
+  }
+  // Target-ID policy does not enter the pre-existing source hash algorithm.
+  assert.equal(mapped.source_hash,mapRecord(input,cache,undefined,true).source_hash);
+  assert.equal(rows('[{"AttemptsRawDataID":9007199254740993}]')[0]!.AttemptsRawDataID,'9007199254740993');
+});
 test('column mapping preserves IDs, phone and microseconds; unconfirmed fields remain NULL',()=>{
   const input=rows('[{"AttemptsRawDataID":9007199254740993,"CallId":"0004","OriginalPhoneNumber":"001155500001","AgentId":7,"CampaignId":"03","DispositionId":9,"StartDate":"2026-10-01T10:11:12.123456-03:00","CallIdTelecom":"88","CampaignData":"cpf=123"}]')[0]!;
   const result=mapRecord(input,cache);

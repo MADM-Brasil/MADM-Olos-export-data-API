@@ -1,3 +1,4 @@
+import { certifiedOriginal } from '../identity/gates.js';
 import type { PoolClient } from 'pg';
 import { SyncError } from '../corporate-sync/errors.js';
 import { columns } from '../corporate-sync/mapping.js';
@@ -70,10 +71,12 @@ export async function assertPreservedHistory(local: PoolClient, source: string, 
     JOIN olos_http.reads h ON h.id=$2
     WHERE r.source_key=$1 AND r.source_id=ANY($4::text[]) FOR SHARE OF r,o NOWAIT`,
   [source, readId, read.target_table, historyHomologation.map(row => row.source_id)])).rows;
+  const migrated=new Set<string>();
+  if(contract==='v1')for(const entry of entries)if(await certifiedOriginal(local,source,entry))migrated.add(entry.source_id);
   if (entries.length !== 3 || historyHomologation.some(expected => !entries.some(entry =>
-    entry.valid && (entry.origin === 'capture' || allowsLegacyHistoryEntry(entry, readId, contract)) &&
+    entry.valid && (entry.origin === 'capture' || allowsLegacyHistoryEntry(entry, readId, contract) || migrated.has(entry.source_id)) &&
     entry.source_id === expected.source_id && entry.agent_id === expected.agent_id &&
-    entry.target_id === expected.target_id && (contract !== 'v2' || entry.payload.id_operador_olos === expected.agent_id) &&
+    (entry.target_id === expected.target_id || migrated.has(entry.source_id)) && (contract !== 'v2' || entry.payload.id_operador_olos === expected.agent_id) &&
     (contract !== 'v1' || entry.payload.olos_call_id === expected.olos_call_id)))) {
     throw new SyncError('HISTORY_HOMOLOGATION_RECORD_CHANGED');
   }
