@@ -1,3 +1,4 @@
+import { parsePreservedHistory, validatePreservedHistory } from './preserved-history.js';
 import type { PoolClient } from 'pg';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { SyncError } from '../corporate-sync/errors.js';
@@ -8,11 +9,12 @@ import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { lockSelection } from './selective-commit.js';
 import { deliveryDigest, hasOperator, mapDeliveryRow, operatorColumn, operatorId, withOperator } from './payload.js';
 
-export type OperatorRequest = { kind: 'plan' } |
+export type OperatorRequest = { historyReadId?: string } & ({ kind: 'plan' } |
   { kind: 'adopt'; previousHash: string; schemaHash: string; confirmation: string } |
-  { kind: 'prepare'; ids: string[]; confirmation: string };
+  { kind: 'prepare'; ids: string[]; confirmation: string });
 export function validateOperatorRequest(cfg: DeliveryConfig | undefined, request: OperatorRequest): void {
   if (!cfg || cfg.connection.writeEnabled) throw new SyncError('OPERATOR_REQUIRES_GENERAL_WRITE_DISABLED');
+  validatePreservedHistory(request.historyReadId, request.kind === 'prepare' ? request.ids : undefined);
   if (request.kind === 'plan') return;
   if (request.kind === 'adopt') {
     if (![request.previousHash, request.schemaHash].every(h => /^[a-f0-9]{64}$/.test(h)) || request.previousHash === request.schemaHash) throw new SyncError('OPERATOR_SCHEMA_HASH_INVALID');
@@ -24,6 +26,8 @@ export function validateOperatorRequest(cfg: DeliveryConfig | undefined, request
   }
 }
 export function parseOperatorRequest(cfg: DeliveryConfig | undefined, command: string, args: string[]): OperatorRequest {
+  const { args: parameters, ...history } = parsePreservedHistory(args);
+  args = parameters;
   let request: OperatorRequest;
   if (command === 'corporate-operator-plan' && !args.length) request = { kind: 'plan' };
   else if (command === 'corporate-adopt-operator' && args.length === 6 && args[0] === '--expected-schema-hash' && args[2] === '--schema-hash' && args[4] === '--confirm') {
@@ -31,6 +35,7 @@ export function parseOperatorRequest(cfg: DeliveryConfig | undefined, command: s
   } else if (command === 'corporate-prepare-operator' && args.length === 4 && args[0] === '--source-ids' && args[2] === '--confirm') {
     request = { kind: 'prepare', ids: args[1]!.split(','), confirmation: args[3]! };
   } else throw new SyncError('OPERATOR_PARAMETERS_INVALID');
+  request = { ...request, ...history };
   validateOperatorRequest(cfg, request); return request;
 }
 
@@ -40,14 +45,14 @@ export async function operatorAdmin(local: PoolClient, cfg: DeliveryConfig, sour
   validateOperatorRequest(cfg, request);
   await local.query('BEGIN');
   try {
-    await lockSelection(local, source);
+    await lockSelection(local, source, request.historyReadId);
     await assertLocalConsumersCompatible(local, source);
     if (!(await local.query("SELECT to_regclass('olos_http.corporate_operator_contracts') IS NOT NULL AND to_regclass('olos_http.corporate_operator_payloads') IS NOT NULL AS ok")).rows[0].ok) throw new SyncError('OPERATOR_LOCAL_MIGRATION_REQUIRED');
     const state = (await local.query('SELECT * FROM olos_http.corporate_control WHERE singleton FOR UPDATE NOWAIT')).rows[0];
     if (!state?.ready || !state.paused || state.blocked || state.last_code) throw new SyncError('OPERATOR_CONTROL_NOT_READY');
     if (state.binding !== cfg.binding || state.source_key !== source || state.target_table !== target) throw new SyncError('CORPORATE_BINDING_CHANGED');
     if ((await local.query("SELECT 1 FROM olos_http.corporate_selective_commits WHERE state='unresolved'")).rowCount) throw new SyncError('SELECTIVE_COMMIT_RECONCILIATION_REQUIRED');
-    if ((await local.query("SELECT 1 FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received')", [source])).rowCount) throw new SyncError('LOCAL_CAPTURE_RECOVERY_REQUIRED');
+    if ((await local.query("SELECT 1 FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') AND ($2::uuid IS NULL OR id<>$2::uuid)", [source, request.historyReadId ?? null])).rowCount) throw new SyncError('LOCAL_CAPTURE_RECOVERY_REQUIRED');
     const adoption = (await local.query('SELECT * FROM olos_http.corporate_operator_contracts WHERE source_key=$1 FOR UPDATE', [source])).rows[0];
     if (request.kind !== 'prepare') {
       const remote = await connect(cfg.connection, 'destination');

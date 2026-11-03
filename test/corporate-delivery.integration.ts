@@ -13,11 +13,13 @@ import { DynamicScheduler, type ScheduledConsumer } from '../src/scheduler.js';
 import type { SchedulerRepository, Settings } from '../src/admin/repository.js';
 import { columns, digest, mapRow, projection, type Row } from '../src/corporate-sync/mapping.js';
 import { operatorAdmin, type OperatorRequest } from '../src/corporate-delivery/operator-admin.js';
+import { preservedHistoryRead, historyHomologation } from '../src/corporate-delivery/preserved-history.js';
 import { deliveryDigest } from '../src/corporate-delivery/payload.js';
 import { operatorComplementProposal } from '../src/corporate-delivery/operator-complement.js';
 import { corporateSchema } from '../src/corporate-delivery/contract.js';
 import { assertNoDirectOwnership } from '../src/corporate-sync/ownership.js';
 import { selectiveCommitBlock } from '../src/corporate-delivery/selective-commit.js';
+import type { DeliverySelection, ReconciliationSelection } from '../src/corporate-delivery/selection.js';
 import type { DeliveryHooks } from '../src/corporate-delivery/delivery.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { SyncError } from '../src/corporate-sync/errors.js';
@@ -633,7 +635,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       await stage(s, selectedIds.map((id, i) => record(Number(id), { CallId: String(35458016 + i) })));
       await close(s); return cfg;
     }
-    async function selectiveRun(cfg: Config, hooks: DeliveryHooks = {}, selection = selected) {
+    async function selectiveRun(cfg: Config, hooks: DeliveryHooks = {}, selection: DeliverySelection = selected) {
       const s = new Store(cfg);
       try { await s.open(); await s.delivery!.deliverSelected(selection, hooks); }
       finally { await s.close(); }
@@ -641,7 +643,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     const unresolvedCommit = async () => (await local.query("SELECT * FROM olos_http.corporate_selective_commits WHERE state='unresolved'")).rows[0];
     const reconciliationFor = (attemptId: string, ids = selectedIds) => ({ sourceIds: ids, attemptId,
       confirmation: `AUTHORIZE_EXPORTDATA_SELECTIVE_RECONCILIATION:${attemptId}:${ids.join(',')}` });
-    async function reconcileRun(cfg: Config, hooks: DeliveryHooks = {}, selection?: ReturnType<typeof reconciliationFor>) {
+    async function reconcileRun(cfg: Config, hooks: DeliveryHooks = {}, selection?: ReconciliationSelection) {
       const request = selection ?? reconciliationFor((await unresolvedCommit()).attempt_id);
       const s = new Store(cfg);
       try { await s.open(); await s.delivery!.reconcileSelected(request, hooks); }
@@ -979,6 +981,171 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       await stage(s, selectedIds.map((id,i) => record(Number(id), { CallId:String(35458016+i),AgentId:[52,1599,0][i] })));
       await close(s); return cfg;
     }
+    const incidentIds = historyHomologation.map(row => row.source_id);
+    const incidentSelection = { sourceIds: incidentIds, historyReadId: preservedHistoryRead,
+      confirmation: `AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${incidentIds.join(',')}` };
+    const incidentPrepare: OperatorRequest = { kind: 'prepare', ids: incidentIds, historyReadId: preservedHistoryRead,
+      confirmation: `AUTHORIZE_EXPORTDATA_OPERATOR_PAYLOADS:${incidentIds.join(',')}` };
+    async function incidentFixture() {
+      const cfg = { ...await historyConfig(), ingestionBaseline: '2026-09-01T00:00:00Z' }; await operatorLocalMigrations();
+      const s = await open(cfg);
+      await stage(s, [record(900001)]); // Unrelated frozen v1 backlog must survive.
+      for (const row of historyHomologation) {
+        await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),$1)", [Number(row.target_id)-1]);
+        await stage(s, [record(Number(row.source_id), { AgentId: row.agent_id })]);
+      }
+      await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),725262)");
+      await close(s);
+      await local.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,error_code)
+        VALUES($1,$2,$3,'{"kind":"history"}','RESPONSE_TOO_LARGE')`, [preservedHistoryRead,cfg.sourceKey,'"raw"."olos_calls"']);
+      await operatorMigration();
+      return cfg;
+    }
+    async function incidentAdopt(cfg: Config) {
+      const plan = await operatorCommand(cfg, { kind: 'plan', historyReadId: preservedHistoryRead });
+      return operatorCommand(cfg, { kind: 'adopt', historyReadId: preservedHistoryRead,
+        previousHash: plan.previous_schema_hash, schemaHash: plan.schema_hash,
+        confirmation: `AUTHORIZE_EXPORTDATA_OPERATOR_CONTRACT:${plan.previous_schema_hash}:${plan.schema_hash}` });
+    }
+    const incidentEvidence = async () => ({
+      reads: (await local.query('SELECT * FROM olos_http.reads ORDER BY id')).rows,
+      records: (await local.query('SELECT * FROM olos_http.records ORDER BY target_id')).rows,
+      settings: (await local.query('SELECT * FROM olos_http.worker_settings')).rows,
+      audit: (await local.query('SELECT * FROM olos_http.admin_audit ORDER BY id')).rows,
+      receipts: (await local.query('SELECT * FROM corporate_sync.receipts ORDER BY internal_id_olos')).rows,
+      others: (await local.query('SELECT * FROM olos_http.corporate_outbox WHERE NOT(source_id=ANY($1::text[])) ORDER BY target_id',[incidentIds])).rows,
+      sequence: (await local.query('SELECT last_value,is_called FROM raw.olos_calls_internal_id_olos_seq')).rows,
+    });
+    await t.test('preserved history: exact incident adoption, preparation and delivery preserve all historical evidence and backlog', async () => {
+      const cfg = await incidentFixture(), before = await incidentEvidence(), frozen = await outbox();
+      await assert.rejects(operatorCommand(cfg,{kind:'plan'}),/HISTORY_RECOVERY_REQUIRED/);
+      await assert.rejects(selectiveRun(cfg,{}, {sourceIds:incidentIds,confirmation:incidentSelection.confirmation}),/HISTORY_RECOVERY_REQUIRED/);
+      await incidentAdopt(cfg); await incidentAdopt(cfg);
+      assert.deepEqual(await outbox(),frozen);
+      await operatorCommand(cfg,incidentPrepare); await operatorCommand(cfg,incidentPrepare);
+      const audits = (await local.query('SELECT * FROM olos_http.corporate_operator_payloads')).rows;
+      assert.equal(audits.length,3);
+      for (const audit of audits) {
+        const original = frozen.find(row => row.source_id === audit.source_id)!;
+        assert.deepEqual(audit.previous_payload,original.payload); assert.equal(audit.previous_hash,original.payload_hash);
+        assert.equal(audit.source_hash,original.source_hash);
+      }
+      await selectiveRun(cfg,{},incidentSelection); await selectiveRun(cfg,{},incidentSelection);
+      assert.equal(await destinationCount(),5); assert.deepEqual(await incidentEvidence(),before);
+      for (const row of historyHomologation) {
+        assert.equal((await remote.query('SELECT id_operador_olos FROM raw.olos_calls WHERE internal_id_olos=$1',[row.target_id])).rows[0].id_operador_olos,row.agent_id);
+      }
+      const s = await open(cfg);
+      let calls=0; const worker=historyWorker(s,async()=>{calls++;return '[]';});
+      for (const spec of [{kind:'history'},{kind:'current'},{kind:'previous'},
+        {kind:'reread',date:'2026-10-01',start:'1',end:'2'}] as const) {
+        await assert.rejects(worker.cycle(spec,true),/HISTORY_RECOVERY_REQUIRED/);
+      }
+      await assert.rejects(worker.captureOnce(),/RECOVERY_REQUIRED/);
+      await assert.rejects(s.drain(cache),/HISTORY_RECOVERY_REQUIRED/);
+      await s.delivery!.tick(); assert.equal(await destinationCount(),5); assert.equal(calls,0);
+      await close(s);
+      await assert.rejects(corporateControl(makeConfig(), 'corporate-resume'),/HISTORY_RECOVERY_REQUIRED/);
+      assert.deepEqual(await incidentEvidence(),before); assert.equal((await control()).paused,true);
+    });
+    await t.test('preserved history: changed read, selection, scheduler or provenance fail closed', async () => {
+      const mutations = [
+        "UPDATE olos_http.reads SET error_code='NETWORK_FAILURE' WHERE spec->>'kind'='history'",
+        "UPDATE olos_http.reads SET response_body='[]',state='received' WHERE spec->>'kind'='history'",
+        "UPDATE olos_http.reads SET processed_count=1 WHERE spec->>'kind'='history'",
+        "UPDATE olos_http.reads SET spec='{\"kind\":\"current\"}' WHERE spec->>'kind'='history'",
+        "UPDATE olos_http.reads SET state='resolved',resolution='synthetic evidence' WHERE spec->>'kind'='history'",
+        "INSERT INTO olos_http.reads(id,source_key,target_table,spec) SELECT '11111111-1111-4111-8111-111111111111',source_key,target_table,'{\"kind\":\"current\"}' FROM olos_http.reads WHERE spec->>'kind'='history'",
+        "UPDATE olos_http.records SET agent_id='999' WHERE source_id='47561569'",
+        "UPDATE olos_http.corporate_outbox SET created_at=clock_timestamp() WHERE source_id='47561569'",
+        "UPDATE olos_http.worker_settings SET enabled=true,desired_state='RUNNING'",
+      ];
+      for (const sql of mutations) {
+        const cfg=await incidentFixture();
+        await operatorCommand(cfg,{kind:'plan',historyReadId:preservedHistoryRead});
+        await local.query(sql);
+        const before=await outbox(), state=await control();
+        await assert.rejects(incidentAdopt(cfg),/HISTORY_/);
+        assert.deepEqual(await outbox(),before); assert.deepEqual(await control(),state);
+        assert.equal(await destinationCount(),2);
+      }
+      const cfg=await incidentFixture();
+      await assert.rejects(selectiveRun(cfg,{}, {...incidentSelection, sourceIds:['47561569']}),/HISTORY_HOMOLOGATION_SCOPE_INVALID/);
+      await assert.rejects(operatorCommand(cfg,{kind:'plan',historyReadId:'11111111-1111-4111-8111-111111111111'}),/HISTORY_HOMOLOGATION_SCOPE_INVALID/);
+      for (const key of [`olos-admin:${cfg.sourceKey}`,`olos-http:history:${cfg.sourceKey}`]) {
+        await local.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[key]);
+        try { await assert.rejects(incidentAdopt(cfg),/HISTORY_(ADMIN|CAPTURE)_ACTIVE/); }
+        finally { await local.query('SELECT pg_advisory_unlock_all()'); }
+      }
+    });
+    await t.test('preserved history: UNKNOWN retains both journals; explicit reconciliation has no capture or retry', async () => {
+      const cfg=await incidentFixture(), before=await incidentEvidence();
+      await incidentAdopt(cfg); await operatorCommand(cfg,incidentPrepare);
+      await assert.rejects(selectiveRun(cfg,{afterRemoteCommit:async()=>{throw new Error('lost acknowledgement');}},incidentSelection),/CORPORATE_COMMIT_UNKNOWN/);
+      const attempt=await unresolvedCommit();
+      await assert.rejects(selectiveRun(cfg,{},incidentSelection),/CORPORATE_DELIVERY_BLOCKED/);
+      await assert.rejects(reconcileRun(cfg,{},reconciliationFor(attempt.attempt_id,incidentIds)),/HISTORY_RECOVERY_REQUIRED/);
+      await reconcileRun(cfg,{}, {...reconciliationFor(attempt.attempt_id,incidentIds),historyReadId:preservedHistoryRead});
+      assert.equal((await control()).paused,true); assert.equal((await control()).blocked,false);
+      assert.deepEqual(await incidentEvidence(),before); assert.equal(await destinationCount(),5);
+      const journal=(await local.query('SELECT * FROM olos_http.corporate_selective_commits WHERE attempt_id=$1',[attempt.attempt_id])).rows[0];
+      assert.deepEqual(journal.evidence,attempt.evidence); assert.equal(journal.state,'reconciled');
+    });
+    await t.test('preserved history: revalidation after intent detects changed scheduler before remote COMMIT', async () => {
+      const cfg=await incidentFixture(); await incidentAdopt(cfg); await operatorCommand(cfg,incidentPrepare);
+      await assert.rejects(selectiveRun(cfg,{afterSelectiveIntent:async()=>{
+        // Uncooperative fixture SQL after row locks are released: retained session fences
+        // also prevent a real Admin/capture from entering this interval.
+        const contender=new AdminRepository(localUrl.toString(),cfg.sourceKey);
+        try { await assert.rejects(contender.open(120000,'STOPPED'),/SCHEDULER_ALREADY_ACTIVE/); }
+        finally { await contender.close(); }
+        await local.query("UPDATE olos_http.worker_settings SET enabled=true,desired_state='RUNNING'");
+      }},incidentSelection),/CORPORATE_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(),2); assert.ok(await unresolvedCommit());
+      assert.equal((await control()).paused,true); assert.equal((await control()).blocked,true);
+      assert.equal((await local.query('SELECT state FROM olos_http.reads WHERE id=$1',[preservedHistoryRead])).rows[0].state,'reading');
+    });
+    await t.test('preserved history CLI: explicit scope, zero OLOS HTTP and no scheduler or general delivery', async () => {
+      const cfg=await incidentFixture(), before=await incidentEvidence(); let calls=0;
+      const server=createServer((_,res)=>{calls++;res.writeHead(500);res.end();});
+      await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const env={...base,ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:remoteUrl.toString(),
+        OLOS_CORPORATE_CA_FILE:process.env.OLOS_DIRECT_TEST_CA_FILE!,OLOS_CORPORATE_WRITE_ENABLED:'false',
+        OLOS_BASE_URL:`http://127.0.0.1:${(server.address() as {port:number}).port}`};
+      const suffix=['--preserve-history-read',preservedHistoryRead];
+      const cli=(command:string,args:string[]=[])=>promisify(execFile)(process.execPath,
+        ['dist/main.js',command,...args,...suffix],{env,timeout:15000});
+      try {
+        for (const command of ['capture-history','once','capture-once','start','admin','resolve','corporate-resume','corporate-deliver-once']) {
+          await assert.rejects(cli(command),(e:any)=>e.code===1&&e.stdout.includes('HISTORY_HOMOLOGATION_SCOPE_INVALID'));
+        }
+        const output=await cli('corporate-operator-plan'); const plan=JSON.parse(output.stdout.trim());
+        await cli('corporate-adopt-operator',['--expected-schema-hash',plan.previous_schema_hash,'--schema-hash',plan.schema_hash,
+          '--confirm',`AUTHORIZE_EXPORTDATA_OPERATOR_CONTRACT:${plan.previous_schema_hash}:${plan.schema_hash}`]);
+        await cli('corporate-prepare-operator',['--source-ids',incidentIds.join(','),'--confirm',incidentPrepare.confirmation]);
+        await cli('corporate-deliver-selected',['--source-ids',incidentIds.join(','),'--confirm',incidentSelection.confirmation]);
+        assert.equal(calls,0); assert.deepEqual(await incidentEvidence(),before); assert.equal(await destinationCount(),5);
+        assert.equal((await control()).paused,true);
+      } finally { await new Promise<void>(resolve=>server.close(()=>resolve())); }
+    });
+    await t.test('preserved history: later evidence-backed local recovery deduplicates delivered v2 and frozen v1', async () => {
+      const cfg=await incidentFixture(); await incidentAdopt(cfg); await operatorCommand(cfg,incidentPrepare);
+      await selectiveRun(cfg,{},incidentSelection);
+      const before=await outbox();
+      const s=await open(cfg);
+      // Fixture-only simulation of an original response obtained by external reconciliation.
+      // This is not a recovery procedure or evidence for the real read.
+      await s.stage(preservedHistoryRead,JSON.stringify([
+        ...historyHomologation.map(row=>record(Number(row.source_id),{AgentId:row.agent_id})),
+        record(900001),record(900002,{AgentId:'42'}),
+      ]),1);
+      const result=await s.drain(cache); assert.equal(result.duplicates,4); assert.equal(result.queued,1);
+      await close(s);
+      const after=await outbox(); assert.deepEqual(after.filter(row=>row.source_id!=='900002'),before);
+      assert.equal(after.find(row=>row.source_id==='900002')!.payload.id_operador_olos,'42');
+      assert.equal(await destinationCount(),5); assert.equal((await control()).paused,true);
+    });
+
     await t.test('operator: additive migration/adoption preserve frozen backlog, receipts, binding and pause', async () => {
       const cfg = await operatorFixture(), before = await outbox(), state = await control();
       const records = (await local.query('SELECT * FROM olos_http.records ORDER BY target_id')).rows;

@@ -20,6 +20,10 @@ async function main() {
   const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
     'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-deliver-selected','corporate-reconcile-selected','corporate-operator-plan','corporate-adopt-operator','corporate-prepare-operator','capture-history'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
+  if (args.includes('--preserve-history-read') && !['corporate-operator-plan','corporate-adopt-operator',
+    'corporate-prepare-operator','corporate-deliver-selected','corporate-reconcile-selected'].includes(command)) {
+    throw new WorkerError('HISTORY_HOMOLOGATION_SCOPE_INVALID');
+  }
   // Reject missing consent and malformed IDs before opening any database or HTTP client.
   const selection = command === 'corporate-deliver-selected' ? parseSelection(cfg.corporateDelivery, args) : undefined;
   const reconciliation = command === 'corporate-reconcile-selected' ? parseReconciliation(cfg.corporateDelivery, args) : undefined;

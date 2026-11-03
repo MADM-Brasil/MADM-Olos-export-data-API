@@ -11,6 +11,7 @@ import { reconcileLegacy } from './reconcile.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { validateSelection, type DeliverySelection, type ReconciliationSelection } from './selection.js';
 
+import { assertPreservedHistory } from './preserved-history.js';
 import { assertEvidence, evidence, lockRemoteSelection, lockSelection, prepareCommit, resolveCommit,
   selectEntries, selectedRows, selectiveCommitBlock } from './selective-commit.js';
 
@@ -136,7 +137,7 @@ export class CorporateDelivery {
     const ids = validateSelection(this.cfg, selection);
     if (!this.admitted || this.closing) throw new SyncError('CORPORATE_DELIVERY_NOT_ADMITTED');
     if (this.active) throw new SyncError('CORPORATE_DELIVERY_BUSY');
-    this.active = this.attempt(hooks, ids);
+    this.active = this.attempt(hooks, ids, selection.historyReadId);
     try { await this.active; }
     finally { this.active = undefined; }
   }
@@ -145,12 +146,12 @@ export class CorporateDelivery {
     const ids = validateSelection(this.cfg, selection, 'reconciliation', selection.attemptId);
     if (!this.admitted || this.closing) throw new SyncError('CORPORATE_DELIVERY_NOT_ADMITTED');
     if (this.active) throw new SyncError('CORPORATE_DELIVERY_BUSY');
-    this.active = this.reconcileSelectedAttempt(selection.attemptId, ids, hooks);
+    this.active = this.reconcileSelectedAttempt(selection.attemptId, ids, hooks, selection.historyReadId);
     try { await this.active; }
     finally { this.active = undefined; }
   }
 
-  private async reconcileSelectedAttempt(attemptId: string, ids: string[], hooks: DeliveryHooks): Promise<void> {
+  private async reconcileSelectedAttempt(attemptId: string, ids: string[], hooks: DeliveryHooks, historyReadId?: string): Promise<void> {
     this.fence();
     const local = await this.pool.connect();
     const lostLocalSession = () => this.localFailure();
@@ -158,7 +159,7 @@ export class CorporateDelivery {
     let remote: Client | undefined;
     try {
       await local.query('BEGIN');
-      await lockSelection(local, this.source);
+      await lockSelection(local, this.source, historyReadId, true);
       await assertLocalConsumersCompatible(local, this.source);
       const state = await this.state(local, true, true);
       if (!state.paused) throw new SyncError('SELECTIVE_REQUIRES_PAUSED');
@@ -217,7 +218,7 @@ export class CorporateDelivery {
   }
 
   // Both entry points share the remote transaction, contract and receipt protocol.
-  private async attempt(hooks: DeliveryHooks, ids?: string[]): Promise<void> {
+  private async attempt(hooks: DeliveryHooks, ids?: string[], historyReadId?: string): Promise<void> {
     this.fence();
     const local = await this.pool.connect();
     const lostLocalSession = () => this.localFailure();
@@ -227,7 +228,7 @@ export class CorporateDelivery {
     try {
       await local.query('BEGIN');
       // Source and Corporate Sync session locks remain owned by Store.
-      if (ids) await lockSelection(local, this.source);
+      if (ids) await lockSelection(local, this.source, historyReadId, true);
       else if (!(await local.query('SELECT pg_try_advisory_xact_lock(17320914,4) AS ok')).rows[0].ok) {
         await local.query('ROLLBACK'); return;
       }
@@ -291,6 +292,7 @@ export class CorporateDelivery {
           await local.query('BEGIN');
           const guarded = await this.state(local, true, true);
           if (!guarded.paused || !guarded.blocked || guarded.last_code !== selectiveCommitBlock) throw new SyncError('SELECTIVE_COMMIT_FENCE_LOST');
+          if (historyReadId !== undefined) await assertPreservedHistory(local, this.source, historyReadId, true);
           const refreshed = await selectEntries(local, this.source, this.target, ids);
           assertEvidence(refreshed, evidence(entries));
           selectedRows(refreshed, shape, this.cfg);
