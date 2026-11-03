@@ -38,6 +38,11 @@ Não há defaults ilimitados, daemon, agendamento ou wrapper de retry. A primeir
 
 ## Homologação inicial de 100
 
+Filhos concluídos pelo [protocolo de lacunas](gap-recovery-v1.md) podem admitir
+registros posteriores ao corte mediante proveniência imutável validada e incluída
+no novo manifesto. O corte continua obrigatório para os demais registros;
+planos antigos não recebem essa exceção retroativamente.
+
 Admissão posterior à base `ee52c7e`: a seleção exige AgentId válido e `nome_agente`
 congelado preenchido antes do LIMIT. Planos anteriores incompatíveis exigem
 cancelamento autorizado; intenções incertas preservam sua reconciliação original.

@@ -1,5 +1,9 @@
 # Captura histórica ExportDataV3
 
+Para as lacunas comprovadas da exportação de 28/10, consultar a extensão de
+[recuperação por manifesto](gap-recovery-v1.md) de `capture-reread`/`recover-local`.
+Ela preserva o pai interrompido e não repete `read-data-previous-days`.
+
 `capture-history` faz **um único POST** em `read-data-previous-days`, somente com `TableName=AttemptsRawData`. Não recebe intervalo, não pagina, não agenda execuções e não garante recuperar setembro/outubro de 2026 completos. Não usar chamadas consumidoras para sondar retenção; obter os limites por documentação/evidência do provedor e auditar as datas efetivamente recebidas.
 
 A resposta completa é persistida em `olos_http.reads` antes de ser processada. A política `{ "kind": "history" }` permanece no registro e impede o descarte pelo `INGESTION_BASELINE`, inclusive após reinicialização. No modo corporativo, novas chamadas geram `olos_http.records` e outbox **local pendente**; não são inseridas em `raw.olos_calls` local nem enviadas a MADM nesta operação. Recibos existentes são preservados; `AttemptsRawDataID` repetido com conteúdo divergente bloqueia sem sobrescrever nem inventar outro ID. `CallId` isolado não é chave de deduplicação.

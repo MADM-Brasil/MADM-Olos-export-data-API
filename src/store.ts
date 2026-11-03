@@ -8,6 +8,7 @@ import { assertSchema, quote } from './schema.js';
 import { lockSource } from './source-lock.js';
 import { CorporateDelivery } from './corporate-delivery/delivery.js';
 import { assertNoDirectOwnership } from './corporate-sync/ownership.js';
+import { localGap, checkGapInventory, recordGapMembers, gapReferences, gapInstalled, type GapAuthorization, type GapScope } from './history-gaps.js';
 
 type Read = { id: string; spec: ReadSpec; state: string; response_body: string | null; processed_count: number; request_ms: number | null };
 export class Store {
@@ -224,6 +225,7 @@ export class Store {
       if (historical.state !== 'received') throw new WorkerError('HISTORY_RECOVERY_REQUIRED');
       await this.assertHistoryReady({ id: historical.id, state: 'received' });
     }
+    if(pending.some(r=>Object.hasOwn(r.spec,'gap')))throw new WorkerError('GAP_EXPLICIT_RECOVERY_REQUIRED');
     const total: { received: number; inserted: number; updated: number; duplicates: number; queued?: number } =
       { received: 0, inserted: 0, updated: 0, duplicates: 0, ...(this.delivery ? { queued: 0 } : {}) };
     for (const read of pending) {
@@ -263,7 +265,40 @@ export class Store {
     }
     return total;
   }
-  private async persist(readId: string, input: MappedRecord[], processed: number, received: number) {
+  async recoverGap(a:GapAuthorization,references:string,hooks:{beforeCommit?:()=>Promise<void>;afterCommit?:()=>Promise<void>}={}) {
+    const c=await localGap(this,a),scope:GapScope={plan:c.plan,block:c.block,number:c.number,readId:c.read.id};
+    if(Buffer.byteLength(references)>this.cfg.maxResponseBytes)throw new WorkerError('GAP_REFERENCES_TOO_LARGE');
+    const cache=gapReferences(references,c.plan.manifest.referencesSha256);
+    const data=rows(c.read.response_body).map(row=>mapRecord(row,cache,this.cfg.sourceTimeZone,true));
+    const seen=new Map<string,string>();
+    for(const row of data){
+      if(BigInt(row.source_id)<BigInt(c.block.start)||BigInt(row.source_id)>BigInt(c.block.end))throw new WorkerError('RECOVERY_RESPONSE_OUTSIDE_RANGE');
+      if(seen.has(row.source_id)&&seen.get(row.source_id)!==row.source_hash)throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
+      seen.set(row.source_id,row.source_hash);
+    }
+    for(const row of c.block.existing as {id:string;record:{source_hash:string}}[]){
+      if(seen.has(row.id)&&seen.get(row.id)!==row.record.source_hash)throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
+    }
+    // No arithmetic assumption about what OLOS actually returned. Missing IDs
+    // must be proven in the saved response before any normalization is committed.
+    if(c.block.missing.some(id=>!seen.has(id)))throw new WorkerError('GAP_RESPONSE_INCOMPLETE');
+    if(c.read.processed_count>data.length||c.read.state==='done'&&c.read.processed_count!==data.length)throw new WorkerError('GAP_PROGRESS_CHANGED');
+    await checkGapInventory(this,scope);
+    if(c.read.state==='done')return {read_id:scope.readId,state:'done',received:data.length,recovered:c.block.missing.length};
+    for(let offset=c.read.processed_count;offset<data.length;offset+=this.cfg.batchSize){
+      await this.persist(scope.readId,data.slice(offset,offset+this.cfg.batchSize),Math.min(offset+this.cfg.batchSize,data.length),data.length,{scope,a,hooks});
+    }
+    const db=this.db();await db.query('BEGIN');
+    try{
+      await localGap(this,a);await checkGapInventory(this,scope);
+      if((await db.query("UPDATE olos_http.reads SET state='done',finished_at=COALESCE(finished_at,clock_timestamp()) WHERE id=$1 AND state IN ('received','done') AND processed_count=$2 RETURNING id",
+        [scope.readId,data.length])).rowCount!==1)throw new WorkerError('GAP_PROGRESS_CHANGED');
+      await db.query('COMMIT');
+    }catch(e){await db.query('ROLLBACK').catch(()=>{});throw e;}
+    return {read_id:scope.readId,state:'done',received:data.length,recovered:c.block.missing.length};
+  }
+  private async persist(readId: string, input: MappedRecord[], processed: number, received: number,
+    gap?:{scope:GapScope;a:GapAuthorization;hooks:{beforeCommit?:()=>Promise<void>;afterCommit?:()=>Promise<void>}}) {
     const db = this.db();
     const unique = new Map<string, MappedRecord>();
     for (const row of input) {
@@ -275,9 +310,13 @@ export class Store {
     if (this.delivery) {
       await db.query('BEGIN');
       try {
+        if(gap){await localGap(this,gap.a);await checkGapInventory(this,gap.scope);}
         const result = await this.delivery.enqueue(db, batch);
+        if(gap)await recordGapMembers(this,gap.scope,batch.map(r=>r.source_id));
         await db.query('UPDATE olos_http.reads SET processed_count=$2,received_count=$3 WHERE id=$1', [readId, processed, received]);
+        await gap?.hooks.beforeCommit?.();
         await db.query('COMMIT');
+        await gap?.hooks.afterCommit?.();
         // Queued locally is not a corporate INSERT or acknowledgement.
         return { inserted: 0, updated: 0, queued: result.queued, duplicates: input.length - result.queued };
       } catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
@@ -359,6 +398,8 @@ export class Store {
     return updated;
   }
   async resolve(id: string, evidence: string) {
+    if(await gapInstalled(this.db())&&(await this.db().query(`SELECT 1 FROM olos_http.history_gap_children WHERE read_id=$1
+      UNION ALL SELECT 1 FROM olos_http.history_gap_plans WHERE manifest->>'parent'=$1::text LIMIT 1`,[id])).rowCount)throw new WorkerError('GAP_RESOLVE_FORBIDDEN');
     if (evidence.trim().length < 10) throw new WorkerError('RECONCILIATION_EVIDENCE_REQUIRED');
     const result = await this.db().query("UPDATE olos_http.reads SET state='resolved',resolution=$3,finished_at=clock_timestamp() WHERE id=$1 AND source_key=$2 AND state='reading'", [id,this.cfg.sourceKey,evidence]);
     if (result.rowCount !== 1) throw new WorkerError('UNRESOLVED_READ_NOT_FOUND');

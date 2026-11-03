@@ -50,8 +50,9 @@ export class OlosApi {
     return this.request('/api/export-data/read-data-previous-days', readFields({ kind: 'history' }), token);
   }
   // Capture is evidence gathering: never replay even an explicitly rejected POST.
-  async captureRereadOnce(spec: Extract<ReadSpec, { kind: 'reread' }>) {
+  async captureRereadOnce(spec: Extract<ReadSpec, { kind: 'reread' }>, beforeRead?: () => Promise<void>) {
     const token = await this.auth.getToken();
+    await beforeRead?.();
     return this.request('/api/export-data/re-read-data', readFields(spec), token);
   }
 

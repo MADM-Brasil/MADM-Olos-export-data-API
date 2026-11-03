@@ -3,6 +3,7 @@ import { StaticCache } from './cache.js';
 import { Store } from './store.js';
 import { AuthUnavailable, HttpError, WorkerError, errorCode, log } from './errors.js';
 import { sleep } from './http.js';
+import { beginGap, loadGap, stageGap, type GapAuthorization } from './history-gaps.js';
 
 export type CycleReport = { read_id: string; received: number; inserted: number; updated: number; duplicates: number; queued?: number; request_ms: number; persistence_ms: number; duration_ms: number };
 
@@ -28,7 +29,8 @@ export class Worker {
   private active = false;
   private initialized = false;
   constructor(readonly store: Store, readonly api: OlosApi, readonly cache: StaticCache) {}
-  async captureReread(parentId: string, date: string, start: string, end: string) {
+  async captureReread(parentId: string, date: string, start: string, end: string, gap?:GapAuthorization,
+    hooks: {afterIntent?:()=>Promise<void>;afterResponse?:()=>Promise<void>;afterStage?:()=>Promise<void>} = {}) {
     if (this.active) throw new WorkerError('POLL_ALREADY_ACTIVE');
 
     const spec = { kind: 'reread' as const, date, start, end };
@@ -41,17 +43,32 @@ export class Worker {
     this.active = true;
     try {
       await this.store.ping();
-      await this.store.validateRecoveryRead(parentId, spec);
+      if(gap){
+        const c=await loadGap(this.store,gap,'CAPTURE');
+        if(parentId!==c.plan.manifest.parent||date!==c.block.date||start!==c.block.start||end!==c.block.end)throw new WorkerError('GAP_SCOPE_CHANGED');
+        if(c.read){
+          if(['received','done'].includes(c.read.state))return c.read.id as string;
+          throw new WorkerError('GAP_REMOTE_RESULT_UNKNOWN');
+        }
+      }else await this.store.validateRecoveryRead(parentId, spec);
       await this.api.auth.getToken();
       await this.api.validateCaptureCatalog();
 
-      const id = await this.store.beginRecoveryRead(parentId, spec);
+      const id = gap ? await beginGap(this.store,gap) : await this.store.beginRecoveryRead(parentId, spec);
       const started = performance.now();
 
       try {
-        const body = await this.api.captureRereadOnce(spec);
+        await hooks.afterIntent?.();
+        const body = await this.api.captureRereadOnce(spec,gap ? async()=>{
+          const c=await loadGap(this.store,gap,'CAPTURE');
+          if(c.read?.id!==id||c.read.state!=='reading')throw new WorkerError('GAP_CHILD_CHANGED');
+          await this.store.ping();
+        }:undefined);
+        await hooks.afterResponse?.();
         const requestMs = Math.round(performance.now() - started);
-        await this.store.stage(id, body, requestMs);
+        if(gap)await stageGap(this.store,gap,id,body,requestMs);
+        else await this.store.stage(id, body, requestMs);
+        await hooks.afterStage?.();
 
         log('capture_reread_received', {
           read_id: id,

@@ -1,4 +1,5 @@
 import { identityAdopted, identityDeliveryGate } from '../identity/gates.js';
+import { gapInstalled, recoveredGapProof } from '../history-gaps.js';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -18,7 +19,8 @@ import { lockRemoteSelection, selectedRows, type SelectedEntry } from './selecti
 import { drainConsent, drainHash, validateDrainLimits, validateDrainRequest, type DrainLimits, type DrainRequest } from './drain-request.js';
 
 export const drainBlock = 'DRAIN_RECONCILIATION_REQUIRED';
-interface Entry extends SelectedEntry { eligible: boolean; record_created: string; outbox_created: string }
+interface Entry extends SelectedEntry { eligible: boolean; record_created: string; outbox_created: string;
+  recovery?:{read_id:string;plan_hash:string;body_hash:string} }
 interface Run {
   run_id: string; source_key: string; target_table: string; binding: string; schema_hash: string;
   history_snapshot: Record<string, unknown>; limits: DrainLimits; plan_hash: string; selected_count: number;
@@ -40,7 +42,7 @@ export interface DrainHooks {
 function frozen(entries: Entry[]) {
   return entries.map(e => ({source_id:e.source_id,target_id:e.target_id,source_hash:e.source_hash,
     payload_hash:e.payload_hash,origin:e.origin,agent_id:e.agent_id,
-    record_created:e.record_created,outbox_created:e.outbox_created}));
+    record_created:e.record_created,outbox_created:e.outbox_created,...(e.recovery?{recovery:e.recovery}:{})}));
 }
 function manifest(run: Run, batches: Batch[]) {
   return {runId:run.run_id,source:run.source_key,target:run.target_table,binding:run.binding,schema:run.schema_hash,
@@ -104,7 +106,7 @@ async function guard(local: PoolClient, cfg: Config, target: string, run?: Run, 
   return {history:h as Record<string,unknown>,control};
 }
 
-async function entries(local: PoolClient, source: string, target: string, ids: string[]): Promise<Entry[]> {
+async function entries(local: PoolClient, source: string, target: string, ids: string[], cfg:Config): Promise<Entry[]> {
   const result=(await local.query<Entry>(`SELECT o.source_id,o.target_id::text,o.payload,o.payload_hash,o.state,
     o.remote_raw_id::text,o.source_hash,o.origin,r.source_hash AS record_hash,r.target_id::text AS record_target_id,
     r.target_table,r.agent_id,r.created_at::text AS record_created,o.created_at::text AS outbox_created,
@@ -113,8 +115,10 @@ async function entries(local: PoolClient, source: string, target: string, ids: s
     JOIN olos_http.reads h ON h.id=$3
     WHERE o.source_key=$1 AND o.source_id=ANY($2::text[]) ORDER BY o.target_id FOR UPDATE OF o,r NOWAIT`,
   [source,ids,preservedHistoryRead])).rows;
+  const recovered=await recoveredGapProof(local,cfg,result.filter(e=>!e.eligible));
+  for(const e of result){const proof=recovered.get(e.source_id);if(proof)e.recovery=proof;}
   if (result.length !== ids.length || result.some(e => !/^[1-9][0-9]{0,18}$/.test(e.source_id) || BigInt(e.source_id)>9223372036854775807n ||
-    !e.eligible || !['capture','legacy_backlog'].includes(e.origin) ||
+    (!e.eligible && !e.recovery) || !['capture','legacy_backlog'].includes(e.origin) ||
     !['pending','confirmed'].includes(e.state) || e.source_hash !== e.record_hash || e.target_id !== e.record_target_id ||
     e.target_table !== target || Object.keys(e.payload).length !== columns.length || columns.some(c => !Object.hasOwn(e.payload,c)))) {
     throw new SyncError('DRAIN_RECEIPT_INVALID');
@@ -123,7 +127,7 @@ async function entries(local: PoolClient, source: string, target: string, ids: s
   return result;
 }
 async function batchEntries(local: PoolClient, run: Run, batch: Batch, shape: Shape, cfg: Config) {
-  const found=await entries(local,run.source_key,run.target_table,batch.evidence.map(e => e.source_id));
+  const found=await entries(local,run.source_key,run.target_table,batch.evidence.map(e => e.source_id),cfg);
   if (drainHash(frozen(found)) !== drainHash(batch.evidence)) throw new SyncError('DRAIN_EVIDENCE_CHANGED');
   selectedRows(found,shape,cfg.corporateDelivery!);
   // Used only for admission to a new write, never for uncertain-COMMIT reconciliation.
@@ -170,16 +174,18 @@ async function plan(store: Store, cfg: Config, limits: DrainLimits) {
   const first=await assertStage(local,cfg,limits,control.schema_hash);
   // LIMIT is only used to make a durable manifest; execution never selects new IDs.
   const originalOnly=await identityAdopted(local);
+  const recoveredCandidate=await gapInstalled(local) ? `EXISTS(SELECT 1 FROM olos_http.history_gap_members gm
+    JOIN olos_http.reads gr ON gr.id=gm.read_id WHERE gm.source_key=o.source_key AND gm.source_id=o.source_id AND gr.state='done')` : 'false';
   const ids=(await local.query(`SELECT o.source_id FROM olos_http.corporate_outbox o
     JOIN olos_http.records r USING(source_key,source_id) JOIN olos_http.reads h ON h.id=$2
-    WHERE o.source_key=$1 AND o.state='pending' AND o.created_at<h.started_at
+    WHERE o.source_key=$1 AND o.state='pending' AND (o.created_at<h.started_at OR ${recoveredCandidate})
     AND (NOT $4::boolean OR o.target_id::text=o.source_id)
     AND r.agent_id ~ $5 AND jsonb_typeof(o.payload->'nome_agente')='string'
     AND btrim(o.payload->>'nome_agente',$6)<>''
     ORDER BY o.target_id LIMIT $3 FOR UPDATE OF o,r NOWAIT`,
   [cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,originalOnly,identifiedAgentPattern,operatorNameWhitespace])).rows.map(r => r.source_id as string);
   if (!ids.length || first && ids.length !== 100) throw new SyncError('DRAIN_INSUFFICIENT_BACKLOG');
-  const selected=await entries(local,cfg.sourceKey,store.target,ids);
+  const selected=await entries(local,cfg.sourceKey,store.target,ids,cfg);
   if (selected.some(e => !hasIdentifiedOperator(e))) throw new SyncError('DRAIN_OPERATOR_REQUIRED');
   const remote=await connect(remoteConfig(cfg,limits),'destination');
   try {
@@ -376,7 +382,7 @@ async function reconcile(store: Store, cfg: Config, request: Extract<DrainReques
     let remote: Client | undefined;
     try {
       await local.query('BEGIN'); await guard(local,cfg,store.target,run,true);
-      const selected=await entries(local,run.source_key,run.target_table,batch.evidence.map(e => e.source_id));
+      const selected=await entries(local,run.source_key,run.target_table,batch.evidence.map(e => e.source_id),cfg);
       if (drainHash(frozen(selected)) !== drainHash(batch.evidence)) throw new SyncError('DRAIN_EVIDENCE_CHANGED');
       remote=await connect(remoteConfig(cfg,run.limits),'destination');
       await remote.query('BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY');

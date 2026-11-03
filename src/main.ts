@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import pg from 'pg';
 import { config } from './config.js';
 import { HttpTransport, sleep } from './http.js';
@@ -15,6 +15,8 @@ import { corporateControl } from './corporate-delivery/commands.js';
 import { parseSelection, parseReconciliation } from './corporate-delivery/selection.js';
 import { parseDrainRequest } from './corporate-delivery/drain-request.js';
 import { drainCommand } from './corporate-delivery/drain.js';
+import { prepareGaps, loadGap } from './history-gaps.js';
+import { parseGapRequest } from './history-gap-request.js';
 
 async function main() {
   const cfg = config();
@@ -23,6 +25,7 @@ async function main() {
     'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-deliver-selected','corporate-reconcile-selected','corporate-operator-plan','corporate-adopt-operator','corporate-prepare-operator','capture-history',
     'corporate-drain-plan','corporate-drain-backlog','corporate-drain-status','corporate-drain-reconcile','corporate-drain-cancel'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
+  const gap=parseGapRequest(command,args);
   if (args.includes('--preserve-history-read') && !['corporate-operator-plan','corporate-adopt-operator',
     'corporate-prepare-operator','corporate-deliver-selected','corporate-reconcile-selected','corporate-drain-plan','corporate-drain-backlog'].includes(command)) {
     throw new WorkerError('HISTORY_HOMOLOGATION_SCOPE_INVALID');
@@ -72,6 +75,25 @@ async function main() {
   let historicalRecovery = false;
   try {
     await store.open();
+    if(gap?.kind==='prepare'){
+      const plan=await prepareGaps(store,JSON.parse(await readFile(gap.input,'utf8')));
+      await writeFile(gap.output,JSON.stringify(plan,null,2),{mode:0o600,flag:'wx'});
+      log('history_gap_planned',{plan_id:plan.id,plan_hash:plan.hash,blocks:plan.manifest.blocks.length,
+        missing:plan.manifest.blocks.reduce((n,b)=>n+b.missing.length,0)});return;
+    }
+    if(gap?.kind==='status'){
+      const result=(await store.client!.query(`SELECT p.id,p.hash,c.block,r.id AS read_id,r.state,r.processed_count,r.received_count,r.error_code
+        FROM olos_http.history_gap_plans p LEFT JOIN olos_http.history_gap_children c ON c.plan_id=p.id
+        LEFT JOIN olos_http.reads r ON r.id=c.read_id WHERE p.id=$1 AND p.manifest->>'source'=$2 ORDER BY c.block`,[gap.id,cfg.sourceKey])).rows;
+      if(!result.length)throw new WorkerError('GAP_PLAN_MISSING');
+      for(const row of result)log('history_gap_status',row);return;
+    }
+    if(gap?.kind==='persist'){
+      // Authorized child only; references are a private, hash-bound snapshot.
+      // No OLOS client, authentication, cache refresh or delivery kick here.
+      log('history_gap_local_completed',await store.recoverGap(gap.authorization,await readFile(gap.references,'utf8')));return;
+    }
+    const gapContext=gap?.kind==='capture'?await loadGap(store,gap.authorization,'CAPTURE'):undefined;
     if (command.startsWith('corporate-')) {
       if (!store.delivery || !store.client) throw new WorkerError('CORPORATE_MODE_REQUIRED');
       if (operator) log('corporate_operator_' + operator.kind, await operatorAdmin(store.client, cfg.corporateDelivery!, cfg.sourceKey, store.target, operator));
@@ -134,6 +156,11 @@ async function main() {
       await cache.refresh(); log('reference_names_reconciled', { updated: await store.reconcileNames(cache.value) }); return;
     }
     if (command === 'capture-reread') {
+      if(gap?.kind==='capture'&&gapContext){
+        const b=gapContext.block;
+        await worker.captureReread(gapContext.plan.manifest.parent,b.date,b.start,b.end,gap.authorization);
+        return;
+      }
       const [parentId, date, start, end] = args;
       if (!parentId || !date || !start || !end || args.length !== 4) {
         throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');

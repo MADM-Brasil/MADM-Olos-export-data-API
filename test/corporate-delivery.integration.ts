@@ -1,11 +1,15 @@
 import { identityCommand } from '../src/identity/migrate.js';
+import { prepareGaps, gapConsent, bodyHash, type GapPlan } from '../src/history-gaps.js';
+import { HttpTransport } from '../src/http.js';
 import { dependencies, referenceRows } from '../src/identity/dependencies.js';
 import { randomUUID } from 'node:crypto';
 import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace } from '../src/corporate-delivery/identified-operator.js';
 import { consent as identityConsent, type Kind as IdentityKind } from '../src/identity/request.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import pg from 'pg';
 import { config, type Config } from '../src/config.js';
 import { Store } from '../src/store.js';
@@ -1688,6 +1692,219 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       await assert.rejects(backlogPlan(cfg),/DRAIN_INSUFFICIENT_BACKLOG/);
       assert.deepEqual(await outbox(),receipts);assert.deepEqual(await remoteRows(),destination);
       assert.deepEqual(await backlogEvidence(),before);assert.equal((await control()).paused,true);
+    });
+    const gapRefs=JSON.stringify({users:[['7','Agent']],campaigns:[['8','Campaign']],dispositions:[['9','Disposition']]});
+    const gapInput=(start=46671511,end=start+99)=>({evidenceSha256:'a'.repeat(64),referencesSha256:bodyHash(gapRefs),
+      ranges:[{date:'2026-10-28',start:String(start),end:String(end)}]});
+    const gapAuth=(p:GapPlan,action:'CAPTURE'|'PERSIST',block=1)=>{
+      const a={planId:p.id,hash:p.hash,block};return {...a,confirmation:gapConsent(action,a)};
+    };
+    async function gapFixture(existing:Record<string,unknown>[]=[]){
+      const cfg={...await historyConfig(),batchSize:10};
+      for(const file of ['003_selective_commit.sql','005_backlog_drain.sql','007_history_gaps.sql'])await local.query(await readFile(new URL(`../migrations/${file}`,import.meta.url),'utf8'));
+      const s=await open({...cfg,ingestionBaseline:'2026-09-01T00:00:00Z'});if(existing.length)await stage(s,existing);await close(s);
+      await local.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,error_code)
+        VALUES($1,$2,$3,'{"kind":"history"}','RESPONSE_TOO_LARGE')`,[preservedHistoryRead,cfg.sourceKey,'"raw"."olos_calls"']);
+      return cfg;
+    }
+    const gapParent=async()=>(await local.query('SELECT to_jsonb(r) AS row FROM olos_http.reads r WHERE id=$1',[preservedHistoryRead])).rows[0];
+    function gapWorker(s:Store,response:()=>Promise<string>){
+      const auth=new OlosAuthManager(async()=>JSON.stringify({access_token:'synthetic',expires_in:3600,token_type:'bearer'}),
+        {username:'synthetic',password:'synthetic',clientId:'synthetic',clientSecret:'synthetic'});
+      const api=new OlosApi(async path=>{
+        if(path.endsWith('/available-tables'))return JSON.stringify(historyCatalog);
+        if(path.endsWith('/re-read-data'))return response();
+        throw new Error(`Forbidden synthetic endpoint ${path}`);
+      },auth,async()=>{});
+      return new Worker(s,api,new StaticCache(api,1000));
+    }
+    const gapCapture=(s:Store,p:GapPlan,response:()=>Promise<string>,hooks:Parameters<Worker['captureReread']>[5]={})=>{
+      const b=p.manifest.blocks[0]!;
+      return gapWorker(s,response).captureReread(p.manifest.parent,b.date,b.start,b.end,gapAuth(p,'CAPTURE'),hooks);
+    };
+    await t.test('gaps: exact interior holes, unchanged confirmed evidence, raw response before persistence, no baseline discard and idempotent recovery',async()=>{
+      const start=46671511,records=Array.from({length:5},(_,i)=>record(start+i,{CallId:String(start+i),StartDate:'2026-09-01T10:00:00-03:00'}));
+      const cfg=await gapFixture([records[0]!,records[2]!,records[4]!]);
+      const delivered=(await outbox()).find(e=>e.source_id===String(start))!;
+      const rr=await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_,i)=>`$${i+1}`).join(',')}) RETURNING raw_olos_call_id`,columns.map(c=>delivered.payload[c]));
+      await local.query("UPDATE olos_http.corporate_outbox SET state='confirmed',remote_raw_id=$2,confirmed_at=now() WHERE source_id=$1",[String(start),rr.rows[0].raw_olos_call_id]);
+      const before=await outbox(),parent=await gapParent(),destination=await remoteRows();
+      let calls=0;const s=await open(cfg),p=await prepareGaps(s,gapInput(start,start+4));
+      assert.deepEqual(p.manifest.blocks[0]!.missing,[String(start+1),String(start+3)]);
+      const raw=' \n'+JSON.stringify([...records,records[1]])+'\n';
+      const id=await gapCapture(s,p,async()=>{
+        calls++;assert.equal((await local.query("SELECT count(*)::int AS n FROM olos_http.history_gap_children c JOIN olos_http.reads r ON r.id=c.read_id WHERE state='reading'")).rows[0].n,1);
+        assert.deepEqual(await outbox(),before);return raw;
+      });
+      assert.equal((await local.query('SELECT response_body FROM olos_http.reads WHERE id=$1',[id])).rows[0].response_body,raw);
+      assert.deepEqual(await outbox(),before);assert.deepEqual(await gapParent(),parent);
+      await assert.rejects(s.drain(cache),/HISTORY_RECOVERY_REQUIRED/);
+      await s.recoverGap(gapAuth(p,'PERSIST'),gapRefs);
+      const after=await outbox();assert.equal(after.length,before.length+2);
+      for(const old of before)assert.deepEqual(after.find(e=>e.source_id===old.source_id),old);
+      assert.equal(await count(local,'olos_http.history_gap_members'),2);
+      await s.recoverGap(gapAuth(p,'PERSIST'),gapRefs);
+      await gapCapture(s,p,async()=>{calls++;throw new Error('must not retry');});
+      assert.equal(calls,1);assert.deepEqual(await outbox(),after);assert.deepEqual(await gapParent(),parent);assert.deepEqual(await remoteRows(),destination);
+      await assert.rejects(local.query('UPDATE olos_http.history_gap_plans SET hash=hash'),/GAP_JOURNAL_IMMUTABLE/);
+      await assert.rejects(local.query('DELETE FROM olos_http.history_gap_members'),/GAP_JOURNAL_IMMUTABLE/);
+      await assert.rejects(s.resolve(p.manifest.parent,'never resolve preserved parent'),/GAP_RESOLVE_FORBIDDEN/);
+      await assert.rejects(s.resolve(id!,'never resolve uncertain child'),/GAP_RESOLVE_FORBIDDEN/);
+      await close(s);
+    });
+    await t.test('gap CLI: private manifest, one bounded reread, offline references, local restart, no forbidden endpoint or corporate write',async()=>{
+      await gapFixture();let calls=0,total=0,fields='';
+      const dir=await mkdtemp(join(tmpdir(),'olos-gap-test-')),input=join(dir,'input.json'),output=join(dir,'plan.json'),refs=join(dir,'references.json');
+      await writeFile(input,JSON.stringify(gapInput(46671511,46671512)));await writeFile(refs,gapRefs);
+      const server=createServer((req,res)=>{
+        total++;const chunks:Buffer[]=[];req.on('data',c=>chunks.push(c));req.on('end',()=>{
+          if(req.url==='/api/auth')res.end(JSON.stringify({access_token:'synthetic',expires_in:3600,token_type:'bearer'}));
+          else if(req.url?.endsWith('/available-tables'))res.end(JSON.stringify(historyCatalog));
+          else if(req.url?.endsWith('/re-read-data')){calls++;fields=Buffer.concat(chunks).toString();res.end(JSON.stringify([record(46671511),record(46671512)]));}
+          else{res.statusCode=500;res.end('forbidden');}
+        });
+      });await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const env={...base,ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:remoteUrl.toString(),
+        OLOS_CORPORATE_CA_FILE:process.env.OLOS_DIRECT_TEST_CA_FILE!,OLOS_CORPORATE_WRITE_ENABLED:'false',SOURCE_TIME_ZONE:'America/Sao_Paulo',
+        INGESTION_BASELINE:'2026-10-28T14:42:14Z',OLOS_BASE_URL:`http://127.0.0.1:${(server.address() as {port:number}).port}`,
+        OLOS_USERNAME:'synthetic',OLOS_PASSWORD:'synthetic',OLOS_CLIENT_ID:'synthetic',OLOS_CLIENT_SECRET:'synthetic'};
+      const cli=(cmd:string,args:string[])=>promisify(execFile)(process.execPath,['dist/main.js',cmd,...args],{env,timeout:15000});
+      const parent=await gapParent(),destination=await remoteRows();
+      try{
+        await cli('capture-reread',['--prepare',input,'--output',output]);assert.equal(total,0);
+        assert.equal((await stat(output)).mode&0o777,0o600);const p=JSON.parse(await readFile(output,'utf8')) as GapPlan;
+        const args=['--plan-id',p.id,'--plan-hash',p.hash,'--block','1'];
+        await assert.rejects(cli('capture-reread',[...args,'--confirm','wrong']));assert.equal(total,0);
+        await cli('capture-reread',[...args,'--confirm',gapAuth(p,'CAPTURE').confirmation]);
+        assert.equal(calls,1);assert.match(fields,/DateExport/);assert.match(fields,/2026-10-28/);assert.match(fields,/PKIDStart/);assert.match(fields,/46671512/);
+        const count=total;
+        await cli('recover-local',[...args,'--confirm',gapAuth(p,'PERSIST').confirmation,'--references',refs]);
+        await cli('recover-local',[...args,'--confirm',gapAuth(p,'PERSIST').confirmation,'--references',refs]);
+        const status=await cli('capture-reread',['--status',p.id]);assert.match(status.stdout,/"state":"done"/);
+        assert.doesNotMatch(status.stdout,/nome_agente|telefone|payload/);assert.equal(total,count);
+        assert.equal(await countMembers(),2);assert.deepEqual(await gapParent(),parent);assert.deepEqual(await remoteRows(),destination);
+      }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));await rm(dir,{recursive:true,force:true});}
+      async function countMembers(){return count(local,'olos_http.history_gap_members');}
+    });
+    await t.test('gaps: prepared blocks respect 10000, authorization and scope, and no POST is admitted with changed inventory or controls',async()=>{
+      const cfg=await gapFixture(),s=await open(cfg),p=await prepareGaps(s,gapInput(46671511,46681511));let calls=0;
+      assert.deepEqual(p.manifest.blocks.map(b=>b.missing.length),[10000,1]);
+      const w=gapWorker(s,async()=>{calls++;return '[]';});
+      await assert.rejects(w.captureReread(p.manifest.parent,'2026-10-28','46671511','46681511',gapAuth(p,'CAPTURE')),/RECOVERY_RANGE_TOO_LARGE/);
+      await assert.rejects(w.captureReread(p.manifest.parent,'2026-10-28','46671511','46681510',{...gapAuth(p,'CAPTURE'),confirmation:'wrong'}),/GAP_NOT_AUTHORIZED/);
+      const zone=cfg.sourceTimeZone,account=cfg.username;
+      cfg.sourceTimeZone='UTC';await assert.rejects(gapCapture(s,p,async()=>{calls++;return '[]';}),/GAP_BINDING_CHANGED/);cfg.sourceTimeZone=zone!;
+      cfg.username='different-account';await assert.rejects(gapCapture(s,p,async()=>{calls++;return '[]';}),/GAP_BINDING_CHANGED/);cfg.username=account;
+      await local.query("UPDATE olos_http.worker_settings SET enabled=true,desired_state='RUNNING'");
+      await assert.rejects(gapCapture(s,p,async()=>{calls++;return '[]';}),/HISTORY_SCHEDULER_NOT_STOPPED/);
+      await local.query("UPDATE olos_http.worker_settings SET enabled=false,desired_state='STOPPED'");
+      await local.query('UPDATE olos_http.corporate_control SET paused=false');
+      await assert.rejects(gapCapture(s,p,async()=>{calls++;return '[]';}),/GAP_CONTROL_INVALID/);
+      assert.equal(calls,0);assert.equal(await count(local,'olos_http.history_gap_children'),0);await close(s);
+      const fresh=await gapFixture(),a=await open(fresh),plan=await prepareGaps(a,gapInput(46671511,46671512));
+      // An external insertion after planning cannot silently shrink the authorized holes.
+      await seedLegacyIds(a.client!,fresh,[record(46671511)],cache);
+      await assert.rejects(gapCapture(a,plan,async()=>{calls++;return '[]';}),/GAP_EVIDENCE_CHANGED/);
+      assert.equal(calls,0);assert.equal(await count(local,'olos_http.history_gap_children'),0);await close(a);
+    });
+    await t.test('gaps: before/after HTTP failures never retry, interrupted intent survives restart and prevents other ranges',async()=>{
+      for(const point of ['before','network','after','rejected'] as const){
+        const cfg=await gapFixture(),s=await open(cfg),p=await prepareGaps(s,gapInput()),parent=await gapParent(),box=await outbox();let calls=0;
+        const stop=async()=>{throw new Error('synthetic loss');};
+        await assert.rejects(gapCapture(s,p,async()=>{
+          calls++;if(point==='network')throw new WorkerError('NETWORK_OR_RESPONSE_FAILURE',true);
+          if(point==='rejected')throw new HttpError(429);
+          return JSON.stringify([record(46671511)]);
+        },point==='before'?{afterIntent:stop}:point==='after'?{afterResponse:stop}:{}),/RECOVERY_REQUIRED/);
+        assert.equal(calls,point==='before'?0:1);await close(s);
+        const resumed=await open(cfg);
+        await assert.rejects(gapCapture(resumed,p,async()=>{calls++;return '[]';}),/GAP_REMOTE_RESULT_UNKNOWN/);
+        await assert.rejects(resumed.recoverGap(gapAuth(p,'PERSIST'),gapRefs),/GAP_REMOTE_RESULT_UNKNOWN/);
+        await assert.rejects(prepareGaps(resumed,gapInput(46671611,46671612)),/GAP_RECOVERY_REQUIRED/);
+        assert.deepEqual(await gapParent(),parent);assert.deepEqual(await outbox(),box);await close(resumed);
+      }
+    });
+    await t.test('gaps: durable response with lost ACK and local commits before/after failure recover without another HTTP call',async()=>{
+      for(const point of ['stage','beforeLocal','afterLocal'] as const){
+        const cfg=await gapFixture(),s=await open(cfg),p=await prepareGaps(s,gapInput(46671511,46671535)),parent=await gapParent();let calls=0;
+        const response=async()=>{calls++;return JSON.stringify(Array.from({length:25},(_,i)=>record(46671511+i)));};
+        const stop=async()=>{throw new Error('synthetic lost ACK');};
+        if(point==='stage')await assert.rejects(gapCapture(s,p,response,{afterStage:stop}),/RECOVERY_REQUIRED/);
+        else{
+          await gapCapture(s,p,response);
+          await assert.rejects(s.recoverGap(gapAuth(p,'PERSIST'),gapRefs,point==='beforeLocal'?{beforeCommit:stop}:{afterCommit:stop}));
+          assert.equal(await count(local,'olos_http.history_gap_members'),point==='beforeLocal'?0:10);
+        }
+        await close(s);const resumed=await open(cfg);
+        await resumed.recoverGap(gapAuth(p,'PERSIST'),gapRefs);
+        await gapCapture(resumed,p,response);assert.equal(calls,1);
+        assert.equal(await count(local,'olos_http.history_gap_members'),25);assert.deepEqual(await gapParent(),parent);await close(resumed);
+      }
+    });
+    await t.test('gaps: control drift before POST blocks consumption; drift after HTTP retains raw evidence but blocks persistence',async()=>{
+      for(const after of [false,true]){
+        const cfg=await gapFixture(),s=await open(cfg),p=await prepareGaps(s,gapInput(46671511,46671512)),before=await outbox(),parent=await gapParent();let calls=0;
+        const stopControl=async()=>{await local.query('UPDATE olos_http.corporate_control SET paused=false');};
+        const body=JSON.stringify([record(46671511),record(46671512)]);
+        const response=async()=>{calls++;if(after)await stopControl();return body;};
+        if(after){
+          const id=await gapCapture(s,p,response);
+          assert.deepEqual((await local.query('SELECT state,response_body FROM olos_http.reads WHERE id=$1',[id])).rows[0],{state:'received',response_body:body});
+          await assert.rejects(s.recoverGap(gapAuth(p,'PERSIST'),gapRefs),/GAP_CONTROL_INVALID/);
+        }else await assert.rejects(gapCapture(s,p,response,{afterIntent:stopControl}),/RECOVERY_REQUIRED/);
+        assert.equal(calls,after?1:0);assert.deepEqual(await outbox(),before);assert.deepEqual(await gapParent(),parent);await close(s);
+      }
+    });
+    await t.test('gaps: missing IDs, divergent duplicates, outside-range response and changed references fail before persistence',async()=>{
+      for(const point of ['missing','duplicate','outside','references'] as const){
+        const cfg=await gapFixture(),s=await open(cfg),p=await prepareGaps(s,gapInput(46671511,46671512)),box=await outbox();
+        const data=point==='missing'?[record(46671511)]:[record(46671511),record(46671512),
+          ...(point==='duplicate'?[record(46671511,{CallId:'changed'})]:point==='outside'?[record(46671513)]:[])];
+        await gapCapture(s,p,async()=>JSON.stringify(data));
+        await assert.rejects(s.recoverGap(gapAuth(p,'PERSIST'),point==='references'?'{}':gapRefs),/GAP_RESPONSE_INCOMPLETE|SOURCE_ID_CONTENT_CONFLICT|RECOVERY_RESPONSE_OUTSIDE_RANGE|GAP_REFERENCES_CHANGED/);
+        assert.deepEqual(await outbox(),box);assert.equal(await count(local,'olos_http.history_gap_members'),0);await close(s);
+      }
+    });
+    await t.test('gaps: response size limit over simulated HTTP leaves reading and never retries',async()=>{
+      const cfg={...await gapFixture(),maxResponseBytes:1024},s=await open(cfg),p=await prepareGaps(s,gapInput(46671511,46671511));let calls=0;
+      const server=createServer((req,res)=>{
+        if(req.url?.endsWith('/available-tables'))res.end(JSON.stringify(historyCatalog));
+        else{calls++;res.setHeader('Content-Length','2048');res.end('x'.repeat(2048));}
+      });await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const http=new HttpTransport(`http://127.0.0.1:${(server.address() as {port:number}).port}`,2000,1024,new AbortController().signal,true);
+      try{
+        const auth=new OlosAuthManager(async()=>JSON.stringify({access_token:'synthetic',expires_in:3600,token_type:'bearer'}),{username:'x',password:'x',clientId:'x',clientSecret:'x'});
+        const api=new OlosApi(http.request,auth),worker=new Worker(s,api,new StaticCache(api,1000)),b=p.manifest.blocks[0]!;
+        await assert.rejects(worker.captureReread(p.manifest.parent,b.date,b.start,b.end,gapAuth(p,'CAPTURE')),/RECOVERY_REQUIRED/);
+        assert.equal(calls,1);assert.equal(await count(local,'olos_http.history_gap_responses'),0);
+        const child=(await local.query('SELECT r.state,r.error_code,r.response_body FROM olos_http.history_gap_children c JOIN olos_http.reads r ON r.id=c.read_id')).rows[0];
+        assert.deepEqual(child,{state:'reading',error_code:'RESPONSE_TOO_LARGE',response_body:null});
+      }finally{await http.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await close(s);}
+    });
+    await t.test('gaps: new provenance alone admits recovered operators to existing 100/250 drains, preserving history and excluded attempts',async()=>{
+      const cfg=await gapFixture(),s=await open(cfg),p=await prepareGaps(s,gapInput(46671511,46671862)),parent=await gapParent();
+      const raw=JSON.stringify(Array.from({length:352},(_,i)=>record(46671511+i,{AgentId:i===0?'0':i===200?'8':'7',
+        StartDate:'2026-09-15T10:00:00-03:00',CallId:String(46671511+i)})));
+      const child=await gapCapture(s,p,async()=>raw);await s.recoverGap(gapAuth(p,'PERSIST'),gapRefs);
+      // An unrelated post-cutoff record has no recovery membership and stays excluded.
+      await seedLegacyIds(s.client!,cfg,[record(46671999)],cache);await close(s);
+      const box=await outbox();const excluded=box.filter(e=>['46671511','46671711','46671999'].includes(e.source_id));
+      const metadata=await corporateMetadata();
+      for(const batchSize of [100,250]){
+        const run=await backlogPlan(cfg,{...drainLimits,batchSize});
+        assert.ok((await backlogJournal(run.runId))[0].evidence.every((e:any)=>e.recovery.plan_hash===p.hash));
+        if(batchSize===100){
+          // Synthetic corruption: admission must revalidate the original response.
+          await local.query("UPDATE olos_http.reads SET response_body='[]' WHERE id=$1",[child]);
+          await assert.rejects(drainCommand(cfg,run),/GAP_PROVENANCE_INVALID/);assert.equal(await destinationCount(),2);
+          await local.query('UPDATE olos_http.reads SET response_body=$2 WHERE id=$1',[child,raw]);
+        }
+        await drainCommand(cfg,run);await drainCommand(cfg,run);
+      }
+      assert.equal(await destinationCount(),352);assert.deepEqual(await gapParent(),parent);
+      assert.deepEqual((await outbox()).filter(e=>['46671511','46671711','46671999'].includes(e.source_id)),excluded);
+      assert.deepEqual(await corporateMetadata(),metadata);assert.equal((await control()).paused,true);
+      assert.ok((await outbox()).filter(e=>e.source_id!=='46671999').every(e=>String(e.target_id)===e.source_id||e.origin==='legacy_receipt'));
     });
     await t.test('identity + drain: progressive 3/100/250/500/1000 migration only admits original IDs; remaining legacy backlog cannot be sent',async()=>{
       const cfg={...await historyConfig(),ingestionBaseline:'2026-09-01T00:00:00Z'};
