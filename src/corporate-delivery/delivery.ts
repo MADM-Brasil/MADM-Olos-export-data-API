@@ -168,7 +168,7 @@ export class CorporateDelivery {
         WHERE attempt_id=$1 AND state='unresolved' FOR UPDATE NOWAIT`, [attemptId])).rows[0];
       if (!attempt || attempt.source_key !== this.source || attempt.target_table !== this.target ||
         attempt.binding !== this.cfg.binding || attempt.schema_hash !== state.schema_hash) throw new SyncError('SELECTIVE_ATTEMPT_MISMATCH');
-      const entries = await selectEntries(local, this.source, this.target, ids);
+      const entries = await selectEntries(local, this.source, this.target, ids, historyReadId, contract);
       assertEvidence(entries, attempt.evidence);
       this.fence();
       remote = await connect(this.cfg.connection, 'destination');
@@ -241,7 +241,7 @@ export class CorporateDelivery {
       if (ids && (await local.query("SELECT 1 FROM olos_http.corporate_selective_commits WHERE state='unresolved'")).rowCount) {
         throw new SyncError(selectiveCommitBlock);
       }
-      const entries = ids ? await selectEntries(local, this.source, this.target, ids) : (await local.query(`SELECT source_id,target_id::text,payload,payload_hash FROM olos_http.corporate_outbox
+      const entries = ids ? await selectEntries(local, this.source, this.target, ids, historyReadId, contract) : (await local.query(`SELECT source_id,target_id::text,payload,payload_hash FROM olos_http.corporate_outbox
         WHERE source_key=$1 AND state='pending' ORDER BY target_id LIMIT $2 FOR UPDATE`, [this.source, this.cfg.connection.batchSize])).rows;
       if (new Map(state.destination_shape).has(operatorColumn) && entries.some(entry =>
         entry.state !== 'confirmed' && !hasOperator(entry.payload))) throw new SyncError('OPERATOR_PAYLOAD_UPGRADE_REQUIRED');
@@ -293,7 +293,7 @@ export class CorporateDelivery {
           const guarded = await this.state(local, true, true);
           if (!guarded.paused || !guarded.blocked || guarded.last_code !== selectiveCommitBlock) throw new SyncError('SELECTIVE_COMMIT_FENCE_LOST');
           if (historyReadId !== undefined) await assertPreservedHistory(local, this.source, historyReadId, contract);
-          const refreshed = await selectEntries(local, this.source, this.target, ids);
+          const refreshed = await selectEntries(local, this.source, this.target, ids, historyReadId, contract);
           assertEvidence(refreshed, evidence(entries));
           selectedRows(refreshed, shape, this.cfg);
           this.fence();

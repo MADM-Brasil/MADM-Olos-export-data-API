@@ -11,6 +11,15 @@ export const historyHomologation = [
   { source_id: '47558756', agent_id: '1565', target_id: '724892', olos_call_id: '1031754587' },
 ] as const;
 
+// Only the frozen v1 incident identities may use legacy backlog provenance.
+export function allowsLegacyHistoryEntry(entry: {
+  origin: string; source_id: string; target_id: string; agent_id: string; payload: Record<string, unknown>;
+}, readId?: string, contract?: 'v1' | 'v2'): boolean {
+  return readId === preservedHistoryRead && contract === 'v1' && entry.origin === 'legacy_backlog' &&
+    historyHomologation.some(row => entry.source_id === row.source_id && entry.target_id === row.target_id &&
+      entry.agent_id === row.agent_id && entry.payload.olos_call_id === row.olos_call_id);
+}
+
 export function validatePreservedHistory(readId: string | undefined, ids?: readonly string[]): void {
   if (readId === undefined) return;
   if (readId !== preservedHistoryRead || ids &&
@@ -54,15 +63,16 @@ export async function assertPreservedHistory(local: PoolClient, source: string, 
   }
   // SQL compares timestamps at full PostgreSQL precision. No record from the
   // failed read, or from a later capture, may be admitted by this exception.
-  const entries = (await local.query(`SELECT r.source_id,r.agent_id,r.target_id::text,o.payload,
+  const entries = (await local.query(`SELECT r.source_id,r.agent_id,r.target_id::text,o.payload,o.origin,
     r.target_table=$3 AND r.target_id=o.target_id AND r.source_hash=o.source_hash
-      AND r.created_at<h.started_at AND o.created_at<h.started_at AND o.origin='capture' AS valid
+      AND r.created_at<h.started_at AND o.created_at<h.started_at AS valid
     FROM olos_http.records r JOIN olos_http.corporate_outbox o USING(source_key,source_id)
     JOIN olos_http.reads h ON h.id=$2
     WHERE r.source_key=$1 AND r.source_id=ANY($4::text[]) FOR SHARE OF r,o NOWAIT`,
   [source, readId, read.target_table, historyHomologation.map(row => row.source_id)])).rows;
   if (entries.length !== 3 || historyHomologation.some(expected => !entries.some(entry =>
-    entry.valid && entry.source_id === expected.source_id && entry.agent_id === expected.agent_id &&
+    entry.valid && (entry.origin === 'capture' || allowsLegacyHistoryEntry(entry, readId, contract)) &&
+    entry.source_id === expected.source_id && entry.agent_id === expected.agent_id &&
     entry.target_id === expected.target_id && (contract !== 'v2' || entry.payload.id_operador_olos === expected.agent_id) &&
     (contract !== 'v1' || entry.payload.olos_call_id === expected.olos_call_id)))) {
     throw new SyncError('HISTORY_HOMOLOGATION_RECORD_CHANGED');

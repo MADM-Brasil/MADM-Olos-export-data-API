@@ -1,4 +1,4 @@
-import { assertPreservedHistory } from './preserved-history.js';
+import { allowsLegacyHistoryEntry, assertPreservedHistory, validatePreservedHistory } from './preserved-history.js';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { PoolClient, Client } from 'pg';
@@ -12,7 +12,7 @@ export const selectiveCommitBlock = 'SELECTIVE_COMMIT_RECONCILIATION_REQUIRED';
 export interface SelectedEntry {
   source_id: string; target_id: string; payload: Record<string, unknown>; payload_hash: string;
   state: 'pending' | 'confirmed'; remote_raw_id: string | null; source_hash: string;
-  origin: string; record_hash: string; record_target_id: string; target_table: string;
+  origin: string; agent_id: string; record_hash: string; record_target_id: string; target_table: string;
 }
 export async function lockSelection(local: PoolClient, source: string, historyReadId?: string, contract?: 'v1' | 'v2'): Promise<void> {
   // Session locks survive the local COMMIT intent; release(true) destroys this session.
@@ -32,13 +32,16 @@ export async function lockRemoteSelection(remote: Client): Promise<void> {
     throw new SyncError('SELECTIVE_REMOTE_TRANSACTION_ACTIVE');
   }
 }
-export async function selectEntries(local: PoolClient, source: string, target: string, ids: string[]): Promise<SelectedEntry[]> {
+export async function selectEntries(local: PoolClient, source: string, target: string, ids: string[],
+  historyReadId?: string, contract?: 'v1' | 'v2'): Promise<SelectedEntry[]> {
+  validatePreservedHistory(historyReadId, ids);
   const entries = (await local.query<SelectedEntry>(`SELECT o.source_id,o.target_id::text,o.payload,o.payload_hash,o.state,
       o.remote_raw_id::text,o.source_hash,o.origin,r.source_hash AS record_hash,
-      r.target_id::text AS record_target_id,r.target_table
+      r.target_id::text AS record_target_id,r.target_table,r.agent_id
     FROM olos_http.corporate_outbox o JOIN olos_http.records r USING(source_key,source_id)
     WHERE o.source_key=$1 AND o.source_id=ANY($2::text[]) ORDER BY o.target_id FOR UPDATE OF o,r NOWAIT`, [source, ids])).rows;
-  if (entries.length !== ids.length || entries.some(entry => entry.origin !== 'capture' ||
+  if (entries.length !== ids.length || entries.some(entry =>
+    (entry.origin !== 'capture' && !allowsLegacyHistoryEntry(entry, historyReadId, contract)) ||
     !['pending','confirmed'].includes(entry.state) || entry.source_hash !== entry.record_hash ||
     entry.target_id !== entry.record_target_id || entry.target_table !== target)) throw new SyncError('SELECTIVE_RECEIPT_INVALID');
   return entries;

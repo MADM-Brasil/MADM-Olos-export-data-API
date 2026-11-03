@@ -986,7 +986,8 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       confirmation: `AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${incidentIds.join(',')}` };
     const incidentPrepare: OperatorRequest = { kind: 'prepare', ids: incidentIds, historyReadId: preservedHistoryRead,
       confirmation: `AUTHORIZE_EXPORTDATA_OPERATOR_PAYLOADS:${incidentIds.join(',')}` };
-    async function incidentFixture(contract: 'v1' | 'v2' = 'v2') {
+    async function incidentFixture(contract: 'v1' | 'v2' = 'v2',
+      origin: 'capture' | 'legacy_backlog' = contract === 'v1' ? 'legacy_backlog' : 'capture') {
       const cfg = { ...await historyConfig(), ingestionBaseline: '2026-09-01T00:00:00Z' };
       // Disposable fixture provisioning only. V1 has no operator tables or column.
       if (contract === 'v2') await operatorLocalMigrations();
@@ -1000,6 +1001,8 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       }
       await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),725262)");
       await close(s);
+      // Synthetic provenance only: reproduce the frozen legacy v1 incident.
+      await local.query('UPDATE olos_http.corporate_outbox SET origin=$1 WHERE source_id=ANY($2::text[])', [origin,incidentIds]);
       await local.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,error_code)
         VALUES($1,$2,$3,'{"kind":"history"}','RESPONSE_TOO_LARGE')`, [preservedHistoryRead,cfg.sourceKey,'"raw"."olos_calls"']);
       if (contract === 'v2') await operatorMigration();
@@ -1039,6 +1042,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       assert.equal(metadata.columns.some(c=>c.column_name==='id_operador_olos'),false);
       assert.equal(columns.length,14);
       for (const entry of frozen) {
+        assert.equal(entry.origin,'legacy_backlog');
         assert.deepEqual(Object.keys(entry.payload).sort(),[...columns].sort());
         assert.equal(entry.payload_hash,digest(entry.payload));
       }
@@ -1086,8 +1090,24 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
         assert.equal((await control()).confirmed_count,String(Number(state.confirmed_count)+3));
       } finally { await new Promise<void>(resolve=>server.close(()=>resolve())); }
     });
+    await t.test('v1 preserved history: capture still works; legacy origin cannot enter v2 or operator adoption', async () => {
+      const cfg=await incidentFixture('v1','capture'), before=await incidentEvidence(), frozen=await v1Receipts();
+      await selectiveRun(cfg,{},incidentV1);
+      assert.equal(await destinationCount(),5); assert.deepEqual(await incidentEvidence(),before);
+      assert.deepEqual((await v1Receipts()).map(r=>[r.origin,r.payload,r.payload_hash]),frozen.map(r=>[r.origin,r.payload,r.payload_hash]));
+      const v2cfg=await incidentFixture('v2','legacy_backlog'), v2before=await incidentEvidence(), receipts=await v1Receipts();
+      await assert.rejects(incidentAdopt(v2cfg),/HISTORY_HOMOLOGATION_RECORD_CHANGED/);
+      await assert.rejects(selectiveRun(v2cfg,{},incidentSelection),/HISTORY_HOMOLOGATION_RECORD_CHANGED/);
+      assert.equal(await destinationCount(),2); assert.deepEqual(await incidentEvidence(),v2before);
+      assert.deepEqual(await v1Receipts(),receipts);
+    });
     await t.test('v1 preserved history: identity/hash/shape/scheduler changes block without rewriting payloads', async () => {
       const cases: [string,RegExp][] = [
+        ["UPDATE olos_http.corporate_outbox SET origin='legacy_receipt' WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
+        ["UPDATE olos_http.records SET agent_id='999' WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
+        ["UPDATE olos_http.corporate_outbox SET source_hash=repeat('f',64) WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
+        ["UPDATE olos_http.records SET created_at=clock_timestamp() WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
+        ["UPDATE olos_http.corporate_outbox SET created_at=clock_timestamp() WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
         ["UPDATE olos_http.corporate_outbox SET payload=jsonb_set(payload,'{olos_call_id}','\"wrong\"') WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
         ["UPDATE olos_http.records SET target_id=725263 WHERE source_id='47561569'",/HISTORY_HOMOLOGATION_RECORD_CHANGED/],
         ["UPDATE olos_http.corporate_outbox SET payload_hash=repeat('f',64) WHERE source_id='47561569'",/CORPORATE_PAYLOAD_CHANGED/],
@@ -1165,14 +1185,21 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       }
     });
     await t.test('v1 preserved history: source evidence is revalidated after durable intent before remote COMMIT', async () => {
-      const cfg=await incidentFixture('v1'), frozen=await v1Receipts();
-      await assert.rejects(selectiveRun(cfg,{afterSelectiveIntent:async()=>{
-        await local.query("UPDATE olos_http.corporate_outbox SET payload=jsonb_set(payload,'{olos_call_id}','\"changed\"') WHERE source_id='47561569'");
-      }},incidentV1),/CORPORATE_COMMIT_UNKNOWN/);
-      assert.equal(await destinationCount(),2); assert.ok(await unresolvedCommit());
-      assert.equal((await control()).blocked,true);
-      assert.ok((await v1Receipts()).every(r=>r.state==='pending'));
-      assert.deepEqual((await v1Receipts()).map(r=>r.payload_hash),frozen.map(r=>r.payload_hash));
+      for (const sql of [
+        "UPDATE olos_http.corporate_outbox SET payload=jsonb_set(payload,'{olos_call_id}','\"changed\"') WHERE source_id='47561569'",
+        "UPDATE olos_http.corporate_outbox SET origin='legacy_receipt' WHERE source_id='47561569'",
+      ]) {
+        const cfg=await incidentFixture('v1'), frozen=await v1Receipts();
+        const reads=(await local.query('SELECT * FROM olos_http.reads ORDER BY id')).rows;
+        await assert.rejects(selectiveRun(cfg,{afterSelectiveIntent:async()=>{
+          await local.query(sql);
+        }},incidentV1),/CORPORATE_COMMIT_UNKNOWN/);
+        assert.equal(await destinationCount(),2); assert.ok(await unresolvedCommit());
+        assert.equal((await control()).blocked,true);
+        assert.ok((await v1Receipts()).every(r=>r.state==='pending'));
+        assert.deepEqual((await v1Receipts()).map(r=>r.payload_hash),frozen.map(r=>r.payload_hash));
+        assert.deepEqual((await local.query('SELECT * FROM olos_http.reads ORDER BY id')).rows,reads);
+      }
     });
     await t.test('preserved history: exact incident adoption, preparation and delivery preserve all historical evidence and backlog', async () => {
       const cfg = await incidentFixture(), before = await incidentEvidence(), frozen = await outbox();

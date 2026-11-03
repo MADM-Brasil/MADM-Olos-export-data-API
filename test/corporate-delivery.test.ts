@@ -9,9 +9,26 @@ import { parseSelection, parseReconciliation, validateSelection } from '../src/c
 import { CorporateDelivery } from '../src/corporate-delivery/delivery.js';
 import type { Pool } from 'pg';
 import { handlingSeconds } from '../src/mapping.js';
+import { allowsLegacyHistoryEntry, historyHomologation, preservedHistoryRead } from '../src/corporate-delivery/preserved-history.js';
 
 const env = { DATABASE_URL: 'postgresql://test@localhost/local', OLOS_SOURCE_KEY: 'synthetic',
   ATTEMPTS_PERSISTENCE_MODE: 'corporate', OLOS_CORPORATE_DATABASE_URL: 'postgresql://test@localhost/madm' };
+test('legacy history exception requires every fixed identity, explicit v1 and the preserved read', () => {
+  for (const row of historyHomologation) {
+    const entry = { ...row, origin: 'legacy_backlog', payload: { olos_call_id: row.olos_call_id } };
+    assert.equal(allowsLegacyHistoryEntry(entry,preservedHistoryRead,'v1'),true);
+    for (const altered of [
+      {...entry,source_id:'900001'}, {...entry,target_id:'725263'}, {...entry,agent_id:'999'},
+      {...entry,payload:{olos_call_id:'wrong'}}, {...entry,origin:'legacy_receipt'}, {...entry,origin:'capture'},
+    ]) assert.equal(allowsLegacyHistoryEntry(altered,preservedHistoryRead,'v1'),false);
+    for (const readId of [undefined,'11111111-1111-4111-8111-111111111111']) {
+      assert.equal(allowsLegacyHistoryEntry(entry,readId,'v1'),false);
+    }
+    for (const contract of [undefined,'v2'] as const) {
+      assert.equal(allowsLegacyHistoryEntry(entry,preservedHistoryRead,contract),false);
+    }
+  }
+});
 test('corporate direct mode is opt-in and independent from Corporate Sync configuration', () => {
   assert.equal(config({ DATABASE_URL: env.DATABASE_URL, OLOS_SOURCE_KEY: 'test', CORPORATE_SYNC_ENABLED: 'true' }).corporateDelivery, undefined);
   const cfg = deliveryConfig(env)!;
