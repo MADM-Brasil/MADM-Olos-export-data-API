@@ -1,4 +1,7 @@
 import { identityCommand } from '../src/identity/migrate.js';
+import { dependencies, referenceRows } from '../src/identity/dependencies.js';
+import { randomUUID } from 'node:crypto';
+import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace } from '../src/corporate-delivery/identified-operator.js';
 import { consent as identityConsent, type Kind as IdentityKind } from '../src/identity/request.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,7 +29,7 @@ import type { DeliveryHooks } from '../src/corporate-delivery/delivery.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { SyncError } from '../src/corporate-sync/errors.js';
 import { drainCommand, drainBlock, type DrainHooks } from '../src/corporate-delivery/drain.js';
-import { drainConsent, type DrainLimits, type DrainRequest } from '../src/corporate-delivery/drain-request.js';
+import { drainConsent, drainHash, type DrainLimits, type DrainRequest } from '../src/corporate-delivery/drain-request.js';
 import { fixture } from './corporate-sync.fixture.js';
 import { seedLegacyIds } from './legacy-id.fixture.js';
 import { HttpError, WorkerError } from '../src/errors.js';
@@ -68,9 +71,9 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     OLOS_CORPORATE_BATCH_SIZE: '500', OLOS_CORPORATE_BACKOFF_MS: '1', OLOS_CORPORATE_TIMEOUT_MS: '2000', ...extra });
   async function open(cfg = makeConfig()) { const s = new Store(cfg); stores.push(s); await s.open(); return s; }
   async function close(s: Store) { stores.splice(stores.indexOf(s), 1); await s.close(); }
-  async function stage(s: Store, rows: unknown[]) {
+  async function stage(s: Store, rows: unknown[], references=cache) {
     const id = await s.beginRead({ kind: 'current' }); await s.stage(id, JSON.stringify(rows), 1);
-    return s.drain(cache);
+    return s.drain(references);
   }
   async function count(db: pg.Client, table: string): Promise<number> { return Number((await db.query(`SELECT count(*)::text AS n FROM ${table}`)).rows[0].n); }
   async function reset(n = 2) {
@@ -1081,7 +1084,8 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     const incidentPrepare: OperatorRequest = { kind: 'prepare', ids: incidentIds, historyReadId: preservedHistoryRead,
       confirmation: `AUTHORIZE_EXPORTDATA_OPERATOR_PAYLOADS:${incidentIds.join(',')}` };
     async function incidentFixture(contract: 'v1' | 'v2' = 'v2',
-      origin: 'capture' | 'legacy_backlog' = contract === 'v1' ? 'legacy_backlog' : 'capture') {
+      origin: 'capture' | 'legacy_backlog' = contract === 'v1' ? 'legacy_backlog' : 'capture',
+      users=cache.users, extra: Record<string,unknown> = {}) {
       const cfg = { ...await historyConfig(), ingestionBaseline: '2026-09-01T00:00:00Z' };
       // Disposable fixture provisioning only. V1 has no operator tables or column.
       if (contract === 'v2') await operatorLocalMigrations();
@@ -1091,7 +1095,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       for (const row of historyHomologation) {
         await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),$1)", [Number(row.target_id)-1]);
         await seedLegacyIds(s.client!,cfg,[record(Number(row.source_id), { AgentId: row.agent_id,
-          ...(contract === 'v1' ? { CallId: row.olos_call_id } : {}) })],cache);
+          ...(contract === 'v1' ? { CallId: row.olos_call_id } : {}),...extra })],{...cache,users});
       }
       await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),725262)");
       await close(s);
@@ -1128,8 +1132,8 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       functions:(await remote.query("SELECT pg_get_functiondef('raw.fn_olos_calls_normalizar_telefone()'::regprocedure),pg_get_functiondef('core.gerar_telefone_match_key(text)'::regprocedure)")).rows,
     });
     // Diagnostic fixtures only: no renumbering command or identity bypass is implemented.
-    async function coordinatedDiagnosticFixture(confirmed=true) {
-      const cfg=await incidentFixture('v1');
+    async function coordinatedDiagnosticFixture(confirmed=true, users=cache.users, extra: Record<string,unknown> = {}) {
+      const cfg=await incidentFixture('v1','legacy_backlog',users,extra);
       if(confirmed){await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN raw_olos_call_id RESTART WITH 73757');
       await selectiveRun(cfg,{},incidentV1);}
       const entries=await v1Receipts();
@@ -1234,8 +1238,10 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
         assert.equal((await control()).paused,true);
       }
     });
-    async function identityFixture(kind:IdentityKind='pending') {
-      const cfg=await coordinatedDiagnosticFixture(kind==='confirmed');
+    const identifiedIncidentUsers = new Map(historyHomologation.map(e=>[e.agent_id,'  Operador identificado  ']));
+    async function identityFixture(kind:IdentityKind='pending', users=kind==='pending'?identifiedIncidentUsers:cache.users,
+      extra:Record<string,unknown>={}) {
+      const cfg=await coordinatedDiagnosticFixture(kind==='confirmed',users,extra);
       await local.query(await readFile(new URL('../migrations/005_backlog_drain.sql',import.meta.url),'utf8'));
       await local.query(await readFile(new URL('../migrations/006_original_identity.sql',import.meta.url),'utf8'));
       return cfg;
@@ -1244,6 +1250,57 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     function identityAction(p:Awaited<ReturnType<typeof identityPlan>>,action:'execute'|'reconcile'|'cancel'='execute') {
       return {action,id:p.id,hash:p.hash,confirmation:identityConsent(action,p.id,p.hash,p.kind)};
     }
+    // Reproduce a v1 plan written by the previous binary, without an operator
+    // admission policy. Only fixture INSERTs; no mutation of an existing journal.
+    async function legacyIdentityPlan(cfg:Config) {
+      const entries=(await local.query(`SELECT o.source_id,o.target_id::text,o.payload,o.payload_hash,o.state,o.remote_raw_id::text,o.source_hash,o.origin,
+        r.source_hash AS record_hash,r.target_id::text AS record_target_id,r.target_table,r.agent_id,
+        to_jsonb(r)::text AS record_snapshot,to_jsonb(o)::text AS outbox_snapshot,
+        (SELECT to_jsonb(d)::text FROM raw.olos_calls d WHERE d.internal_id_olos=r.target_id) AS local_row,
+        (SELECT to_jsonb(c)::text FROM corporate_sync.receipts c WHERE c.internal_id_olos=r.target_id) AS receipt,
+        r.created_at<h.started_at AND o.created_at<h.started_at AS eligible
+        FROM olos_http.records r JOIN olos_http.corporate_outbox o USING(source_key,source_id)
+        JOIN olos_http.reads h ON h.id=$1 WHERE r.source_id=ANY($2::text[]) ORDER BY r.source_id`,[preservedHistoryRead,incidentIds])).rows;
+      for(const e of entries){e.new_payload={...e.payload,internal_id_olos:e.source_id};e.new_hash=digest(e.new_payload);e.remote_row=null;}
+      const local_dependencies=await dependencies(local,true);
+      const manifest={version:1,kind:'pending',ids:incidentIds.slice().sort(),source:cfg.sourceKey,target:'"raw"."olos_calls"',
+        binding:cfg.corporateDelivery!.binding,schema:(await control()).schema_hash,review:'b'.repeat(64),
+        history:(await local.query('SELECT to_jsonb(h) AS h FROM olos_http.reads h WHERE id=$1',[preservedHistoryRead])).rows[0].h,
+        local_dependencies,remote_dependencies:await dependencies(remote,false),
+        references:await referenceRows(local,local_dependencies.refs,entries.map(e=>e.target_id)),
+        checkpoint:(await local.query('SELECT to_jsonb(c)::text AS row FROM corporate_sync.control c WHERE singleton')).rows[0]?.row??'null',entries};
+      const id=randomUUID(),hash=drainHash(manifest);
+      await local.query('INSERT INTO olos_http.identity_plans(id,manifest,hash) VALUES($1,$2,$3)',[id,manifest,hash]);
+      await local.query("INSERT INTO olos_http.identity_runs(id,state) VALUES($1,'planned')",[id]);
+      await local.query("INSERT INTO olos_http.identity_events(id,event) VALUES($1,'PREPARED')",[id]);
+      return {id,hash,kind:'pending' as const,state:'planned',selected:3,confirmation:identityConsent('execute',id,hash,'pending')};
+    }
+    await t.test('identity operator admission: missing/blank name or invalid AgentId rejects the whole pending plan without writes',async()=>{
+      for(const c of [
+        {users:cache.users,extra:{}},
+        {users:new Map(historyHomologation.map(e=>[e.agent_id,operatorNameWhitespace])),extra:{}},
+        ...['0','-1','invalid'].map(id=>({users:new Map([[id,'Agent']]),extra:{AgentId:id}})),
+      ]){
+        const cfg=await identityFixture('pending',c.users,c.extra),before=await coordinatedLocalEvidence(),destination=await remoteRows();
+        await assert.rejects(identityPlan(cfg),/IDENTITY_OPERATOR_REQUIRED/);
+        assert.deepEqual(await coordinatedLocalEvidence(),before);assert.deepEqual(await remoteRows(),destination);
+        assert.equal(await count(local,'olos_http.identity_plans'),0);
+        assert.equal((await local.query('SELECT adopted FROM olos_http.identity_contract')).rows[0].adopted,false);
+      }
+    });
+    await t.test('identity operator admission: an incompatible old plan retains its hash and evidence until authorized cancellation',async()=>{
+      const cfg=await identityFixture('pending',cache.users),plan=await legacyIdentityPlan(cfg);
+      const before=await coordinatedLocalEvidence(),destination=await remoteRows();
+      const journal=(await local.query('SELECT * FROM olos_http.identity_plans')).rows;
+      await assert.rejects(identityCommand(cfg,identityAction(plan)),/IDENTITY_OPERATOR_PLAN_CANCEL_REQUIRED/);
+      assert.equal((await identityCommand(cfg,{action:'status',id:plan.id})).state,'planned');
+      await assert.rejects(identityPlan(cfg),/IDENTITY_OPEN_PLAN_EXISTS/);
+      await assert.rejects(identityCommand(cfg,{...identityAction(plan,'cancel'),confirmation:'wrong'}),/IDENTITY_NOT_AUTHORIZED/);
+      await identityCommand(cfg,identityAction(plan,'cancel'));
+      assert.equal((await identityCommand(cfg,{action:'status',id:plan.id})).state,'cancelled');
+      assert.deepEqual((await local.query('SELECT * FROM olos_http.identity_plans')).rows,journal);
+      assert.deepEqual(await coordinatedLocalEvidence(),before);assert.deepEqual(await remoteRows(),destination);
+    });
     await t.test('identity migration: three pending calls, immutable journal, cascade references, PK/sequence and history preserved; selective v1 delivers originals',async()=>{
       const cfg=await identityFixture();
       await local.query("CREATE TABLE raw.identity_ref(id bigint REFERENCES raw.olos_calls(internal_id_olos) ON UPDATE CASCADE,note text); INSERT INTO raw.identity_ref VALUES(724892,'keep'),(724965,'keep'),(725262,'keep')");
@@ -1532,7 +1589,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     });
     const drainLimits: DrainLimits={batchSize:100,maxBatches:1,delayMs:1000,maxBatchMs:10000,statementTimeoutMs:2000,
       contract:'v1',historyReadId:preservedHistoryRead};
-    async function backlogFixture(n=351) {
+    async function backlogFixture(n=351, extra:(i:number)=>Record<string,unknown>=()=>({}), users=cache.users) {
       const cfg={...await historyConfig(),ingestionBaseline:'2026-09-01T00:00:00Z'};
       for (const file of ['003_selective_commit.sql','005_backlog_drain.sql']) {
         await local.query(await readFile(new URL(`../migrations/${file}`,import.meta.url),'utf8'));
@@ -1540,8 +1597,8 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       const s=await open(cfg);
       const input=Array.from({length:n},(_,i) => record(1000000+i,{CallId:String(2000000+i),
         StartDate:i%2?'2026-11-01T10:00:00-03:00':'2026-09-15T10:00:00-03:00',
-        EndWrap:i%2?'2026-11-01T10:00:01-03:00':'2026-09-15T10:00:01-03:00'}));
-      await stage(s,[...input,record(9999999)]); await close(s);
+        EndWrap:i%2?'2026-11-01T10:00:01-03:00':'2026-09-15T10:00:01-03:00',...extra(i)}));
+      await stage(s,[...input,record(9999999)],{...cache,users}); await close(s);
       // Synthetic provenance, never a runtime repair of local records.
       await local.query("UPDATE olos_http.corporate_outbox SET origin='legacy_backlog' WHERE source_id::bigint%2=0 AND state='pending'");
       await local.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,error_code)
@@ -1567,20 +1624,91 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       sequence:(await local.query('SELECT * FROM raw.olos_calls_internal_id_olos_seq')).rows,
       frozen:(await local.query('SELECT source_id,target_id,payload,payload_hash,source_hash,origin,created_at FROM olos_http.corporate_outbox ORDER BY target_id')).rows,
     });
+    // Synthetic journal from the old binary: complete frozen scope, with no
+    // operator admission. Never rewrite an existing plan or use this in runtime.
+    async function legacyBacklogPlan(cfg:Config,ids:string[],limits=drainLimits) {
+      const selected=(await local.query(`SELECT o.source_id,o.target_id::text,o.source_hash,o.payload_hash,o.origin,r.agent_id,
+        r.created_at::text AS record_created,o.created_at::text AS outbox_created
+        FROM olos_http.corporate_outbox o JOIN olos_http.records r USING(source_key,source_id)
+        WHERE o.source_id=ANY($1::text[]) ORDER BY o.target_id`,[ids])).rows;
+      const runId=randomUUID(),state=await control();
+      const history=(await local.query('SELECT to_jsonb(h) AS h FROM olos_http.reads h WHERE id=$1',[preservedHistoryRead])).rows[0].h;
+      const batches=[];
+      for(let i=0;i<selected.length;i+=limits.batchSize)batches.push({number:batches.length+1,evidence:selected.slice(i,i+limits.batchSize)});
+      const planHash=drainHash({runId,source:cfg.sourceKey,target:'"raw"."olos_calls"',binding:state.binding,schema:state.schema_hash,
+        history,limits,selected:selected.length,batches});
+      await local.query(`INSERT INTO olos_http.corporate_drain_runs
+        (run_id,source_key,target_table,binding,schema_hash,history_snapshot,limits,plan_hash,selected_count)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,[runId,cfg.sourceKey,'"raw"."olos_calls"',state.binding,state.schema_hash,history,limits,planHash,selected.length]);
+      for(const b of batches)await local.query('INSERT INTO olos_http.corporate_drain_batches(run_id,batch_no,evidence) VALUES($1,$2,$3)',[runId,b.number,JSON.stringify(b.evidence)]);
+      return {kind:'execute' as const,runId,planHash,limits,confirmation:drainConsent('execute',runId,planHash)};
+    }
+    await t.test('operator selection SQL and runtime agree on invalid IDs, missing names and all supported whitespace',async()=>{
+      const cases=[...['0','-1','-2','007','7.0',' 7','7 ','7\n','7\r','7','9007199254740993',null].map(agent=>({agent,name:'Agent'})),
+        ...[null,42,{},'',...operatorNameWhitespace,' \tAgent\u00a0'].map(name=>({agent:'7',name}))];
+      for(const {agent,name} of cases){
+        const payload={nome_agente:name};
+        const result=(await local.query(`SELECT COALESCE($1::text ~ $3 AND jsonb_typeof($2::jsonb->'nome_agente')='string'
+          AND btrim($2::jsonb->>'nome_agente',$4)<>'',false) AS eligible`,[agent,JSON.stringify(payload),identifiedAgentPattern,operatorNameWhitespace])).rows[0].eligible;
+        assert.equal(result,hasIdentifiedOperator({agent_id:agent,payload}),JSON.stringify({agent,name}));
+      }
+    });
+    await t.test('drain operator admission checks every frozen batch before delivery; incompatible old plan requires authorized cancel',async()=>{
+      const cfg=await backlogFixture(300,i=>i===299?{AgentId:'0'}:{});
+      await drainCommand(cfg,await backlogPlan(cfg));
+      const request=await legacyBacklogPlan(cfg,Array.from({length:200},(_,i)=>String(1000100+i)),{...drainLimits,maxBatches:2});
+      const before=await backlogEvidence(),receipts=await outbox(),destination=await remoteRows(),state=await control();
+      const journal=await backlogJournal(request.runId),run=(await local.query('SELECT * FROM olos_http.corporate_drain_runs WHERE run_id=$1',[request.runId])).rows;
+      await assert.rejects(drainCommand(cfg,request),/DRAIN_OPERATOR_PLAN_CANCEL_REQUIRED/);
+      assert.deepEqual(await backlogJournal(request.runId),journal);
+      assert.deepEqual((await local.query('SELECT * FROM olos_http.corporate_drain_runs WHERE run_id=$1',[request.runId])).rows,run);
+      await assert.rejects(backlogPlan(cfg),/DRAIN_OPEN_RUN_EXISTS/);
+      await assert.rejects(drainCommand(cfg,{kind:'cancel',runId:request.runId,planHash:request.planHash,confirmation:'wrong'}),/DRAIN_NOT_AUTHORIZED/);
+      await drainCommand(cfg,{kind:'cancel',runId:request.runId,planHash:request.planHash,confirmation:drainConsent('cancel',request.runId,request.planHash)});
+      assert.deepEqual(await backlogJournal(request.runId),journal);
+      assert.deepEqual(await backlogEvidence(),before);assert.deepEqual(await outbox(),receipts);
+      assert.deepEqual(await remoteRows(),destination);assert.deepEqual(await control(),state);
+    });
+    await t.test('old uncertain drain without operator reconciles exact remote evidence, never reinserts or admits excluded pending rows',async()=>{
+      const cfg=await backlogFixture(100,i=>i<2?{AgentId:'0'}:{});
+      const request=await legacyBacklogPlan(cfg,Array.from({length:100},(_,i)=>String(1000000+i)));
+      const old=(await outbox()).find(e=>e.source_id==='1000000')!;
+      await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_,i)=>`$${i+1}`).join(',')})`,columns.map(c=>old.payload[c]));
+      await remote.query("UPDATE raw.olos_calls SET kommo_event_hash='preserve-old',kommo_tentativas=7");
+      await local.query("UPDATE olos_http.corporate_drain_runs SET state='failed',last_code='CORPORATE_COMMIT_UNKNOWN' WHERE run_id=$1",[request.runId]);
+      await local.query("UPDATE olos_http.corporate_drain_batches SET state='intent',intent_at=now() WHERE run_id=$1",[request.runId]);
+      await local.query('UPDATE olos_http.corporate_control SET blocked=true,last_code=$1',[drainBlock]);
+      const before=await backlogEvidence(),destination=await remoteRows();
+      await assert.rejects(drainCommand(cfg,request),/DRAIN_RECONCILIATION_REQUIRED/);
+      await drainCommand(cfg,backlogReconciliation(request));
+      const receipts=await outbox();
+      assert.equal(receipts.find(e=>e.source_id==='1000000')!.state,'confirmed');
+      assert.equal(receipts.find(e=>e.source_id==='1000001')!.state,'pending');
+      await drainCommand(cfg,backlogReconciliation(request));await drainCommand(cfg,request);
+      await assert.rejects(backlogPlan(cfg),/DRAIN_INSUFFICIENT_BACKLOG/);
+      assert.deepEqual(await outbox(),receipts);assert.deepEqual(await remoteRows(),destination);
+      assert.deepEqual(await backlogEvidence(),before);assert.equal((await control()).paused,true);
+    });
     await t.test('identity + drain: progressive 3/100/250/500/1000 migration only admits original IDs; remaining legacy backlog cannot be sent',async()=>{
       const cfg={...await historyConfig(),ingestionBaseline:'2026-09-01T00:00:00Z'};
       for(const file of ['003_selective_commit.sql','005_backlog_drain.sql','006_original_identity.sql'])await local.query(await readFile(new URL(`../migrations/${file}`,import.meta.url),'utf8'));
       const s=await open(cfg),ids=Array.from({length:1854},(_,i)=>String(1000000+i));
-      await seedLegacyIds(s.client!,cfg,ids.map(id=>record(Number(id),{CallId:String(Number(id)+1000000)})),cache);await close(s);
+      const excluded=Array.from({length:4},(_,i)=>record(500000+i,{AgentId:['0','-1',null,'8'][i]}));
+      await seedLegacyIds(s.client!,cfg,[...excluded,...ids.map((id,i)=>record(Number(id),{
+        CallId:String(Number(id)+1000000),DispositionId:['3','4','9',null][i%4]}))],cache);await close(s);
       await local.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,error_code)
         VALUES($1,$2,$3,'{"kind":"history"}','RESPONSE_TOO_LARGE')`,[preservedHistoryRead,cfg.sourceKey,'"raw"."olos_calls"']);
       const before=await incidentEvidence();
+      const excludedBefore=(await outbox()).filter(e=>Number(e.source_id)<600000&&e.state==='pending');
       await assert.rejects(identityPlan(cfg,'pending',ids.slice(0,100)),/IDENTITY_STAGE_NOT_PROVEN/);
       const stale=await backlogPlan(cfg);
       await assert.rejects(identityPlan(cfg,'pending',ids.slice(0,3)),/DRAIN_OPEN_RUN_EXISTS/);
       await drainCommand(cfg,{kind:'cancel',runId:stale.runId,planHash:stale.planHash,confirmation:drainConsent('cancel',stale.runId,stale.planHash)});
       let offset=0;
       for(const size of [3,100,250,500,1000]){
+        const evidence=await outbox(),journals=await count(local,'olos_http.identity_plans');
+        await assert.rejects(identityPlan(cfg,'pending',['500000',...ids.slice(offset,offset+size-1)]),/IDENTITY_OPERATOR_REQUIRED/);
+        assert.deepEqual(await outbox(),evidence);assert.equal(await count(local,'olos_http.identity_plans'),journals);
         const plan=await identityPlan(cfg,'pending',ids.slice(offset,offset+size));await identityCommand(cfg,identityAction(plan));offset+=size;
         if(size===3)await assert.rejects(backlogPlan(cfg),/DRAIN_INSUFFICIENT_BACKLOG/);
         else{const run=await backlogPlan(cfg,{...drainLimits,batchSize:size});await drainCommand(cfg,run);}
@@ -1592,6 +1720,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       assert.notEqual(String(legacy.target_id),ids.at(-1));
       assert.equal((await remote.query('SELECT 1 FROM raw.olos_calls WHERE internal_id_olos=$1',[legacy.target_id])).rowCount,0);
       assert.deepEqual((await incidentEvidence()).reads,before.reads);assert.deepEqual((await incidentEvidence()).receipts,before.receipts);
+      assert.deepEqual((await outbox()).filter(e=>Number(e.source_id)<600000&&e.state==='pending'),excludedBefore);
     });
     await t.test('identity CLI: pending plan/execute/status perform zero HTTP, expose no payload, preserve overflow evidence and reject unsafe rollback',async()=>{
       const cfg=await identityFixture(),before=await v1Receipts();
@@ -1613,7 +1742,12 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));}
     });
     await t.test('drain CLI: 100 then 250/500/1000, immutable v1/schema/history/Kommo, exact caps, idempotence and zero OLOS', async () => {
-      const cfg=await backlogFixture(1851), before=await backlogEvidence(), metadata=await corporateMetadata();
+      const invalidAgents=['0','-1',null,'8','missing','-2','7.0',' 7','007'];
+      const excluded=new Set(invalidAgents.map((_,i)=>String(1000010+i)));
+      const cfg=await backlogFixture(1860,i=>i>=10&&i<19?{AgentId:invalidAgents[i-10]}:{},
+        new Map([...cache.users,['0','Filled but invalid ID'],['-1','Filled but invalid ID'],['8',operatorNameWhitespace]]));
+      const before=await backlogEvidence(),metadata=await corporateMetadata();
+      const excludedBefore=(await outbox()).filter(e=>excluded.has(e.source_id));
       const already=(await local.query("SELECT payload FROM olos_http.corporate_outbox WHERE source_id='1000000'")).rows[0].payload;
       await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_,i) => `$${i+1}`).join(',')})`,columns.map(c => already[c]));
       await remote.query("UPDATE raw.olos_calls SET kommo_event_hash='keep',kommo_lead_id_encontrado=123,kommo_tentativas=7");
@@ -1654,8 +1788,9 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
         }
         const p=projection((await corporateSchema(remote,cfg.corporateDelivery!,false)).shape,'d',false,cfg.corporateDelivery!.connection);
         const delivered=(await remote.query(`SELECT ${p.sql} FROM raw.olos_calls d WHERE d.internal_id_olos>2 ORDER BY d.internal_id_olos`)).rows;
-        assert.deepEqual(delivered,before.frozen.filter(e => Number(e.source_id)>=1000000 && Number(e.source_id)<1001850).map(e => e.payload));
-        assert.equal((await local.query("SELECT count(*)::int AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n,2);
+        assert.deepEqual(delivered,before.frozen.filter(e => Number(e.source_id)>=1000000 && Number(e.source_id)<1001859 && !excluded.has(e.source_id)).map(e => e.payload));
+        assert.equal((await local.query("SELECT count(*)::int AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n,11);
+        assert.deepEqual((await outbox()).filter(e=>excluded.has(e.source_id)),excludedBefore);
         assert.deepEqual(await backlogEvidence(),before); assert.deepEqual(await corporateMetadata(),metadata);
         assert.equal((await control()).paused,true); assert.equal((await control()).blocked,false); assert.equal(calls,0);
         await local.query("UPDATE olos_http.reads SET request_ms=123 WHERE id=$1",[preservedHistoryRead]);

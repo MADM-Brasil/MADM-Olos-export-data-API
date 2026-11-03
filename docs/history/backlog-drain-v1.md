@@ -38,6 +38,11 @@ Não há defaults ilimitados, daemon, agendamento ou wrapper de retry. A primeir
 
 ## Homologação inicial de 100
 
+Admissão posterior à base `ee52c7e`: a seleção exige AgentId válido e `nome_agente`
+congelado preenchido antes do LIMIT. Planos anteriores incompatíveis exigem
+cancelamento autorizado; intenções incertas preservam sua reconciliação original.
+Ver [política e homologação somente com operador](identified-operator-import-v1.md).
+
 Em uma janela autorizada, após verificar os pré-requisitos, revisar este plano:
 
 ```bash

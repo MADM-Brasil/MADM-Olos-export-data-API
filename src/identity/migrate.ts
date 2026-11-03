@@ -9,6 +9,7 @@ import { SyncError } from '../corporate-sync/errors.js';
 import { columns, projection, mapRow } from '../corporate-sync/mapping.js';
 import { corporateSchema, matches } from '../corporate-delivery/contract.js';
 import { deliveryDigest } from '../corporate-delivery/payload.js';
+import { hasIdentifiedOperator } from '../corporate-delivery/identified-operator.js';
 import { lockRemoteSelection, selectedRows, type SelectedEntry } from '../corporate-delivery/selective-commit.js';
 import { assertLocalConsumersCompatible } from '../corporate-delivery/local-consumers.js';
 import { historyHomologation, preservedHistoryRead } from '../corporate-delivery/preserved-history.js';
@@ -79,6 +80,7 @@ async function entries(db:PoolClient,cfg:Config,ids:string[],kind:Kind,shape:Awa
   if(!/^[a-f0-9]{64}$/.test(e.source_hash))throw new SyncError('IDENTITY_SOURCE_HASH_INVALID');
   if(!e.eligible||e.source_hash!==e.record_hash||e.target_id!==e.record_target_id||e.target_table!=='"raw"."olos_calls"'||!['capture','legacy_backlog','legacy_receipt'].includes(e.origin)||e.state!==kind||Object.keys(e.payload).length!==14||columns.some(c=>!Object.hasOwn(e.payload,c)))throw new SyncError('IDENTITY_RECEIPT_INVALID');
   if(kind==='pending'&&(e.receipt||e.remote_raw_id))throw new SyncError('IDENTITY_RECEIPT_EXISTS');
+  if(kind==='pending'&&!hasIdentifiedOperator(e))throw new SyncError('IDENTITY_OPERATOR_REQUIRED');
   if(e.receipt&&JSON.parse(e.receipt).payload_hash!==e.payload_hash)throw new SyncError('IDENTITY_RECEIPT_INVALID');
   if(e.source_id===e.target_id)throw new SyncError('IDENTITY_ALREADY_ORIGINAL');
   if((await db.query(`SELECT 1 FROM olos_http.records WHERE target_table=$1 AND target_id=$2
@@ -234,6 +236,10 @@ export async function identityCommand(cfg:Config,request:Request,hooks:IdentityH
    await db.query("UPDATE olos_http.identity_runs SET state='cancelled',finished_at=clock_timestamp() WHERE id=$1",[p.id]);await event(db,p.id,'CANCELLED');await db.query('COMMIT');return result({...p,state:'cancelled'});
   }
   if(request.action==='reconcile'&&p.state!=='intent'||request.action==='execute'&&p.state!=='planned')throw new SyncError('IDENTITY_RECONCILIATION_REQUIRED');
+  // Preserve old manifests and their authorization. A pending plan incompatible
+  // with current admission must be explicitly cancelled, never trimmed/rebuilt.
+  // Completed runs and confirmed/uncertain deliveries retain their old evidence.
+  if(request.action==='execute'&&m.kind==='pending'&&m.entries.some(e=>!hasIdentifiedOperator(e)))throw new SyncError('IDENTITY_OPERATOR_PLAN_CANCEL_REQUIRED');
   // Both databases are fenced before checking absence or changing identity.
   await guard(db,cfg,request.action==='reconcile');
   remote=await connect(cfg.corporateDelivery.connection,'destination');const shape=await remoteBegin(remote,cfg,m.schema);

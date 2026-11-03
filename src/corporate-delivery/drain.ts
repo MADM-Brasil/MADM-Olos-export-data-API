@@ -12,6 +12,7 @@ import { columns, quote, type Shape } from '../corporate-sync/mapping.js';
 import { corporateSchema, matches } from './contract.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { operatorColumn } from './payload.js';
+import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace } from './identified-operator.js';
 import { preservedHistoryRead } from './preserved-history.js';
 import { lockRemoteSelection, selectedRows, type SelectedEntry } from './selective-commit.js';
 import { drainConsent, drainHash, validateDrainLimits, validateDrainRequest, type DrainLimits, type DrainRequest } from './drain-request.js';
@@ -125,6 +126,8 @@ async function batchEntries(local: PoolClient, run: Run, batch: Batch, shape: Sh
   const found=await entries(local,run.source_key,run.target_table,batch.evidence.map(e => e.source_id));
   if (drainHash(frozen(found)) !== drainHash(batch.evidence)) throw new SyncError('DRAIN_EVIDENCE_CHANGED');
   selectedRows(found,shape,cfg.corporateDelivery!);
+  // Used only for admission to a new write, never for uncertain-COMMIT reconciliation.
+  if (found.some(e => !hasIdentifiedOperator(e))) throw new SyncError('DRAIN_OPERATOR_PLAN_CANCEL_REQUIRED');
   return found;
 }
 async function load(local: PoolClient, runId: string) {
@@ -167,12 +170,17 @@ async function plan(store: Store, cfg: Config, limits: DrainLimits) {
   const first=await assertStage(local,cfg,limits,control.schema_hash);
   // LIMIT is only used to make a durable manifest; execution never selects new IDs.
   const originalOnly=await identityAdopted(local);
-  const ids=(await local.query(`SELECT o.source_id FROM olos_http.corporate_outbox o JOIN olos_http.reads h ON h.id=$2
+  const ids=(await local.query(`SELECT o.source_id FROM olos_http.corporate_outbox o
+    JOIN olos_http.records r USING(source_key,source_id) JOIN olos_http.reads h ON h.id=$2
     WHERE o.source_key=$1 AND o.state='pending' AND o.created_at<h.started_at
     AND (NOT $4::boolean OR o.target_id::text=o.source_id)
-    ORDER BY o.target_id LIMIT $3 FOR UPDATE OF o NOWAIT`,[cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,originalOnly])).rows.map(r => r.source_id as string);
+    AND r.agent_id ~ $5 AND jsonb_typeof(o.payload->'nome_agente')='string'
+    AND btrim(o.payload->>'nome_agente',$6)<>''
+    ORDER BY o.target_id LIMIT $3 FOR UPDATE OF o,r NOWAIT`,
+  [cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,originalOnly,identifiedAgentPattern,operatorNameWhitespace])).rows.map(r => r.source_id as string);
   if (!ids.length || first && ids.length !== 100) throw new SyncError('DRAIN_INSUFFICIENT_BACKLOG');
   const selected=await entries(local,cfg.sourceKey,store.target,ids);
+  if (selected.some(e => !hasIdentifiedOperator(e))) throw new SyncError('DRAIN_OPERATOR_REQUIRED');
   const remote=await connect(remoteConfig(cfg,limits),'destination');
   try {
     await remote.query('BEGIN READ ONLY');
@@ -321,8 +329,12 @@ async function execute(store: Store, cfg: Config, request: Extract<DrainRequest,
     await local.query('ROLLBACK'); log('corporate_drain_replay',{run_id:run.run_id,state:run.state}); return;
   }
   if (run.state !== 'planned') throw new SyncError(drainBlock);
-  await guard(local,cfg,store.target,run);
+  const {control}=await guard(local,cfg,store.target,run);
   await assertStage(local,cfg,run.limits,run.schema_hash);
+  // Check the entire frozen plan before starting even its first batch. Old plans
+  // are never filtered, rehashed or partially delivered under the new policy.
+  // Rejection leaves a planned run available for the existing authorized cancel.
+  for (const batch of batches) await batchEntries(local,run,batch,new Map(control.destination_shape),cfg);
   await local.query("UPDATE olos_http.corporate_drain_runs SET state='running' WHERE run_id=$1",[run.run_id]);
   await local.query(`UPDATE olos_http.corporate_control SET paused=true,blocked=true,last_code=$1,next_attempt_at=NULL,updated_at=now()
     WHERE singleton`,[drainBlock]);

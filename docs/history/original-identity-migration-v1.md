@@ -40,6 +40,11 @@ Limites fixos: um lote atômico por invocação; tamanhos 3, 100, 250, 500 ou 1.
 
 ## Pendentes: somente alterações locais
 
+Admissão posterior à base `ee52c7e`: pendentes precisam de AgentId válido e
+`nome_agente` congelado preenchido. Listas mistas são rejeitadas integralmente;
+planos anteriores incompatíveis exigem cancelamento autorizado. Ver
+[política e homologação somente com operador](identified-operator-import-v1.md).
+
 O plano exige três pendentes reais escolhidos por source_id. **Os três exemplos já confirmados não podem ser apresentados como pendentes.** O comando recusa recibo confirmado na outbox ou em corporate_sync.receipts. Confere source/target/hash, origem, 14 campos, linha local quando existir, colisões em mapping/outbox/raw/recibos e duplicidade lógica local.
 
 Na MADM abre uma transação SERIALIZABLE com fence remoto e lock SHARE ROW EXCLUSIVE: revalida ausência dos IDs antigos/novos e da identidade lógica completa. Esse lock protege contra DML de outros clientes durante a prova; a transação é aberta com capacidade de locks e **não emite DML ou COMMIT corporativo**. Termina em ROLLBACK. A ausência verificada não é garantia permanente depois de liberar o lock: a entrega posterior repete sua validação.
