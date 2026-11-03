@@ -14,6 +14,8 @@ import type { SchedulerRepository, Settings } from '../src/admin/repository.js';
 import { columns, digest, mapRow, projection, type Row } from '../src/corporate-sync/mapping.js';
 import { corporateSchema } from '../src/corporate-delivery/contract.js';
 import { assertNoDirectOwnership } from '../src/corporate-sync/ownership.js';
+import { selectiveCommitBlock } from '../src/corporate-delivery/selective-commit.js';
+import type { DeliveryHooks } from '../src/corporate-delivery/delivery.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { SyncError } from '../src/corporate-sync/errors.js';
 import { fixture } from './corporate-sync.fixture.js';
@@ -616,6 +618,337 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       } finally {
         await close(restarted);
       }
+    });
+
+    const selectedIds = ['35091119','35091120','35091121'];
+    const selected = { sourceIds: selectedIds, confirmation: `AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${selectedIds.join(',')}` };
+    async function selectiveFixture() {
+      const cfg = await pausedQueue();
+      await local.query(await readFile(new URL('../migrations/003_selective_commit.sql', import.meta.url), 'utf8'));
+      const s = await open(cfg);
+      await local.query("SELECT setval(pg_get_serial_sequence('raw.olos_calls','internal_id_olos'),725284)");
+      await stage(s, selectedIds.map((id, i) => record(Number(id), { CallId: String(35458016 + i) })));
+      await close(s); return cfg;
+    }
+    async function selectiveRun(cfg: Config, hooks: DeliveryHooks = {}, selection = selected) {
+      const s = new Store(cfg);
+      try { await s.open(); await s.delivery!.deliverSelected(selection, hooks); }
+      finally { await s.close(); }
+    }
+    const unresolvedCommit = async () => (await local.query("SELECT * FROM olos_http.corporate_selective_commits WHERE state='unresolved'")).rows[0];
+    const reconciliationFor = (attemptId: string, ids = selectedIds) => ({ sourceIds: ids, attemptId,
+      confirmation: `AUTHORIZE_EXPORTDATA_SELECTIVE_RECONCILIATION:${attemptId}:${ids.join(',')}` });
+    async function reconcileRun(cfg: Config, hooks: DeliveryHooks = {}, selection?: ReturnType<typeof reconciliationFor>) {
+      const request = selection ?? reconciliationFor((await unresolvedCommit()).attempt_id);
+      const s = new Store(cfg);
+      try { await s.open(); await s.delivery!.reconcileSelected(request, hooks); }
+      finally { await s.close(); }
+    }
+    async function assertQuarantined(cfg: Config) {
+      assert.equal((await control()).blocked, true); assert.equal((await control()).paused, true);
+      assert.equal((await control()).last_code, selectiveCommitBlock);
+      assert.ok(await unresolvedCommit());
+      await assert.rejects(selectiveRun(cfg), /CORPORATE_DELIVERY_BLOCKED/);
+    }
+    const otherReceipts = async () => (await local.query(
+      'SELECT * FROM olos_http.corporate_outbox WHERE NOT(source_id=ANY($1::text[])) ORDER BY target_id', [selectedIds])).rows;
+    const selectedReceipts = async () => (await local.query(
+      'SELECT * FROM olos_http.corporate_outbox WHERE source_id=ANY($1::text[]) ORDER BY target_id', [selectedIds])).rows;
+
+    await t.test('selective: exactly requested IDs, old queue unchanged, paused throughout and replay idempotent', async () => {
+      const cfg = await selectiveFixture(), before = await otherReceipts(), frozen = await selectedReceipts();
+      await selectiveRun(cfg, { beforeRemoteCommit: async () => {
+        assert.equal((await control()).paused, true);
+        assert.equal((await control()).confirmed_count, '2');
+        assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+        assert.equal(await destinationCount(), 2);
+      } });
+      const delivered = (await remote.query('SELECT internal_id_olos,olos_call_id FROM raw.olos_calls WHERE internal_id_olos>=725285 ORDER BY internal_id_olos')).rows;
+      assert.deepEqual(delivered, [725285,725286,725287].map((id,i) => ({ internal_id_olos: id, olos_call_id: String(35458016+i) })));
+      assert.equal(await destinationCount(), 5);
+      assert.deepEqual(await otherReceipts(), before);
+      const receipts = await selectedReceipts();
+      for (let i = 0; i < receipts.length; i++) {
+        assert.equal(receipts[i].state, 'confirmed');
+        for (const key of ['payload','payload_hash','source_hash','target_id','source_id','origin']) assert.deepEqual(receipts[i][key], frozen[i][key]);
+      }
+      assert.equal((await control()).paused, true); assert.equal((await control()).confirmed_count, '5');
+      await selectiveRun(cfg);
+      assert.deepEqual(await selectedReceipts(), receipts);
+      assert.deepEqual(await otherReceipts(), before);
+      assert.equal((await control()).confirmed_count, '5'); assert.equal(await destinationCount(), 5);
+      const s = await open(cfg); await s.delivery!.tick(); s.delivery!.kick(); await s.delivery!.settle(); await close(s);
+      assert.deepEqual(await otherReceipts(), before); assert.equal(await destinationCount(), 5);
+    });
+    await t.test('selective: unknown COMMIT persists across restart; only authorized reconciliation confirms existing rows', async () => {
+      const cfg = await selectiveFixture(), before = await otherReceipts();
+      await assert.rejects(selectiveRun(cfg, { afterRemoteCommit: async () => { throw new Error('lost commit acknowledgement'); } }), /CORPORATE_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(), 5);
+      assert.ok((await selectedReceipts()).every(r => r.state === 'pending' && r.remote_raw_id === null));
+      assert.equal((await control()).confirmed_count, '2'); assert.equal((await control()).paused, true);
+      await remote.query("UPDATE raw.olos_calls SET arquivo_origem='corporate',kommo_tentativas=7,kommo_status_processamento='processed' WHERE internal_id_olos>=725285");
+      const remoteBefore = (await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+      const identityBefore = (await remote.query('SELECT last_value,is_called FROM raw.olos_calls_raw_olos_call_id_seq')).rows;
+      await assertQuarantined(cfg);
+      await reconcileRun(cfg);
+      assert.equal((await control()).blocked, false); assert.equal((await control()).paused, true);
+      assert.equal(await unresolvedCommit(), undefined);
+      await selectiveRun(cfg);
+      assert.deepEqual((await remote.query('SELECT last_value,is_called FROM raw.olos_calls_raw_olos_call_id_seq')).rows, identityBefore);
+      assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows, remoteBefore);
+      assert.deepEqual(await otherReceipts(), before); assert.equal((await control()).confirmed_count, '5');
+    });
+    await t.test('selective: remote rollback and local acknowledgement failure remain replayable without duplicate receipts', async () => {
+      const cfg = await selectiveFixture(), before = await otherReceipts();
+      await assert.rejects(selectiveRun(cfg, { beforeRemoteCommit: async () => { throw Object.assign(new Error('rollback'), { code: '40001' }); } }), /DATABASE_TRANSIENT_FAILURE/);
+      assert.equal(await destinationCount(), 2); assert.equal((await control()).confirmed_count, '2');
+      assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+      await assert.rejects(selectiveRun(cfg, { beforeLocalCommit: async () => { throw new Error('local commit failed'); } }), /local commit failed/);
+      assert.equal(await destinationCount(), 5); assert.equal((await control()).confirmed_count, '2');
+      assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+      await assertQuarantined(cfg); await reconcileRun(cfg);
+      await selectiveRun(cfg); assert.equal(await destinationCount(), 5);
+      assert.equal((await control()).confirmed_count, '5'); assert.equal((await control()).paused, true);
+      assert.deepEqual(await otherReceipts(), before);
+    });
+    await t.test('selective: real remote session loss at COMMIT leaves every receipt pending', async () => {
+      const cfg = await selectiveFixture();
+      await assert.rejects(selectiveRun(cfg, { beforeRemoteCommit: async () => {
+        const killed = await remote.query(`SELECT pg_terminate_backend(pid) AS ok FROM pg_stat_activity
+          WHERE datname=current_database() AND application_name='corporate-sync' AND state='idle in transaction'`);
+        assert.equal(killed.rowCount, 1); assert.equal(killed.rows[0].ok, true);
+      } }), /CORPORATE_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(), 2); assert.equal((await control()).last_code, selectiveCommitBlock);
+      assert.equal((await control()).confirmed_count, '2'); assert.equal((await control()).paused, true);
+      assert.ok((await selectedReceipts()).every(r => r.state === 'pending' && r.remote_raw_id === null));
+      await assertQuarantined(cfg);
+      await reconcileRun(cfg);
+      assert.equal(await destinationCount(), 2); assert.equal((await control()).confirmed_count, '2');
+      assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+      assert.equal((await control()).blocked, false); assert.equal((await control()).paused, true);
+      await selectiveRun(cfg); assert.equal(await destinationCount(), 5);
+    });
+    await t.test('selective quarantine survives local session loss after remote COMMIT; general resume cannot bypass it', async () => {
+      const cfg = await selectiveFixture(), s = new Store(cfg);
+      await s.open();
+      const pid = (await s.client!.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      try {
+        await assert.rejects(s.delivery!.deliverSelected(selected, { afterRemoteCommit: async () => {
+          await local.query('SELECT pg_terminate_backend($1)', [pid]);
+          await pause(30);
+          throw new Error('owner lost with acknowledgement');
+        } }), /CORPORATE_COMMIT_UNKNOWN/);
+      } finally { await s.close(); }
+      assert.equal(await destinationCount(), 5); await assertQuarantined(cfg);
+      await assert.rejects(corporateControl(makeConfig(), 'corporate-resume'), /CORPORATE_DELIVERY_BLOCKED/);
+      const general = await open(makeConfig());
+      try { await general.delivery!.tick(); } finally { await close(general); }
+      assert.equal((await control()).blocked, true); assert.equal((await control()).confirmed_count, '2');
+      await reconcileRun(cfg); assert.equal((await control()).confirmed_count, '5');
+    });
+    await t.test('selective durable intent survives interruption before remote COMMIT and reconciles absence without writing', async () => {
+      const cfg = await selectiveFixture();
+      await assert.rejects(selectiveRun(cfg, { afterSelectiveIntent: async () => { throw new Error('interruption'); } }), /CORPORATE_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(), 2); await assertQuarantined(cfg);
+      await reconcileRun(cfg);
+      assert.equal(await destinationCount(), 2); assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+      assert.equal((await control()).blocked, false); assert.equal((await control()).paused, true);
+    });
+    await t.test('selective revalidates frozen payload after durable intent releases row locks', async () => {
+      const cfg = await selectiveFixture();
+      await assert.rejects(selectiveRun(cfg, { afterSelectiveIntent: async () => {
+        await local.query("UPDATE olos_http.corporate_outbox SET payload=jsonb_set(payload,'{olos_call_id}','\"changed\"') WHERE source_id='35091120'");
+      } }), /CORPORATE_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(), 2); await assertQuarantined(cfg);
+      await assert.rejects(reconcileRun(cfg), /CORPORATE_PAYLOAD_CHANGED/);
+      await assertQuarantined(cfg);
+    });
+    await t.test('selective reconciliation requires exact attempt, full selection and separate consent; divergences retain quarantine', async () => {
+      const cfg = await selectiveFixture(), others = await otherReceipts();
+      await assert.rejects(selectiveRun(cfg, { afterRemoteCommit: async () => { throw new Error('unknown'); } }), /CORPORATE_COMMIT_UNKNOWN/);
+      const attempt = await unresolvedCommit(), receipts = await selectedReceipts();
+      await assert.rejects(reconcileRun(cfg, {}, { ...reconciliationFor(attempt.attempt_id), confirmation: selected.confirmation }), /WRITE_NOT_AUTHORIZED/);
+      await assert.rejects(reconcileRun(cfg, {}, reconciliationFor('00000000-0000-4000-8000-000000000001')), /SELECTIVE_ATTEMPT_MISMATCH/);
+      await assert.rejects(reconcileRun(cfg, {}, reconciliationFor(attempt.attempt_id, selectedIds.slice(0,2))), /SELECTIVE_COMMIT_EVIDENCE_CHANGED/);
+      await assert.rejects(reconcileRun(cfg, {}, reconciliationFor(attempt.attempt_id, ['900001'])), /SELECTIVE_COMMIT_EVIDENCE_CHANGED/);
+      await remote.query("UPDATE raw.olos_calls SET olos_call_id='divergent' WHERE internal_id_olos=725286");
+      const divergent = (await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows;
+      await assert.rejects(reconcileRun(cfg), /INTERNAL_ID_COLLISION/);
+      assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls ORDER BY raw_olos_call_id')).rows, divergent);
+      assert.deepEqual(await selectedReceipts(), receipts); assert.deepEqual(await otherReceipts(), others);
+      assert.deepEqual(await unresolvedCommit(), attempt); await assertQuarantined(cfg);
+    });
+    await t.test('selective reconciliation rejects changed local hashes and remote schema without clearing quarantine', async () => {
+      const cfg = await selectiveFixture();
+      await assert.rejects(selectiveRun(cfg, { afterRemoteCommit: async () => { throw new Error('unknown'); } }), /CORPORATE_COMMIT_UNKNOWN/);
+      const original = (await selectedReceipts())[0];
+      await local.query("UPDATE olos_http.corporate_outbox SET payload_hash=repeat('f',64) WHERE source_id='35091119'");
+      await assert.rejects(reconcileRun(cfg), /SELECTIVE_COMMIT_EVIDENCE_CHANGED/);
+      await local.query("UPDATE olos_http.corporate_outbox SET payload_hash=$1 WHERE source_id='35091119'", [original.payload_hash]);
+      await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN raw_olos_call_id SET GENERATED BY DEFAULT');
+      await assert.rejects(reconcileRun(cfg), /CORPORATE_IDENTITY_ALWAYS_REQUIRED/);
+      await assertQuarantined(cfg); assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+    });
+    await t.test('selective reconciliation refuses absence while a remote transaction still holds its fence', async () => {
+      const cfg = await selectiveFixture();
+      await assert.rejects(selectiveRun(cfg, { afterSelectiveIntent: async () => { throw new Error('stop'); } }), /CORPORATE_COMMIT_UNKNOWN/);
+      await remote.query('BEGIN'); await remote.query('SELECT pg_advisory_xact_lock(17320914,5)');
+      try { await assert.rejects(reconcileRun(cfg), /SELECTIVE_REMOTE_TRANSACTION_ACTIVE/); }
+      finally { await remote.query('ROLLBACK'); }
+      await assertQuarantined(cfg); assert.equal(await destinationCount(), 2);
+      await reconcileRun(cfg); assert.equal(await destinationCount(), 2);
+    });
+    await t.test('selective reconciliation commit failures roll back receipts, journal resolution and unblock atomically', async () => {
+      const cfg = await selectiveFixture();
+      await assert.rejects(selectiveRun(cfg, { afterRemoteCommit: async () => { throw new Error('unknown'); } }), /CORPORATE_COMMIT_UNKNOWN/);
+      const before = await selectedReceipts(), attempt = await unresolvedCommit();
+      for (const hooks of [
+        { afterRemoteCommit: async () => { throw new Error('reconciliation read commit lost'); } },
+        { beforeLocalCommit: async () => { throw new Error('reconciliation local commit failed'); } }
+      ]) {
+        await assert.rejects(reconcileRun(cfg, hooks), /reconciliation/);
+        assert.deepEqual(await selectedReceipts(), before); assert.deepEqual(await unresolvedCommit(), attempt);
+        await assertQuarantined(cfg);
+      }
+      await reconcileRun(cfg);
+      const resolved = (await local.query('SELECT * FROM olos_http.corporate_selective_commits WHERE attempt_id=$1', [attempt.attempt_id])).rows[0];
+      assert.equal(resolved.state, 'reconciled'); assert.equal(resolved.outcome.length, 3);
+      assert.ok(resolved.outcome.every((row: any) => row.remote_raw_id));
+      await assert.rejects(reconcileRun(cfg, {}, reconciliationFor(attempt.attempt_id)), /SELECTIVE_RECONCILIATION_NOT_PENDING/);
+      assert.equal((await control()).confirmed_count, '5');
+    });
+    await t.test('selective commands require local migration; old untracked UNKNOWN cannot be retried selectively', async () => {
+      const cfg = await selectiveFixture();
+      await local.query('DROP TABLE olos_http.corporate_selective_commits');
+      await assert.rejects(selectiveRun(cfg), /SELECTIVE_COMMIT_MIGRATION_REQUIRED/);
+      await local.query(await readFile(new URL('../migrations/003_selective_commit.sql', import.meta.url), 'utf8'));
+      await local.query("UPDATE olos_http.corporate_control SET last_code='CORPORATE_COMMIT_UNKNOWN'");
+      await assert.rejects(selectiveRun(cfg), /SELECTIVE_UNTRACKED_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(), 2);
+    });
+    await t.test('selective: connection refusal sends nothing and returns failure', async () => {
+      const cfg = await selectiveFixture();
+      cfg.corporateDelivery!.connection.destinationUrl = 'postgresql://postgres@localhost:1/madm';
+      await assert.rejects(selectiveRun(cfg), /DATABASE_TRANSIENT_FAILURE/);
+      assert.equal(await destinationCount(), 2); assert.equal((await control()).confirmed_count, '2');
+      assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+      assert.equal((await control()).paused, true);
+    });
+    await t.test('selective: divergent identity blocks the entire set and cannot be skipped on replay', async () => {
+      const cfg = await selectiveFixture();
+      const payload = (await selectedReceipts())[1].payload;
+      await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_,i) => `$${i+1}`).join(',')})`,
+        columns.map(name => name === 'olos_call_id' ? 'divergent' : payload[name]));
+      await assert.rejects(selectiveRun(cfg), /INTERNAL_ID_COLLISION/);
+      assert.equal(await destinationCount(), 3); assert.equal((await control()).blocked, true);
+      assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+      await assert.rejects(selectiveRun(cfg), /CORPORATE_DELIVERY_BLOCKED/);
+      assert.equal((await control()).paused, true);
+    });
+    await t.test('selective: missing IDs and invalid receipt mappings fail before any remote write', async () => {
+      for (const mutate of [
+        () => local.query("DELETE FROM olos_http.corporate_outbox WHERE source_id='35091120'"),
+        () => local.query("UPDATE olos_http.corporate_outbox SET source_hash='invalid' WHERE source_id='35091120'"),
+        () => local.query("UPDATE olos_http.corporate_outbox SET origin='legacy_backlog' WHERE source_id='35091120'")
+      ]) {
+        const cfg = await selectiveFixture(); await mutate();
+        await assert.rejects(selectiveRun(cfg), /SELECTIVE_RECEIPT_INVALID/);
+        assert.equal(await destinationCount(), 2); assert.equal((await control()).confirmed_count, '2');
+      }
+    });
+    await t.test('selective: invalid frozen hash, payload and schema never deliver a subset', async () => {
+      for (const [mutate, error] of [
+        [() => local.query("UPDATE olos_http.corporate_outbox SET payload_hash=repeat('a',64) WHERE source_id='35091120'"), /CORPORATE_PAYLOAD_CHANGED/],
+        [() => local.query("UPDATE olos_http.corporate_outbox SET payload=jsonb_set(payload,'{olos_call_id}','null') WHERE source_id='35091120'"), /REQUIRED_VALUE_MISSING/],
+        [() => remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN raw_olos_call_id SET GENERATED BY DEFAULT'), /CORPORATE_IDENTITY_ALWAYS_REQUIRED/]
+      ] as const) {
+        const cfg = await selectiveFixture(); await mutate();
+        await assert.rejects(selectiveRun(cfg), error);
+        assert.equal(await destinationCount(), 2); assert.equal((await control()).paused, true);
+        assert.ok((await selectedReceipts()).every(r => r.state === 'pending'));
+      }
+    });
+    await t.test('selective: a confirmed receipt with missing remote proof is never silently recreated', async () => {
+      const cfg = await selectiveFixture(); await selectiveRun(cfg);
+      const receipts = await selectedReceipts();
+      await remote.query('DELETE FROM raw.olos_calls WHERE internal_id_olos=725286');
+      await assert.rejects(selectiveRun(cfg), /SELECTIVE_CONFIRMED_RECEIPT_DIVERGES/);
+      assert.equal(await destinationCount(), 4); assert.deepEqual(await selectedReceipts(), receipts);
+    });
+    await t.test('selective: source, sync, history and delivery locks reject concurrency', async () => {
+      for (const [sql, params, error] of [
+        ['SELECT pg_advisory_lock(hashtextextended($1,0))', [`olos-http:AttemptsRawData:${base.OLOS_SOURCE_KEY}`], /CONSUMER_ALREADY_ACTIVE/],
+        ['SELECT pg_advisory_lock(17320914,1)', [], /CORPORATE_SYNC_STILL_RUNNING/],
+        ['SELECT pg_advisory_lock(hashtextextended($1,0))', [`olos-http:history:${base.OLOS_SOURCE_KEY}`], /HISTORY_CAPTURE_ACTIVE/],
+        ['SELECT pg_advisory_lock(17320914,4)', [], /CORPORATE_DELIVERY_BUSY/]
+      ] as const) {
+        const cfg = await selectiveFixture(); await local.query(sql, [...params]);
+        try { await assert.rejects(selectiveRun(cfg), error); }
+        finally { await local.query('SELECT pg_advisory_unlock_all()'); }
+        assert.equal(await destinationCount(), 2); assert.equal((await control()).paused, true);
+      }
+    });
+    await t.test('selective: same-owner overlap rejected, pause/resume cannot interleave with remote transaction', async () => {
+      const cfg = await selectiveFixture(), s = await open(cfg);
+      await s.delivery!.deliverSelected(selected, { beforeRemoteCommit: async () => {
+        await assert.rejects(s.delivery!.deliverSelected(selected), /CORPORATE_DELIVERY_BUSY/);
+        await local.query("SET lock_timeout='50ms'");
+        try { await assert.rejects(local.query('UPDATE olos_http.corporate_control SET paused=false'), (e: any) => e.code === '55P03'); }
+        finally { await local.query('SET lock_timeout=0'); }
+        const contender = new Store(cfg);
+        try { await assert.rejects(contender.open(), /CONSUMER_ALREADY_ACTIVE/); }
+        finally { await contender.close(); }
+      } });
+      await close(s); assert.equal(await destinationCount(), 5); assert.equal((await control()).paused, true);
+    });
+    await t.test('selective: active history intentions, unpaused and blocked states reject without delivery', async () => {
+      for (const [sql, error] of [
+        ["INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES('11111111-1111-1111-1111-111111111111','synthetic-direct','\"raw\".\"olos_calls\"','{\"kind\":\"history\"}')", /HISTORY_RECOVERY_REQUIRED/],
+        ['UPDATE olos_http.corporate_control SET paused=false', /SELECTIVE_REQUIRES_PAUSED/],
+        ['UPDATE olos_http.corporate_control SET blocked=true', /CORPORATE_DELIVERY_BLOCKED/]
+      ] as const) {
+        const cfg = await selectiveFixture(); await local.query(sql);
+        await assert.rejects(selectiveRun(cfg), error); assert.equal(await destinationCount(), 2);
+      }
+    });
+    await t.test('selective CLI: explicit consent, no API calls, no scheduler changes and nonzero exit on conflict', async () => {
+      await selectiveFixture();
+      await local.query(await readFile(new URL('../admin/migrations/002_worker_administration.sql', import.meta.url), 'utf8'));
+      const admin = new AdminRepository(localUrl.toString(), base.OLOS_SOURCE_KEY);
+      try { await admin.open(120000, 'STOPPED'); } finally { await admin.close(); }
+      const settings = (await local.query('SELECT * FROM olos_http.worker_settings')).rows;
+      let requests = 0;
+      const server = createServer((_, res) => { requests++; res.writeHead(500); res.end(); });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const env = { ...base, ATTEMPTS_PERSISTENCE_MODE: 'corporate',
+        OLOS_CORPORATE_DATABASE_URL: remoteUrl.toString(), OLOS_CORPORATE_CA_FILE: process.env.OLOS_DIRECT_TEST_CA_FILE!,
+        OLOS_CORPORATE_WRITE_ENABLED: 'false', OLOS_BASE_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+        OLOS_USERNAME: 'synthetic', OLOS_PASSWORD: 'synthetic', OLOS_CLIENT_ID: 'synthetic', OLOS_CLIENT_SECRET: 'synthetic' };
+      const args = ['--source-ids', selectedIds.join(','), '--confirm', selected.confirmation];
+      const cli = (parameters: string[], extra: NodeJS.ProcessEnv = {}) => promisify(execFile)(process.execPath,
+        ['dist/main.js','corporate-deliver-selected', ...parameters], { env: { ...env, ...extra }, timeout: 15000 });
+      try {
+        await assert.rejects(cli([]), (e: any) => e.code === 1 && e.stdout.includes('SELECTIVE_PARAMETERS_INVALID'));
+        await assert.rejects(cli([...args.slice(0,3), 'wrong'], { DATABASE_URL: 'postgresql://postgres@127.0.0.1:1/unreachable' }),
+          (e: any) => e.code === 1 && e.stdout.includes('SELECTIVE_WRITE_NOT_AUTHORIZED'));
+        await assert.rejects(cli(args, { OLOS_CORPORATE_WRITE_ENABLED: 'true', OLOS_CORPORATE_WRITE_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_DIRECT_DELIVERY' }),
+          (e: any) => e.code === 1 && e.stdout.includes('SELECTIVE_REQUIRES_GENERAL_WRITE_DISABLED'));
+        assert.equal(await destinationCount(), 2);
+        await assert.rejects(selectiveRun(config(env), { afterRemoteCommit: async () => { throw new Error('unknown'); } }), /CORPORATE_COMMIT_UNKNOWN/);
+        await assert.rejects(cli(args), (e: any) => e.code === 1 && e.stdout.includes('CORPORATE_DELIVERY_BLOCKED'));
+        const attemptId = (await unresolvedCommit()).attempt_id;
+        const reconcileCli = (confirmation: string) => promisify(execFile)(process.execPath,
+          ['dist/main.js','corporate-reconcile-selected','--source-ids',selectedIds.join(','),'--attempt-id',attemptId,'--confirm',confirmation],
+          { env, timeout: 15000 });
+        await assert.rejects(reconcileCli(selected.confirmation), (e: any) => e.code === 1 && e.stdout.includes('SELECTIVE_WRITE_NOT_AUTHORIZED'));
+        assert.match((await reconcileCli(reconciliationFor(attemptId).confirmation)).stdout, /corporate_selected_commit_reconciled/);
+        const result = await cli(args); assert.match(result.stdout, /corporate_selected_delivery_confirmed/);
+        await cli(args); assert.equal(await destinationCount(), 5);
+        await remote.query("UPDATE raw.olos_calls SET olos_call_id='divergent' WHERE internal_id_olos=725286");
+        await assert.rejects(cli(args), (e: any) => e.code === 1 && e.stdout.includes('INTERNAL_ID_COLLISION'));
+        assert.equal(requests, 0); assert.equal((await control()).paused, true);
+        assert.deepEqual((await local.query('SELECT * FROM olos_http.worker_settings')).rows, settings);
+      } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
     });
 
     await t.test('migration is local/idempotent; activation requires reconciliation and explicit write permission', async () => {

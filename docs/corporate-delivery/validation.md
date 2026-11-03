@@ -148,3 +148,228 @@ O cenário de 12605 comprovou preservação dos hashes, recibos, checkpoints, re
 O container `olos-direct-test-1793384463-403269`, sua rede temporária e os certificados foram removidos ao final. A ausência desses recursos e de containers remanescentes nessa rede foi verificada após o término com código zero. As migrations foram executadas somente nos bancos descartáveis autorizados. O bloqueio anterior da execução dos testes está resolvido; nenhuma ativação operacional foi realizada. Os resultados históricos das demais suítes acima permanecem históricos e não foram reexecutados nesta etapa.
 
 Nenhum arquivo Billing, Corporate Sync antigo, `src/config.ts`, migration, Compose ou configuração operacional foi modificado nesta atualização. Nenhum checkpoint real foi alterado; nenhum banco real foi acessado. Alterações preexistentes foram preservadas. Sem commit, git add, push ou deploy.
+
+## Entrega seletiva — 03/11/2026
+
+> Relatório da primeira implementação. O tratamento de COMMIT incerto e a ausência
+> de migration nova descritos nesta seção foram substituídos pela correção abaixo.
+> Os testes originais aceitavam reexecução sem reconciliação e não provavam quarentena.
+
+Implementação no worktree `/home/madm/madm/export-data-v3-history`, branch
+`feature/exportdata-history`, baseada em `b95d62c`. O checkout começou limpo.
+Nenhum acesso à VPS, OLOS real ou MADM real; nenhuma homologação operacional,
+migração real, alteração do checkout original, Billing ou main, commit, push ou
+deploy. Publicação permanece sujeita a revisão e autorização separadas.
+
+### Implementação e arquivos
+
+- `src/main.ts`: comando `corporate-deliver-selected`, validação de parâmetros e
+  consentimento antes das conexões, execução no Store existente, sem API/scheduler.
+- `src/corporate-delivery/selection.ts`: limite fixo de três IDs, formato canônico,
+  rejeição de duplicatas, autorização vinculada à lista e escrita geral desabilitada.
+- `src/corporate-delivery/delivery.ts`: protocolo transacional comum ao `tick()` e
+  à seleção; locks de entrega/histórico, verificação dos mappings, seleção exata,
+  revalidação de confirmados e erro de CLI em falhas remotas.
+- `test/corporate-delivery.test.ts` e `test/corporate-delivery.integration.ts`:
+  regressões de autorização, escopo, recibos, deduplicação, falhas e concorrência.
+- `docs/corporate-delivery/README.md` e este arquivo: procedimento futuro,
+  pré-condições, garantias, limites da evidência e rollback.
+
+### Validação executada
+
+| Verificação | Resultado |
+| --- | --- |
+| `npm run typecheck` e `npm run build`, Node 24.16.0 | passaram |
+| `node --import tsx --test test/*.test.ts`, Node 24.16.0, ambiente limpo | 92/92 passaram, zero skips |
+| `node --import tsx --test test/corporate-delivery.test.ts`, após revisão final | 6/6 passaram, zero skips |
+| `bash scripts/test-corporate-delivery.sh`, PostgreSQL 16 e Node 24 | 84/84 passaram, zero skips, 30,609 s |
+| `git diff --check` | passou |
+
+O runner de integração existente cria PostgreSQL em tmpfs, rede Docker interna,
+zero portas publicadas e certificado/CA sintéticos. O Node compartilha somente o
+namespace de rede desse PostgreSQL; nenhuma configuração real é carregada.
+Migrations/DDL de preparação e testes de incompatibilidade ocorreram exclusivamente
+nesses bancos descartáveis. A API é simulada; a CLI seletiva fez **zero requisições**
+ao servidor simulado e preservou integralmente `worker_settings`.
+
+A primeira tentativa unitária em `node:24-bookworm-slim --network none` teve
+91/92 sucessos: a fixture TLS não pôde iniciar porque `openssl` não existe nessa
+imagem. A suíte inteira foi repetida com Node 24.16.0 local e ambiente limpo,
+com `openssl` disponível, passando 92/92. Não foi necessário modificar o teste TLS.
+Uma primeira integração passou 83/83; após acrescentar a interrupção real da sessão
+PostgreSQL no COMMIT e concluir os ajustes, o runner final passou 84/84.
+
+Os **13 novos cenários de integração seletiva** comprovaram:
+
+1. Exatamente os três source IDs informados, associados aos targets 725285–725287
+   e CallIds 35458016–35458018; sete pendências anteriores e dois recibos legados
+   permaneceram integralmente iguais. Pausa mantida antes/durante/depois do COMMIT.
+2. Reexecução idempotente, sem duplicação, recontagem ou alteração dos recibos
+   já confirmados; `tick()`/`kick()` continuam sem enviar a fila geral.
+3. COMMIT remoto efetivado com confirmação perdida mantém recibos pendentes;
+   reexecução reconhece as linhas completas, preserva campos corporativos e identity.
+4. Rollback remoto e falha antes do COMMIT local não produzem recibos falsos;
+   reexecução controlada completa a confirmação sem duplicação.
+5. Interrupção real da sessão remota via `pg_terminate_backend` no ponto anterior
+   ao COMMIT produz `CORPORATE_COMMIT_UNKNOWN`, sem confirmação local.
+6. Conexão recusada não envia dados e retorna falha.
+7. Colisão de identidade bloqueia o conjunto inteiro; nova execução respeita o bloqueio.
+8. ID ausente, hash de origem divergente e origem diferente de `capture` impedem escrita.
+9. Hash/payload inválido e schema remoto incompatível impedem entrega parcial.
+10. Recibo confirmado sem prova remota bloqueia sem reinserção.
+11. Locks de origem, Corporate Sync, histórico e entrega rejeitam concorrência.
+12. Duas tentativas no mesmo Store são rejeitadas; outro Store e alteração da pausa
+    não atravessam a transação ativa.
+13. Intenção histórica pendente, controle não pausado/bloqueado e autorização
+    ausente/incorreta bloqueiam; a CLI retorna erro em conflito, não chama a API
+    e não modifica o scheduler.
+
+### Garantias e limites
+
+A seleção não usa o LIMIT da fila geral nem `SKIP LOCKED`. Todos os IDs precisam
+estar presentes e válidos; nenhum registro selecionado é descartado para avançar
+os demais. O destino é `madm.raw.olos_calls`, validado antes de INSERT pelo mesmo
+contrato corporativo existente. Apenas novos recibos pendentes são confirmados,
+e somente após COMMIT remoto reconhecido. Não existe retry automático do comando,
+retomada da fila, migration nova ou mudança permanente de configuração.
+
+Os 709.682 registros pendentes e os três mappings operacionais são informações
+fornecidas pelo solicitante, não evidência coletada em produção. A preservação foi
+verificada por snapshots completos de uma fila sintética menor; não houve ensaio
+de volume com 709.682 registros. Na operação autorizada, confirmar novamente a
+contagem inicial e a redução esperada para 709.679, sem alterações dos demais itens.
+
+Permanecem sem homologação o schema/privilégios/TLS reais, latência WAN, volume e
+convivência com produtores corporativos externos aos locks cooperativos. Não há
+atomicidade distribuída: falha após COMMIT remoto pode deixar recibo local pendente;
+uma falha na confirmação do COMMIT local também exige verificar o estado durável.
+Bloqueios não devem ser removidos nem recibos alterados para forçar avanço. O
+[procedimento e rollback](README.md#entrega-administrativa-seletiva-até-três-registros)
+preservam evidências e exigem autorização separada para qualquer ação real.
+
+
+## Correção da quarentena de COMMIT seletivo incerto — 03/11/2026
+
+### Auditoria e reprodução antes da alteração
+
+O fluxo existente tratava o COMMIT incerto seletivo com a mesma expressão de
+retry da entrega geral: `terminal = !(commitIssued || retryable(error)) || failures >= maxRetries`.
+Na primeira falha, `blocked=false`. A seleção ignorava `retry_wait`, e a próxima
+invocação podia consultar/inserir no destino sem uma reconciliação distinta.
+`corporate-resume` também admitia limpar bloqueios cujo código fosse
+`CORPORATE_COMMIT_UNKNOWN`. Não havia garantia equivalente de quarentena.
+
+Antes de modificar o código, build e o runner descartável original foram
+executados: **84/84 passaram**. Os logs registraram `CORPORATE_COMMIT_UNKNOWN`,
+`blocked=false` nos testes de confirmação perdida e sessão remota interrompida;
+os próprios testes então reexecutaram a seleção com sucesso. Esse resultado
+reproduziu o defeito, em vez de demonstrar a garantia agora exigida.
+
+### Correção restrita à seleção
+
+- `src/corporate-delivery/selective-commit.ts` (novo): locks de sessão locais,
+  fence transacional remoto, leitura exata dos recibos, evidência de IDs/hashes e
+  persistência/finalização da intenção seletiva.
+- `migrations/003_selective_commit.sql` (nova, **somente local e manual**): journal
+  de tentativas, com uma única intenção não resolvida, UUID, binding, schema hash,
+  evidência congelada e resultado por registro. Não altera estrutura corporativa.
+- `src/corporate-delivery/delivery.ts`: grava intenção e bloqueio antes de emitir
+  COMMIT remoto; revalida controle, recibos e payload depois do COMMIT local da
+  intenção. COMMIT incerto e falhas posteriores mantêm intenção não resolvida.
+  Implementa reconciliação com leitura remota e resolução local atômica.
+- `src/corporate-delivery/selection.ts` e `src/main.ts`: comando administrativo
+  `corporate-reconcile-selected`, autorização diferente da entrega, vinculada a
+  UUID e lista exata de 1–3 IDs; rejeição antes das conexões quando não autorizado.
+- `test/corporate-delivery.test.ts` e `test/corporate-delivery.integration.ts`:
+  substituem as expectativas inseguras anteriores e cobrem persistência e recuperação.
+- `docs/corporate-delivery/README.md` e este relatório: pré-requisito local,
+  procedimento de reconciliação, limites e rollback revisados.
+
+O protocolo de retry da entrega geral não foi alterado. Suas regressões continuam
+passando sem aplicar a migration 003 nas respectivas fixtures. Para a seleção,
+o código persistido `SELECTIVE_COMMIT_RECONCILIATION_REQUIRED` não pertence aos
+motivos que o `resume` existente permite desbloquear; portanto não foi necessário
+mudar globalmente o `resume`. O erro de execução incerta continua sendo
+`CORPORATE_COMMIT_UNKNOWN`. O journal é persistido **antes** do COMMIT remoto para
+não depender de conseguir gravar um bloqueio depois de perder a conexão local.
+
+No sucesso normal, a intenção passa a `acknowledged` junto com os recibos, após
+COMMIT remoto reconhecido. Depois de uma falha, reiniciar ou repetir entrega não
+resolve a intenção: só a reconciliação autorizada pode fazê-lo. Isso também cobre
+interrupção antes do COMMIT remoto e falha de confirmação local após sucesso remoto,
+com bloqueio conservador. Não há timer, scheduler ou retry novo.
+
+A reconciliação usa `READ COMMITTED READ ONLY`, exige que o fence remoto da
+transação original esteja livre e faz a leitura de dados depois desse fence. Isso
+impede considerar ausente uma linha cujo COMMIT original ainda pode ocorrer.
+Verifica schema, binding, mappings, hashes, identidade, campos gerenciados e PK dos
+recibos confirmados. Divergências preservam o bloqueio; linhas idênticas permitem
+confirmar exclusivamente os recibos selecionados; ausentes ficam pendentes sem
+INSERT. Resolução do journal, recibos, contadores e desbloqueio são uma única
+transação local, mantendo `paused=true`. A entrega posterior exige outra invocação
+autorizada. Campos corporativos não gerenciados e itens fora da seleção ficam intactos.
+
+### Validação final
+
+Os comandos usam Node 24.16.0 para build/unitários e Node 24/PostgreSQL 16 no
+runner descartável existente, com rede Docker interna, zero portas publicadas,
+CA/hostname sintéticos e API simulada. Nenhuma variável operacional real é carregada.
+A migration 003 foi aplicada exclusivamente nas fixtures locais de entrega seletiva.
+
+| Verificação | Resultado |
+| --- | --- |
+| `npm run typecheck` | passou |
+| `npm run build` | passou |
+| `node --import tsx --test test/*.test.ts` | 93/93 passaram, zero skips |
+| `bash scripts/test-corporate-delivery.sh` | 92/92 passaram, zero skips |
+| `git diff --check` | passou |
+
+A primeira rodada da correção passou 91/91 integrações. A revisão acrescentou a
+revalidação do payload após o COMMIT local da intenção e um teste de alteração
+concorrente nesse intervalo; o runner final passou 92/92. A suíte unitária final
+passou 93/93. Casos relevantes executados:
+
+- COMMIT remoto efetivado com resposta perdida: nenhuma confirmação local;
+  bloqueio persiste ao fechar/reabrir Store e ao invocar a CLI em novo processo.
+- Sessão PostgreSQL remota interrompida no COMMIT: ausências só liberadas pela
+  reconciliação explícita, sem envio; nova entrega é uma ação separada.
+- Perda da sessão proprietária local após COMMIT remoto e interrupção após gravar
+  a intenção: bloqueio sobrevive sem depender do handler conseguir salvar a falha.
+- `corporate-resume`, `tick()` e nova seleção não removem a quarentena.
+- Consentimento errado, UUID errado, seleção parcial ou fora da tentativa: rejeição.
+- Identidade remota divergente, hashes/payload local alterados ou schema incompatível:
+  nenhum recibo confirmado e nenhum desbloqueio; dados divergentes preservados.
+- Fence remoto ocupado: nenhuma inferência de ausência ou desbloqueio.
+- Falha na conclusão da leitura remota ou antes do COMMIT local de reconciliação:
+  rollback de recibos, resolução e desbloqueio; intenção original permanece igual.
+- Reconciliação bem-sucedida mantém pausa, não chama API nem altera scheduler,
+  preserva identity/campos corporativos e recibos fora da seleção autorizada.
+- Reconciliação já concluída não é reaplicada; contadores não são duplicados.
+- Migration ausente e UNKNOWN antigo sem journal: rejeição segura da seleção.
+- Regressão da entrega geral continua reconhecendo seu COMMIT incerto conforme
+  o comportamento preexistente, sem depender do journal seletivo.
+
+### Limites e operação futura
+
+A migration local e privilégios SELECT/INSERT/UPDATE na nova tabela precisam de
+revisão/aplicação explícita antes de usar o comando em ambiente operacional.
+Nenhuma migration de produção foi executada. O journal não substitui backup;
+seu histórico resolvido deve ser preservado. Estado antigo `CORPORATE_COMMIT_UNKNOWN`
+sem journal não permite inferir seleção/UUID e exige procedimento manual específico,
+separadamente autorizado; não há backfill, limpeza de flags ou desbloqueio automático.
+
+Não há atomicidade distribuída. Se a confirmação do COMMIT local de reconciliação
+for perdida, consultar journal/recibos antes de repetir: ele pode já estar resolvido.
+O fence remoto coordena estas transações seletivas; produtores externos que não
+respeitam os locks continuam fora dessa garantia. O ambiente real, volume operacional,
+latência WAN e privilégios/TLS corporativos não foram homologados.
+
+Rollback exige manter pausa/escrita geral desabilitada e preservar o journal.
+Não retornar ao seletor anterior nem limpar flags enquanto houver `unresolved`.
+Não apagar chamadas/recibos ou desfazer somente um dos bancos. Incerteza remota
+precisa de reconciliação antes de qualquer retomada.
+
+Trabalho restrito ao worktree `export-data-v3-history`, branch
+`feature/exportdata-history`; alterações anteriores e o arquivo não rastreado `=`
+foram preservados. Sem commit, push, deploy, acesso à VPS ou MADM real, alteração da
+branch main, Billing ou worktree original.

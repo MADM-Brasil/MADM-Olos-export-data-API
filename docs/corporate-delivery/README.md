@@ -162,3 +162,178 @@ Para validar uma publicação seletiva, exportar somente o índice Git para um d
 9. Retomar o agendador atual, acompanhar captura e entrega separadamente e dimensionar o lote sem criar outro serviço ou scheduler.
 
 Rollback operacional seguro: pausar entrega e/ou parar o mesmo worker, manter o modo/configuração coerente com o estado adotado e preservar outbox/recibos. Não voltar simplesmente ao modo local nem reiniciar o Sync antigo; as proteções impedem esse retorno porque ele pode perder IDs/entregas pendentes. Retorno ao protocolo antigo exige plano específico de conciliação. Não deletar chamadas MADM, não executar down migration e não limpar o marcador de ownership para contornar o bloqueio.
+
+## Entrega administrativa seletiva (até três registros)
+
+`corporate-deliver-selected` usa o mesmo Store e Corporate Delivery, com seleção
+exclusiva por `(source_key, source_id)`. Não chama `tick()` para drenar a fila,
+`resume()`, API OLOS, migração ou agendador. A autorização vale apenas para a lista
+literal informada. Não autoriza publicação, deploy nem execução operacional.
+
+Pré-condições para uma **futura janela separadamente revisada e autorizada**:
+
+1. Usar a versão revisada no serviço existente, com o consumidor parado para
+   liberar o lock da origem. Não iniciar outro worker ou Corporate Sync.
+2. Preservar a configuração de destino, binding, CA/TLS e contrato temporal já
+   conciliados. Exigir `ready=true`, `paused=true`, `blocked=false` e
+   `OLOS_CORPORATE_WRITE_ENABLED=false`. Aplicar previamente, apenas no banco local
+   e em janela autorizada, `migrations/003_selective_commit.sql`. O comando não
+   executa migrations nem modifica configurações de ambiente. O papel local da
+   aplicação precisa de SELECT/INSERT/UPDATE na nova tabela; conceder privilégios
+   explicitamente na implantação revisada, sem ampliar o papel corporativo.
+3. Verificar ausência de captura histórica ativa ou intenção histórica pendente
+   (`reading`/`received`). Não descartar intenções para liberar a entrega.
+4. Conferir localmente os três mappings abaixo, hashes e payloads congelados;
+   registrar a contagem pendente e evidência dos itens fora da seleção antes/depois.
+   Os valores foram fornecidos pelo solicitante; não foram auditados no ambiente real.
+
+| source_id | target_id | payload.olos_call_id |
+| --- | --- | --- |
+| 35091119 | 725285 | 35458016 |
+| 35091120 | 725286 | 35458017 |
+| 35091121 | 725287 | 35458018 |
+
+Comando proposto, **não executado em ambiente real**. Pressupõe as variáveis
+operacionais corretas já carregadas no processo, sem exportar nova autorização geral:
+
+```sh
+env OLOS_CORPORATE_WRITE_ENABLED=false \
+  node dist/main.js corporate-deliver-selected \
+  --source-ids 35091119,35091120,35091121 \
+  --confirm AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:35091119,35091120,35091121
+```
+
+O formato é estrito: entre um e três inteiros positivos canônicos de até 64 bits,
+sem repetição, espaços, intervalos ou argumentos adicionais. A confirmação deve
+conter a mesma lista na mesma ordem. Autorização ausente/incorreta falha antes de
+abrir conexões. A autorização geral `AUTHORIZE_EXPORTDATA_DIRECT_DELIVERY` não
+substitui essa confirmação; escrita geral habilitada também bloqueia o comando.
+
+O Store mantém os locks de origem e Corporate Sync. A transação toma o lock
+exclusivo de entrega `(17320914,4)`, também usado por `tick()`, além do lock
+compartilhado de captura histórica. Na entrega seletiva esses locks são de sessão
+e sobrevivem ao COMMIT local da intenção. Control e recibos
+são bloqueados sem espera na seleção. Nenhum caminho usa `SKIP LOCKED`: um item
+ocupado, ausente, divergente ou inválido impede o conjunto. `origin` deve ser
+`capture`, e o mapping de cada recibo deve coincidir com `olos_http.records`.
+
+O estado `paused` permanece verdadeiro durante a transação e após ela; não existe
+janela temporária de retomada. Os mesmos contratos de schema, hash, identidade
+composta, deduplicação, TLS e campos corporativos gerenciados continuam válidos.
+Todos os registros selecionados são validados antes do primeiro INSERT. Se a
+escrita falhar, toda a transação remota é desfeita quando isso ainda for possível.
+Recibos locais são confirmados somente após o COMMIT remoto reconhecido ou após
+reconciliação explicitamente autorizada com prova remota idêntica.
+
+Reexecução exige novamente a confirmação explícita. Registros idênticos já
+existentes são reconhecidos sem INSERT, sem consumir nova identity nem tocar
+campos corporativos não gerenciados. Recibos já confirmados também são revalidados
+no destino, incluindo `remote_raw_id`; não são contados novamente. Recibo confirmado
+com prova remota ausente/divergente bloqueia, sem recriação automática.
+
+Falha remota retorna código de saída não zero. Antes de emitir o COMMIT remoto,
+a seleção persiste atomicamente uma intenção em `olos_http.corporate_selective_commits`
+e `paused=true`, `blocked=true`, `next_attempt_at=NULL`,
+`last_code=SELECTIVE_COMMIT_RECONCILIATION_REQUIRED` no controle local. A intenção
+registra UUID, origem, destino, binding, schema hash e os IDs/hashes/recibos exatos;
+não armazena outra cópia do payload pessoal. Os locks de sessão sobrevivem a esse
+COMMIT local, e o controle/recibos são novamente bloqueados e validados antes do
+COMMIT remoto. Se o COMMIT local da intenção não for reconhecido, o remoto não é emitido.
+
+No sucesso normal, COMMIT remoto reconhecido permite finalizar intenção como
+`acknowledged`, confirmar os recibos e concluir o controle sem bloqueio, na mesma
+transação local. Se o resultado remoto for incerto, o erro exposto é
+`CORPORATE_COMMIT_UNKNOWN`, mas a intenção permanece `unresolved` e o bloqueio já
+está durável. Falha local após COMMIT remoto e interrupção antes do envio do COMMIT
+também preservam essa quarentena conservadora. Não há contador de retries que a
+remova. Reiniciar, repetir a entrega, `tick()` ou `corporate-resume` não desbloqueiam.
+A política anterior de COMMIT incerto da **entrega geral** permanece inalterada.
+
+### Reconciliação autorizada de COMMIT seletivo incerto
+
+1. Manter consumidor parado, escrita geral desabilitada e `paused=true`. Preservar
+   logs, outbox, hashes e intenção. Não executar UPDATE manual para remover bloqueios.
+2. Consultar o banco **local**, somente leitura, para identificar a tentativa e a
+   seleção exatas; não inferir a seleção por data, posição da fila ou contagem:
+
+   ```sql
+   SELECT attempt_id, source_key, target_table, binding, schema_hash, evidence, created_at
+   FROM olos_http.corporate_selective_commits
+   WHERE state = 'unresolved';
+   ```
+
+3. Após revisão e autorização próprias para essa tentativa/lista, executar no
+   mesmo serviço. Substituir `<UUID>` pelo UUID integral registrado (não é um ID
+   inferido ou inventado):
+
+   ```sh
+   env OLOS_CORPORATE_WRITE_ENABLED=false \
+     node dist/main.js corporate-reconcile-selected \
+     --source-ids 35091119,35091120,35091121 \
+     --attempt-id '<UUID>' \
+     --confirm 'AUTHORIZE_EXPORTDATA_SELECTIVE_RECONCILIATION:<UUID>:35091119,35091120,35091121'
+   ```
+
+A autorização de entrega não autoriza reconciliação e vice-versa. Ambas mantêm o
+limite 1–3 IDs. UUID diferente, lista parcial, outra origem/binding/schema ou recibo
+local divergente bloqueiam sem mudanças. O comando exige controle pausado e
+bloqueado pelo motivo específico, além de todos os locks de origem, Sync,
+entrega e captura histórica; não inicia API ou scheduler.
+
+A transação corporativa de reconciliação é **READ COMMITTED READ ONLY** e não contém
+INSERT/UPDATE/DELETE. Um advisory lock remoto `(17320914,5)`, também mantido pela
+transação seletiva original, impede observar ausência enquanto ela ainda pode
+confirmar. A leitura dos registros ocorre após adquirir esse lock, em snapshot novo.
+Se a transação original ainda estiver ativa, retorna `SELECTIVE_REMOTE_TRANSACTION_ACTIVE`
+e mantém o bloqueio; não cancela a transação original nem tenta novamente.
+
+A reconciliação verifica o schema remoto, payload congelado versus hash, identidade
+composta e todos os campos gerenciados contra as linhas corporativas; recibos já
+confirmados exigem a mesma PK remota. Depois do COMMIT remoto de leitura reconhecido:
+
+- Linhas idênticas encontradas confirmam somente os recibos selecionados ainda
+  pendentes, sem duplicar contadores ou tocar campos corporativos não gerenciados.
+- Linhas ausentes continuam pendentes; a reconciliação **não as envia**.
+- Divergência local/remota ou qualquer falha aborta a transação local, preservando
+  integralmente o bloqueio e a intenção não resolvida.
+- Resolução `reconciled`, evidência por ID (PK remota ou ausência), recibos,
+  contadores e desbloqueio são confirmados em uma única transação local, mantendo
+  `paused=true`. Intenções resolvidas permanecem no journal para auditoria.
+
+Somente depois dessa resolução bem-sucedida uma **nova entrega explicitamente
+autorizada** pode enviar os selecionados que continuarem pendentes. Não há chamada
+encadeada de entrega, retry ou desbloqueio automático. Repetir uma reconciliação já
+concluída falha sem efeitos; se a confirmação do COMMIT local se perder, consultar
+o journal e os recibos para distinguir resolução efetivada de intenção pendente.
+
+Estados `CORPORATE_COMMIT_UNKNOWN` anteriores a esta versão não têm journal capaz
+de comprovar sua seleção. A entrega seletiva os rejeita com
+`SELECTIVE_UNTRACKED_COMMIT_UNKNOWN`; o comando novo não inventa/backfill essa prova.
+Exigem auditoria e procedimento manual específico, separadamente autorizado,
+antes da transição. Não usar `resume` ou editar `last_code` para contornar incertezas.
+
+Se a contagem inicial informada de 709.682 pendentes ainda for válida e os três
+selecionados forem novos recibos, o resultado esperado é **709.679 pendentes**,
+três confirmações adicionais e nenhum outro recibo alterado. Reexecução não deve
+reduzir novamente essa contagem. A implementação não reescreve payloads, hashes,
+identidades, sequência local, checkpoints de captura ou configurações do scheduler.
+
+### Rollback da entrega seletiva
+
+Antes da publicação, basta não aplicar a alteração. A nova migration é local e
+aditiva; sua tabela de auditoria deve ser preservada, inclusive após rollback de
+código. Após publicação autorizada, parar novas invocações, aguardar a tentativa
+corrente encerrar e manter escrita geral desabilitada e entrega pausada.
+
+Não retornar à implementação seletiva anterior enquanto existir intenção
+`unresolved`: ela não conhece este protocolo. Também não habilitar entrega geral
+ou limpar bloqueios como parte do rollback. Resolver/reconciliar a incerteza com
+esta versão e autorização própria antes de qualquer retomada. A imagem anterior
+`b95d62c` pode permanecer parada, mas não deve ser usada para contornar a quarentena.
+
+Rollback de código **não desfaz COMMIT corporativo**. Não apagar chamadas ou
+recibos, não recolocar confirmados em pending, não retroceder contadores/identity,
+não restaurar apenas um lado e não reativar a fila geral. Se houver COMMIT incerto,
+preservar a outbox e reconciliar identidade/hash/PK remotamente em procedimento
+separadamente autorizado. Correção de dados corporativos exige decisão específica;
+não faz parte deste rollback.

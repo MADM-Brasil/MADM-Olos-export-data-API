@@ -5,6 +5,9 @@ import { resolve, dirname } from 'node:path';
 import { config } from '../src/config.js';
 import { deliveryConfig } from '../src/corporate-delivery/config.js';
 import { tma } from '../src/corporate-sync/mapping.js';
+import { parseSelection, parseReconciliation, validateSelection } from '../src/corporate-delivery/selection.js';
+import { CorporateDelivery } from '../src/corporate-delivery/delivery.js';
+import type { Pool } from 'pg';
 import { handlingSeconds } from '../src/mapping.js';
 
 const env = { DATABASE_URL: 'postgresql://test@localhost/local', OLOS_SOURCE_KEY: 'synthetic',
@@ -49,4 +52,55 @@ test('runtime import graph never reaches the standalone Corporate Sync worker or
   for (const name of ['delivery', 'reconcile', 'contract', 'config']) {
     assert.doesNotMatch(readFileSync(resolve(`src/corporate-delivery/${name}.ts`), 'utf8'), /setTimeout|setInterval|sequentialPolling|new DynamicScheduler/);
   }
+});
+
+const selectedIds = ['35091119', '35091120', '35091121'];
+const selectedConsent = `AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${selectedIds.join(',')}`;
+test('selective authorization is explicit, bounded and bound to exact canonical IDs', () => {
+  const cfg = deliveryConfig(env)!;
+  assert.deepEqual(parseSelection(cfg, ['--source-ids', selectedIds.join(','), '--confirm', selectedConsent]).sourceIds, selectedIds);
+  for (const ids of [[], ['1','2','3','4'], ['1','1'], ['0'], ['01'], ['-1'], ['1.0'], ['1e3'], [' 1'], ['1;DROP'], ['9223372036854775808']]) {
+    assert.throws(() => validateSelection(cfg, { sourceIds: ids, confirmation: `AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY:${ids.join(',')}` }), /SOURCE_IDS_INVALID/);
+  }
+  for (const confirmation of ['', 'AUTHORIZE_EXPORTDATA_DIRECT_DELIVERY', 'AUTHORIZE_EXPORTDATA_SELECTIVE_DELIVERY', `${selectedConsent},4`]) {
+    assert.throws(() => validateSelection(cfg, { sourceIds: selectedIds, confirmation }), /WRITE_NOT_AUTHORIZED/);
+  }
+  assert.throws(() => validateSelection(cfg, { sourceIds: [...selectedIds].reverse(), confirmation: selectedConsent }), /WRITE_NOT_AUTHORIZED/);
+  assert.throws(() => validateSelection(undefined, { sourceIds: selectedIds, confirmation: selectedConsent }), /MODE_REQUIRED/);
+  assert.throws(() => validateSelection({ ...cfg, connection: { ...cfg.connection, writeEnabled: true } },
+    { sourceIds: selectedIds, confirmation: selectedConsent }), /GENERAL_WRITE_DISABLED/);
+  for (const args of [[], ['--source-ids', '1'], ['--source-ids', '1', '--confirm', 'x', '--extra'], ['--ids','1','--confirm','x']]) {
+    assert.throws(() => parseSelection(cfg, args), /PARAMETERS_INVALID/);
+  }
+});
+test('unauthorized selective calls never acquire a connection or enter the delivery protocol', async () => {
+  let connections = 0;
+  const pool = { connect: async () => { connections++; throw new Error('must not connect'); } } as unknown as Pool;
+  const delivery = new CorporateDelivery(deliveryConfig(env)!, 'synthetic', '"raw"."olos_calls"', pool, () => true, () => {});
+  await assert.rejects(delivery.deliverSelected({ sourceIds: selectedIds, confirmation: '' }), /WRITE_NOT_AUTHORIZED/);
+  await delivery.tick(); delivery.kick(); await delivery.settle();
+  assert.equal(connections, 0);
+});
+
+test('selective reconciliation consent is distinct, bound to attempt ID and exact bounded list', async () => {
+  const cfg = deliveryConfig(env)!;
+  const attemptId = '11111111-1111-4111-8111-111111111111';
+  const confirmation = `AUTHORIZE_EXPORTDATA_SELECTIVE_RECONCILIATION:${attemptId}:${selectedIds.join(',')}`;
+  assert.deepEqual(parseReconciliation(cfg, ['--source-ids', selectedIds.join(','), '--attempt-id', attemptId, '--confirm', confirmation]),
+    { sourceIds: selectedIds, attemptId, confirmation });
+  for (const args of [[], ['--source-ids', selectedIds.join(','), '--confirm', confirmation],
+    ['--source-ids', selectedIds.join(','), '--attempt-id', attemptId, '--confirm', confirmation, 'extra']]) {
+    assert.throws(() => parseReconciliation(cfg, args), /PARAMETERS_INVALID/);
+  }
+  const request = { sourceIds: selectedIds, attemptId, confirmation };
+  assert.throws(() => validateSelection(cfg, request), /WRITE_NOT_AUTHORIZED/);
+  assert.throws(() => validateSelection(cfg, { ...request, confirmation: selectedConsent }, 'reconciliation', attemptId), /WRITE_NOT_AUTHORIZED/);
+  assert.throws(() => validateSelection(cfg, request, 'reconciliation', 'bad'), /ATTEMPT_ID_INVALID/);
+  assert.throws(() => validateSelection(cfg, request, 'reconciliation', '22222222-2222-4222-8222-222222222222'), /WRITE_NOT_AUTHORIZED/);
+  assert.throws(() => validateSelection(cfg, { ...request, sourceIds: ['1','2','3','4'] }, 'reconciliation', attemptId), /SOURCE_IDS_INVALID/);
+  let connections = 0;
+  const pool = { connect: async () => { connections++; throw new Error('must not connect'); } } as unknown as Pool;
+  const delivery = new CorporateDelivery(cfg, 'synthetic', '"raw"."olos_calls"', pool, () => true, () => {});
+  await assert.rejects(delivery.reconcileSelected({ ...request, confirmation: selectedConsent }), /WRITE_NOT_AUTHORIZED/);
+  assert.equal(connections, 0);
 });
