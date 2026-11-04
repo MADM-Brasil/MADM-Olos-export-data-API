@@ -3,7 +3,8 @@ import { prepareGaps, gapConsent, bodyHash, type GapPlan } from '../src/history-
 import { HttpTransport } from '../src/http.js';
 import { dependencies, referenceRows } from '../src/identity/dependencies.js';
 import { randomUUID } from 'node:crypto';
-import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace } from '../src/corporate-delivery/identified-operator.js';
+import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace, operatorNamePlaceholderPattern } from '../src/corporate-delivery/identified-operator.js';
+import { historyPeriod, inHistoryPeriod } from '../src/corporate-delivery/history-period.js';
 import { consent as identityConsent, type Kind as IdentityKind } from '../src/identity/request.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -1600,8 +1601,8 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       }
       const s=await open(cfg);
       const input=Array.from({length:n},(_,i) => record(1000000+i,{CallId:String(2000000+i),
-        StartDate:i%2?'2026-11-01T10:00:00-03:00':'2026-09-15T10:00:00-03:00',
-        EndWrap:i%2?'2026-11-01T10:00:01-03:00':'2026-09-15T10:00:01-03:00',...extra(i)}));
+        StartDate:i%2?'2026-10-01T10:00:00-03:00':'2026-09-15T10:00:00-03:00',
+        EndWrap:i%2?'2026-10-01T10:00:01-03:00':'2026-09-15T10:00:01-03:00',...extra(i)}));
       await stage(s,[...input,record(9999999)],{...cache,users}); await close(s);
       // Synthetic provenance, never a runtime repair of local records.
       await local.query("UPDATE olos_http.corporate_outbox SET origin='legacy_backlog' WHERE source_id::bigint%2=0 AND state='pending'");
@@ -1649,13 +1650,52 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     }
     await t.test('operator selection SQL and runtime agree on invalid IDs, missing names and all supported whitespace',async()=>{
       const cases=[...['0','-1','-2','007','7.0',' 7','7 ','7\n','7\r','7','9007199254740993',null].map(agent=>({agent,name:'Agent'})),
-        ...[null,42,{},'',...operatorNameWhitespace,' \tAgent\u00a0'].map(name=>({agent:'7',name}))];
+        ...[null,42,{},'',...operatorNameWhitespace,' \tAgent\u00a0','0007','-1',' NULL ','Undefined','N/A',
+          'Unknown','Desconhecido','Sem operador','SEM AGENTE','Não identificado','NAO IDENTIFICADO'].map(name=>({agent:'7',name}))];
       for(const {agent,name} of cases){
         const payload={nome_agente:name};
         const result=(await local.query(`SELECT COALESCE($1::text ~ $3 AND jsonb_typeof($2::jsonb->'nome_agente')='string'
-          AND btrim($2::jsonb->>'nome_agente',$4)<>'',false) AS eligible`,[agent,JSON.stringify(payload),identifiedAgentPattern,operatorNameWhitespace])).rows[0].eligible;
+          AND btrim($2::jsonb->>'nome_agente',$4)<>'' AND btrim($2::jsonb->>'nome_agente',$4) !~* $5,false) AS eligible`,
+          [agent,JSON.stringify(payload),identifiedAgentPattern,operatorNameWhitespace,operatorNamePlaceholderPattern])).rows[0].eligible;
         assert.equal(result,hasIdentifiedOperator({agent_id:agent,payload}),JSON.stringify({agent,name}));
       }
+    });
+    await t.test('drain: period and real-name admission precede LIMIT; excluded and confirmed rows remain byte-for-byte unchanged',async()=>{
+      const outside=['2026-09-01T02:59:59.999999Z','2026-11-01T03:00:00.000000Z','2026-11-15T10:00:00Z'];
+      const names=['Sem operador','0007','NULL','Não identificado'];
+      const cfg=await backlogFixture(108,i=>i<3?{StartDate:outside[i]}:i<7?{AgentId:String(20+i)}:
+        {StartDate:i===7?'2026-09-01T03:00:00.000000Z':i===8?'2026-11-01T02:59:59.999999Z':'2026-10-15T10:00:00-03:00'},
+        new Map([...cache.users,...names.map((name,i)=>[String(23+i),name] as [string,string])]));
+      const before=await backlogEvidence(),box=await outbox(),destination=await remoteRows();
+      const run=await backlogPlan(cfg),journal=await backlogJournal(run.runId);
+      const ids=journal[0].evidence.map((e:any)=>e.source_id);
+      assert.deepEqual(ids,Array.from({length:100},(_,i)=>String(1000007+i)));
+      const shape=(await corporateSchema(remote,cfg.corporateDelivery!,false)).shape,period=historyPeriod(shape);
+      for(const e of box.filter(e=>Number(e.source_id)>=1000000&&e.source_id!=='9999999')){
+        const sql=(await local.query(`SELECT COALESCE($1::text ~ $2 AND $1 COLLATE "C" >= $3 AND $1 COLLATE "C" < $4,false) AS ok`,
+          [e.payload.data_ligacao,period.pattern,period.start,period.end])).rows[0].ok;
+        assert.equal(sql,inHistoryPeriod(e.payload,period));
+      }
+      const expected=box.filter(e=>ids.includes(e.source_id));
+      assert.ok(expected.every(e=>e.payload.cpf===null&&e.payload.email===null&&e.payload.lead_id_origem===null));
+      await drainCommand(cfg,run);
+      const projected=projection(shape,'d',false,cfg.corporateDelivery!.connection);
+      const delivered=(await remote.query(`SELECT ${projected.sql} FROM raw.olos_calls d WHERE internal_id_olos=ANY($1::int[]) ORDER BY internal_id_olos`,
+        [expected.map(e=>e.target_id)])).rows;
+      assert.deepEqual(delivered,expected.map(e=>e.payload));
+      assert.deepEqual((await outbox()).filter(e=>!ids.includes(e.source_id)),box.filter(e=>!ids.includes(e.source_id)));
+      assert.deepEqual((await remoteRows()).slice(0,destination.length),destination);
+      assert.deepEqual(await backlogEvidence(),before);
+    });
+    await t.test('drain: an old plan with November calls is rejected in full without changing its hash or journal',async()=>{
+      const cfg=await backlogFixture(100,i=>i===99?{StartDate:'2026-11-01T00:00:00-03:00'}:{});
+      const run=await legacyBacklogPlan(cfg,Array.from({length:100},(_,i)=>String(1000000+i)));
+      const before=await backlogEvidence(),journal=await backlogJournal(run.runId),box=await outbox(),destination=await remoteRows();
+      await assert.rejects(drainCommand(cfg,run),/DRAIN_PERIOD_PLAN_CANCEL_REQUIRED/);
+      assert.deepEqual(await backlogJournal(run.runId),journal);
+      assert.deepEqual(await backlogEvidence(),before);assert.deepEqual(await outbox(),box);assert.deepEqual(await remoteRows(),destination);
+      await drainCommand(cfg,{kind:'cancel',runId:run.runId,planHash:run.planHash,confirmation:drainConsent('cancel',run.runId,run.planHash)});
+      await assert.rejects(backlogPlan(cfg),/DRAIN_INSUFFICIENT_BACKLOG/);
     });
     await t.test('drain operator admission checks every frozen batch before delivery; incompatible old plan requires authorized cancel',async()=>{
       const cfg=await backlogFixture(300,i=>i===299?{AgentId:'0'}:{});
@@ -1674,7 +1714,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       assert.deepEqual(await remoteRows(),destination);assert.deepEqual(await control(),state);
     });
     await t.test('old uncertain drain without operator reconciles exact remote evidence, never reinserts or admits excluded pending rows',async()=>{
-      const cfg=await backlogFixture(100,i=>i<2?{AgentId:'0'}:{});
+      const cfg=await backlogFixture(100,i=>i<2?{AgentId:'0',StartDate:'2026-11-01T00:00:00-03:00'}:{});
       const request=await legacyBacklogPlan(cfg,Array.from({length:100},(_,i)=>String(1000000+i)));
       const old=(await outbox()).find(e=>e.source_id==='1000000')!;
       await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_,i)=>`$${i+1}`).join(',')})`,columns.map(c=>old.payload[c]));
@@ -1722,6 +1762,24 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       const b=p.manifest.blocks[0]!;
       return gapWorker(s,response).captureReread(p.manifest.parent,b.date,b.start,b.end,gapAuth(p,'CAPTURE'),hooks);
     };
+    await t.test('gaps: empty reread of 100 IDs is not recovery, never retries, preserves backlog and cannot bypass drain guards',async()=>{
+      const cfg=await gapFixture(Array.from({length:100},(_,i)=>record(1000000+i))),s=await open(cfg);
+      const p=await prepareGaps(s,gapInput()),parent=await gapParent(),box=await outbox(),destination=await remoteRows();
+      let calls=0;const id=await gapCapture(s,p,async()=>{calls++;return '[]';});
+      assert.equal(p.manifest.blocks[0]!.missing.length,100);
+      const child=(await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r WHERE id=$1',[id])).rows[0];
+      assert.equal(child.r.state,'received');assert.equal(child.r.response_body,'[]');
+      await assert.rejects(s.recoverGap(gapAuth(p,'PERSIST'),gapRefs),/GAP_RESPONSE_INCOMPLETE/);
+      await close(s);const resumed=await open(cfg);
+      await gapCapture(resumed,p,async()=>{calls++;throw new Error('must not retry');});
+      await assert.rejects(resumed.recoverGap(gapAuth(p,'PERSIST'),gapRefs),/GAP_RESPONSE_INCOMPLETE/);
+      await assert.rejects(prepareGaps(resumed,gapInput(46671611,46671710)),/GAP_RECOVERY_REQUIRED/);
+      assert.deepEqual((await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r WHERE id=$1',[id])).rows[0],child);
+      assert.equal(await count(local,'olos_http.history_gap_members'),0);assert.equal(calls,1);
+      await close(resumed);
+      await assert.rejects(backlogPlan(cfg),/DRAIN_HISTORY_CHANGED/);
+      assert.deepEqual(await gapParent(),parent);assert.deepEqual(await outbox(),box);assert.deepEqual(await remoteRows(),destination);
+    });
     await t.test('gaps: exact interior holes, unchanged confirmed evidence, raw response before persistence, no baseline discard and idempotent recovery',async()=>{
       const start=46671511,records=Array.from({length:5},(_,i)=>record(start+i,{CallId:String(start+i),StartDate:'2026-09-01T10:00:00-03:00'}));
       const cfg=await gapFixture([records[0]!,records[2]!,records[4]!]);

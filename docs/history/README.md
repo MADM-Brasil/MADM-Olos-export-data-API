@@ -1,5 +1,10 @@
 # Captura histórica ExportDataV3
 
+Para continuar as entregas de setembro/outubro a partir dos pendentes já locais,
+seguir [importação somente com operador](identified-operator-import-v1.md).
+A primeira releitura de 100 IDs com `[]` não comprova recuperação nem autoriza
+novas chamadas ou remoção de bloqueios.
+
 Para as lacunas comprovadas da exportação de 28/10, consultar a extensão de
 [recuperação por manifesto](gap-recovery-v1.md) de `capture-reread`/`recover-local`.
 Ela preserva o pai interrompido e não repete `read-data-previous-days`.

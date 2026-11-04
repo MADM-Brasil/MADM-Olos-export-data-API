@@ -6,7 +6,8 @@ test('operator admission requires the original positive AgentId and a populated 
   for (const agent_id of [null, undefined, 0, 7, '', '0', '-1', '-2', '007', '7.0', '7e1', ' 7', '7 ', '7\n', 'NaN']) {
     assert.equal(hasIdentifiedOperator({ agent_id, payload: { nome_agente: 'Agent' } }), false, String(agent_id));
   }
-  for (const nome_agente of [null, undefined, '', ' ', '\t\n', operatorNameWhitespace, 7, {}]) {
+  for (const nome_agente of [null, undefined, '', ' ', '\t\n', operatorNameWhitespace, 7, {},
+    '0007', '-1', ' NULL ', 'Undefined', 'N/A', 'Unknown', 'Desconhecido', 'Sem operador', 'SEM AGENTE', 'Não identificado', 'NAO IDENTIFICADO']) {
     assert.equal(hasIdentifiedOperator({ agent_id: '7', payload: { nome_agente } }), false);
   }
   for (const agent_id of ['7', '1658', '9007199254740993']) {

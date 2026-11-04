@@ -13,7 +13,8 @@ import { columns, quote, type Shape } from '../corporate-sync/mapping.js';
 import { corporateSchema, matches } from './contract.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { operatorColumn } from './payload.js';
-import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace } from './identified-operator.js';
+import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace, operatorNamePlaceholderPattern } from './identified-operator.js';
+import { historyPeriod, inHistoryPeriod } from './history-period.js';
 import { preservedHistoryRead } from './preserved-history.js';
 import { lockRemoteSelection, selectedRows, type SelectedEntry } from './selective-commit.js';
 import { drainConsent, drainHash, validateDrainLimits, validateDrainRequest, type DrainLimits, type DrainRequest } from './drain-request.js';
@@ -132,6 +133,8 @@ async function batchEntries(local: PoolClient, run: Run, batch: Batch, shape: Sh
   selectedRows(found,shape,cfg.corporateDelivery!);
   // Used only for admission to a new write, never for uncertain-COMMIT reconciliation.
   if (found.some(e => !hasIdentifiedOperator(e))) throw new SyncError('DRAIN_OPERATOR_PLAN_CANCEL_REQUIRED');
+  const period=historyPeriod(shape,cfg.corporateDelivery!.connection.timestampZone);
+  if (found.some(e => !inHistoryPeriod(e.payload,period))) throw new SyncError('DRAIN_PERIOD_PLAN_CANCEL_REQUIRED');
   return found;
 }
 async function load(local: PoolClient, runId: string) {
@@ -174,6 +177,7 @@ async function plan(store: Store, cfg: Config, limits: DrainLimits) {
   const first=await assertStage(local,cfg,limits,control.schema_hash);
   // LIMIT is only used to make a durable manifest; execution never selects new IDs.
   const originalOnly=await identityAdopted(local);
+  const period=historyPeriod(new Map(control.destination_shape),cfg.corporateDelivery!.connection.timestampZone);
   const recoveredCandidate=await gapInstalled(local) ? `EXISTS(SELECT 1 FROM olos_http.history_gap_members gm
     JOIN olos_http.reads gr ON gr.id=gm.read_id WHERE gm.source_key=o.source_key AND gm.source_id=o.source_id AND gr.state='done')` : 'false';
   const ids=(await local.query(`SELECT o.source_id FROM olos_http.corporate_outbox o
@@ -182,11 +186,16 @@ async function plan(store: Store, cfg: Config, limits: DrainLimits) {
     AND (NOT $4::boolean OR o.target_id::text=o.source_id)
     AND r.agent_id ~ $5 AND jsonb_typeof(o.payload->'nome_agente')='string'
     AND btrim(o.payload->>'nome_agente',$6)<>''
+    AND btrim(o.payload->>'nome_agente',$6) !~* $7
+    AND jsonb_typeof(o.payload->'data_ligacao')='string' AND o.payload->>'data_ligacao' ~ $8
+    AND (o.payload->>'data_ligacao') COLLATE "C" >= $9 AND (o.payload->>'data_ligacao') COLLATE "C" < $10
     ORDER BY o.target_id LIMIT $3 FOR UPDATE OF o,r NOWAIT`,
-  [cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,originalOnly,identifiedAgentPattern,operatorNameWhitespace])).rows.map(r => r.source_id as string);
+  [cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,originalOnly,identifiedAgentPattern,operatorNameWhitespace,
+    operatorNamePlaceholderPattern,period.pattern,period.start,period.end])).rows.map(r => r.source_id as string);
   if (!ids.length || first && ids.length !== 100) throw new SyncError('DRAIN_INSUFFICIENT_BACKLOG');
   const selected=await entries(local,cfg.sourceKey,store.target,ids,cfg);
   if (selected.some(e => !hasIdentifiedOperator(e))) throw new SyncError('DRAIN_OPERATOR_REQUIRED');
+  if (selected.some(e => !inHistoryPeriod(e.payload,period))) throw new SyncError('DRAIN_PERIOD_REQUIRED');
   const remote=await connect(remoteConfig(cfg,limits),'destination');
   try {
     await remote.query('BEGIN READ ONLY');
