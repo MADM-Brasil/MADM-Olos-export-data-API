@@ -148,3 +148,51 @@ O cenário de 12605 comprovou preservação dos hashes, recibos, checkpoints, re
 O container `olos-direct-test-1793384463-403269`, sua rede temporária e os certificados foram removidos ao final. A ausência desses recursos e de containers remanescentes nessa rede foi verificada após o término com código zero. As migrations foram executadas somente nos bancos descartáveis autorizados. O bloqueio anterior da execução dos testes está resolvido; nenhuma ativação operacional foi realizada. Os resultados históricos das demais suítes acima permanecem históricos e não foram reexecutados nesta etapa.
 
 Nenhum arquivo Billing, Corporate Sync antigo, `src/config.ts`, migration, Compose ou configuração operacional foi modificado nesta atualização. Nenhum checkpoint real foi alterado; nenhum banco real foi acessado. Alterações preexistentes foram preservadas. Sem commit, git add, push ou deploy.
+
+## Homologação pontual pausada — 30/10/2026
+
+Implementado `node dist/main.js corporate-homologate --limit N`, com N obrigatório de 1 a 5 e autorização exclusiva por invocação: `OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION=AUTHORIZE_EXPORTDATA_CORPORATE_HOMOLOGATION`. A escrita contínua precisa estar desabilitada. Não há migration nova, alteração de defaults de conciliação ou habilitação automática de entrega.
+
+Arquivos desta etapa:
+
+- `src/corporate-delivery/homologation.ts` (novo): operação no CLI existente, validação antes de abrir banco, Store com locks, sinais e fechamento garantido; sem OLOS/scheduler.
+- `src/corporate-delivery/config.ts`: autorização e limite próprios, sem mudar `src/config.ts` ou a configuração contínua.
+- `src/corporate-delivery/delivery.ts`: tentativa única compartilhando transação/validações, pausa obrigatória, locks Admin e de homologação, bloqueio de resume concorrente, resultado explícito e falhas propagadas. Falha local ao registrar uma falha remota também invalida o proprietário, em vez de ser classificada como simples indisponibilidade corporativa.
+- `src/main.ts`: despacho do comando antes de construir transporte OLOS ou iniciar o modo administrado.
+- `test/corporate-delivery.test.ts` e `test/corporate-delivery.integration.ts`: autorização, limites e cenários de segurança abaixo.
+- `docs/corporate-delivery/README.md` e este relatório: procedimento e evidência de validação.
+
+O comando mantém `paused=true` sem escrever esse campo. Usa os locks existentes de origem e Corporate Sync, o lock do Admin e o lock de sessão `(17320914,4)` para excluir um resume concorrente desta versão. A tentativa consome no máximo cinco entradas da outbox, incluindo as já existentes no destino, sem buscar outro lote. Confirmações locais só ocorrem depois do COMMIT remoto confirmado. Falha remota retorna erro; COMMIT incerto preserva pendências e exige nova invocação autorizada para reconhecimento idempotente. Divergências nunca são puladas nem desbloqueadas pelo comando.
+
+### Resultados desta etapa
+
+| Verificação | Resultado |
+| --- | --- |
+| Typecheck geral e build no checkout | passaram, Node 24 |
+| Unitários Corporate Delivery | **6/6 passaram**, zero skips |
+| Typecheck, build e `npm test` em cópia isolada sem Billing | passaram; **87/87 unitários**, zero skips |
+| PostgreSQL descartável no checkout | **69/69 passaram**, zero skips |
+| PostgreSQL descartável na cópia isolada | **69/69 passaram**, zero skips |
+| Build Docker da cópia sem Billing | passou; imagem local `olos-exportdata-v3:corporate-homologation-local` |
+| Comando compilado na imagem, sem autorização e sem rede | rejeitou com exit code 1 e `CORPORATE_HOMOLOGATION_NOT_AUTHORIZED` |
+
+Os seis unitários estão contidos nos 87; as duas execuções PostgreSQL repetem a mesma suíte e não representam 138 testes distintos. Os 69 testes incluem Corporate Delivery, administração e Store. A suíte Corporate Delivery passou a ter 32 cenários PostgreSQL mais o teste pai; os dez cenários novos cobrem:
+
+1. CLI compilado entrega exatamente cinco entre sete pendentes, incrementa recibos/contador/geração e deixa dois pendentes; pausa, payloads, hashes, recibos legados e leituras permanecem preservados; servidor HTTP sintético recebe zero solicitações OLOS.
+2. Reconhecimento de chamadas existentes com sentinelas Kommo, sem reinserção ou consumo de identity para as reconhecidas.
+3. Falha remota com rollback, retorno explícito de erro e recuperação somente em outra tentativa autorizada.
+4. COMMIT remoto ambíguo: nenhum recibo local antecipado; reexecução reconhece os mesmos cinco, sem INSERT ou avanço da identity.
+5. Falha de confirmação local depois do COMMIT remoto: erro preservado e reconhecimento após reabertura.
+6. CLI em processo independente rejeita locks de origem, Admin (mesmo sem captura) e Corporate Sync.
+7. Homologação em andamento bloqueia outro CLI e `corporate-resume`; a mesma instância não aceita segunda homologação nem entrega posterior via tick/kick.
+8. Falta de autorização, estado não pausado e divergência estrutural bloqueiam; nenhum registro posterior é pulado.
+9. Interrupção antes do COMMIT remoto preserva pendências e pausa, com rollback remoto.
+10. Hash alterado, schema incompatível e certificado/hostname TLS inválido impedem entrega, preservando a fila e a pausa.
+
+As regressões de 12105 e 12605 recibos passaram nas duas execuções. O padrão esperado continua 12605. Os números operacionais de 725284/15605/709679 são contexto fornecido pelo usuário; nenhum banco real foi consultado ou alterado.
+
+Os testes usaram PostgreSQL 16 com tmpfs, rede interna e sem portas publicadas, URLs explícitas de loopback no namespace do container temporário e certificado sintético. Migrations foram aplicadas somente nas fixtures descartáveis. A cópia de validação partiu de `git archive HEAD` e recebeu apenas os arquivos desta alteração, excluindo Billing e alterações preexistentes de `src/config.ts`. O Dockerfile operacional foi mantido. A imagem foi construída localmente, sem publicar ou executar seu comando de captura.
+
+Os containers, redes e certificados das duas execuções PostgreSQL foram removidos e sua ausência confirmada. A comparação de hashes confirmou somente os oito arquivos desta etapa alterados/criados; Billing, Corporate Sync antigo, `src/config.ts`, Compose, migrations e índice Git permaneceram intactos. O diff dos arquivos da tarefa passou na verificação de whitespace. Sem acesso a bancos reais, alteração Dokploy, commit, push ou deploy.
+
+O [procedimento no README](README.md#homologação-pontual-com-a-entrega-pausada) exige Admin/agendador encerrado, Sync e captura parados, configuração privada já disponível, estado conciliado/pausado/desbloqueado e execução manual sem restart automático. A autorização não deve ser persistida. Controles administrativos da janela devem usar esta versão e cooperar com o lock de homologação. Homologação real, comportamento WAN e o volume operacional completo permanecem fora desta validação sintética.

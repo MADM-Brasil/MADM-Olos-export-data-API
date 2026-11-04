@@ -4,21 +4,32 @@ import { retryable, safeCode, SyncError } from '../corporate-sync/errors.js';
 import { columns, digest, integerValue, mapRow, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
 import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
-import type { DeliveryConfig } from './config.js';
+import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
 import { corporateSchema, freeze, matches, uniqueIdentities } from './contract.js';
 import { reconcileLegacy } from './reconcile.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
+
+// Match JavaScript trim semantics for operator admission.
+const operatorNameWhitespace =
+  '\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u00a0\\u1680' +
+  '\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007' +
+  '\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff';
+
+const operatorNamePlaceholderPattern =
+  '^([0-9]+|-1|null|undefined|n/a|unknown|desconhecido|sem operador|sem agente|não identificado|nao identificado)$';
 
 export interface DeliveryHooks {
   beforeRemoteCommit?: () => Promise<void>;
   afterRemoteCommit?: () => Promise<void>;
   beforeLocalCommit?: () => Promise<void>;
 }
+export interface DeliveryResult { confirmed: number; inserted: number; existing: number }
 export class CorporateDelivery {
   private active: Promise<void> | undefined;
   private admitted = true;
   private closing = false;
   private fatal: unknown;
+  private homologationUsed = false;
   constructor(readonly cfg: DeliveryConfig, readonly source: string, readonly target: string,
     private readonly pool: Pool, private readonly ownerAlive: () => boolean, private readonly localFailure: () => void) {}
 
@@ -65,10 +76,13 @@ export class CorporateDelivery {
     await local.query('UPDATE olos_http.corporate_control SET paused=true,updated_at=now() WHERE singleton');
   }
   async resume(local: PoolClient): Promise<void> {
+    if (this.homologationUsed) throw new SyncError('CORPORATE_HOMOLOGATION_ACTIVE');
     if (!this.cfg.connection.writeEnabled) throw new SyncError('CORPORATE_WRITE_NOT_AUTHORIZED');
     await assertLocalConsumersCompatible(local, this.source);
     await local.query('BEGIN');
     try {
+      // Homologation holds the session counterpart until its owning Store closes.
+      if (!(await local.query('SELECT pg_try_advisory_xact_lock_shared(17320914,4) AS ok')).rows[0].ok) throw new SyncError('CORPORATE_HOMOLOGATION_ACTIVE');
       // Lock before checking: a concurrently finishing delivery may have just discovered a conflict.
       const state = await this.state(local, true);
       if (state.blocked && !['DATABASE_TRANSIENT_FAILURE','CORPORATE_COMMIT_UNKNOWN'].includes(state.last_code)) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
@@ -79,7 +93,7 @@ export class CorporateDelivery {
     this.admitted = true;
   }
   suspend(): void { this.admitted = false; }
-  allow(): void { if (!this.closing) this.admitted = true; }
+  allow(): void { if (!this.closing && !this.homologationUsed) this.admitted = true; }
   async settle(): Promise<void> { await this.active; if (this.fatal) throw this.fatal; }
   async close(): Promise<void> { this.closing = true; this.suspend(); await this.settle(); }
   kick(): void {
@@ -89,6 +103,27 @@ export class CorporateDelivery {
   }
   private fence(): void {
     if (!this.ownerAlive()) throw new SyncError('CORPORATE_OWNER_LOST');
+  }
+
+  async homologate(owner: PoolClient, limit: number, confirmation: string | undefined,
+    signal: AbortSignal, hooks: DeliveryHooks = {}): Promise<DeliveryResult> {
+    assertHomologationAuthorization(limit, confirmation);
+    if (this.cfg.connection.writeEnabled) throw new SyncError('CORPORATE_HOMOLOGATION_REQUIRES_CONTINUOUS_WRITE_DISABLED');
+    if (this.active || this.closing || this.homologationUsed) throw new SyncError('CORPORATE_HOMOLOGATION_ALREADY_ATTEMPTED');
+    this.fence();
+    this.homologationUsed = true;
+    this.suspend();
+    const attempt = async () => {
+      // Store.open already owns the source and Corporate Sync locks. Also exclude a stopped/paused Admin.
+      if (!(await owner.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS ok', [`olos-admin:${this.source}`])).rows[0].ok) throw new SyncError('CORPORATE_HOMOLOGATION_ADMIN_ACTIVE');
+      if (!(await owner.query('SELECT pg_try_advisory_lock(17320914,4) AS ok')).rows[0].ok) throw new SyncError('CORPORATE_HOMOLOGATION_ACTIVE');
+      return this.attempt(hooks, { limit, signal });
+    };
+    const pending = attempt();
+    // Shutdown waits for the attempt; its caller receives failures, never an automatic retry.
+    this.active = pending.then(() => {}, () => {});
+    try { return await pending; }
+    finally { this.active = undefined; }
   }
 
   async enqueue(local: PoolClient, sequence: string, input: MappedRecord[]): Promise<{ queued: number; duplicates: number }> {
@@ -117,7 +152,17 @@ export class CorporateDelivery {
 
   // One bounded attempt per existing scheduler cycle/manual command. No timer, retry loop or scheduler here.
   async tick(hooks: DeliveryHooks = {}): Promise<void> {
-    if (!this.cfg.connection.writeEnabled || !this.admitted) return;
+    if (!this.cfg.connection.writeEnabled || !this.admitted || this.homologationUsed) return;
+    await this.attempt(hooks);
+  }
+
+  private async attempt(hooks: DeliveryHooks, homologation?: { limit: number; signal: AbortSignal }): Promise<DeliveryResult> {
+    const empty = { confirmed: 0, inserted: 0, existing: 0 };
+    const beforeRemoteEffect = () => {
+      this.fence();
+      if (homologation?.signal.aborted) throw new SyncError('CORPORATE_HOMOLOGATION_INTERRUPTED');
+    };
+    beforeRemoteEffect();
     this.fence();
     const local = await this.pool.connect();
     const lostLocalSession = () => this.localFailure();
@@ -128,14 +173,43 @@ export class CorporateDelivery {
       await local.query('BEGIN');
       await assertLocalConsumersCompatible(local, this.source);
       const state = await this.state(local, true);
-      if (state.paused || state.blocked || state.retry_wait) { await local.query('COMMIT'); return; }
-      const entries = (await local.query(`SELECT source_id,target_id::text,payload,payload_hash FROM olos_http.corporate_outbox
-        WHERE source_key=$1 AND state='pending' ORDER BY target_id LIMIT $2 FOR UPDATE`, [this.source, this.cfg.connection.batchSize])).rows;
-      if (!entries.length) { await local.query('COMMIT'); return; }
+      if (homologation) {
+        if (!state.paused) throw new SyncError('CORPORATE_HOMOLOGATION_REQUIRES_PAUSE');
+        if (state.blocked) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
+        if (state.retry_wait) throw new SyncError('CORPORATE_RETRY_WAIT');
+      } else if (state.paused || state.blocked || state.retry_wait) { await local.query('COMMIT'); return empty; }
+      // Homologation retains its existing selection contract.
+      // Automatic delivery admits only calls with identified operators.
+      const entries = homologation
+        ? (await local.query(`SELECT source_id,target_id::text,payload,payload_hash
+            FROM olos_http.corporate_outbox
+            WHERE source_key=$1 AND state='pending'
+            ORDER BY target_id LIMIT $2 FOR UPDATE`,
+            [this.source, homologation.limit])).rows
+        : (await local.query(`SELECT o.source_id,o.target_id::text,o.payload,o.payload_hash,
+              r.agent_id
+            FROM olos_http.corporate_outbox o
+            JOIN olos_http.records r USING (source_key,source_id)
+            WHERE o.source_key=$1
+              AND o.state='pending'
+              AND r.agent_id ~ '^[1-9][0-9]*$'
+              AND jsonb_typeof(o.payload->'nome_agente')='string'
+              AND btrim(o.payload->>'nome_agente',$3)<>''
+              AND btrim(o.payload->>'nome_agente',$3) !~* $4
+            ORDER BY o.target_id LIMIT $2
+            FOR UPDATE OF o,r`,
+            [
+              this.source,
+              this.cfg.connection.batchSize,
+              operatorNameWhitespace,
+              operatorNamePlaceholderPattern
+            ])).rows;
+      if (!entries.length) { await local.query('COMMIT'); return empty; }
       let found: Map<string, string>;
+      let inserted = 0;
       let commitIssued = false;
       try {
-        this.fence();
+        beforeRemoteEffect();
         remote = await connect(this.cfg.connection, 'destination');
         await remote.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
         await remote.query('LOCK TABLE raw.olos_calls IN ROW EXCLUSIVE MODE');
@@ -149,23 +223,24 @@ export class CorporateDelivery {
         uniqueIdentities(rows);
         found = await matches(remote, rows, shape, this.cfg);
         for (const row of rows) {
-          this.fence();
+          beforeRemoteEffect();
           // Exact existing rows are never INSERTed again; even their corporate trigger is not invoked.
           if (found.has(row.internal_id_olos!)) continue;
-          await remote.query(`INSERT INTO raw.olos_calls (${columns.map(quote).join(',')})
+          const insertion = await remote.query(`INSERT INTO raw.olos_calls (${columns.map(quote).join(',')})
             VALUES (${columns.map((_, i) => `$${i + 1}`).join(',')})
             ON CONFLICT (internal_id_olos) WHERE internal_id_olos IS NOT NULL DO NOTHING`, columns.map(name => row[name]));
+          inserted += insertion.rowCount ?? 0;
         }
         found = await matches(remote, rows, shape, this.cfg);
         if (found.size !== rows.length) throw new SyncError('CORPORATE_VERIFICATION_FAILED');
         await hooks.beforeRemoteCommit?.();
-        this.fence();
+        beforeRemoteEffect();
         commitIssued = true;
         await remote.query('COMMIT');
         await hooks.afterRemoteCommit?.();
       } catch (error) {
-        remoteFailure = true;
         if (remote) await rollback(remote);
+        if (error instanceof SyncError && ['CORPORATE_OWNER_LOST','CORPORATE_HOMOLOGATION_INTERRUPTED'].includes(error.code)) throw error;
         const failures = state.failure_count + 1;
         // Network termination during COMMIT does not always carry a PostgreSQL/Node error code.
         const code = commitIssued ? 'CORPORATE_COMMIT_UNKNOWN' : safeCode(error);
@@ -176,7 +251,9 @@ export class CorporateDelivery {
         [failures, terminal, code, delay]);
         await local.query('COMMIT');
         log('corporate_delivery_deferred', { error: code, retry_ms: delay, blocked: terminal });
-        return;
+        remoteFailure = true; // Only a durably recorded remote failure can bypass local-failure handling.
+        if (homologation) throw new SyncError(code);
+        return empty;
       }
       this.fence();
       for (const entry of entries) {
@@ -188,8 +265,10 @@ export class CorporateDelivery {
       await local.query(`UPDATE olos_http.corporate_control SET confirmed_count=confirmed_count+$1,generation=generation+1,
         failure_count=0,next_attempt_at=NULL,last_code=NULL,updated_at=now() WHERE singleton`, [entries.length]);
       await hooks.beforeLocalCommit?.();
+      this.fence();
       await local.query('COMMIT');
       log('corporate_delivery_confirmed', { confirmed: entries.length });
+      return { confirmed: entries.length, inserted, existing: entries.length - inserted };
     } catch (error) {
       await rollback(local);
       // A local/fencing failure cannot be hidden as a corporate outage: stop the owning consumer.

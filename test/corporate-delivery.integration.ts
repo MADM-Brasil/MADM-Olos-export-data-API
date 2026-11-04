@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createServer } from 'node:http';
 import pg from 'pg';
 import { config, type Config } from '../src/config.js';
 import { Store } from '../src/store.js';
+import { AdminRepository } from '../src/admin/repository.js';
 import { Worker } from '../src/worker.js';
 import { OlosApi } from '../src/api.js';
 import { OlosAuthManager } from '../src/auth.js';
@@ -14,6 +18,7 @@ import { columns, digest, mapRow, projection, type Row } from '../src/corporate-
 import { corporateSchema } from '../src/corporate-delivery/contract.js';
 import { assertNoDirectOwnership } from '../src/corporate-sync/ownership.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
+import { corporateHomologation } from '../src/corporate-delivery/homologation.js';
 import { SyncError } from '../src/corporate-sync/errors.js';
 import { fixture } from './corporate-sync.fixture.js';
 
@@ -85,7 +90,433 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
   }
   async function ready(cfg = makeConfig()) { const s = await open(cfg); await s.reconcileCorporate(); await s.delivery!.resume(s.client!); return s; }
   async function destinationCount() { return count(remote, 'raw.olos_calls'); }
+  const homologationEnv = { OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_CORPORATE_HOMOLOGATION' };
+  const homologationArgs = ['--limit','5'];
+  async function pausedQueue(n = 7) {
+    await reset();
+    const cfg = makeConfig(2, { OLOS_CORPORATE_WRITE_ENABLED: 'false' });
+    const s = await open(cfg); await s.reconcileCorporate();
+    await stage(s, Array.from({ length: n }, (_, i) => record(900001 + i)));
+    await close(s); return cfg;
+  }
+  const control = async () => (await local.query('SELECT * FROM olos_http.corporate_control')).rows[0];
+  const outbox = async () => (await local.query('SELECT * FROM olos_http.corporate_outbox ORDER BY target_id')).rows;
+  async function homologationCli(extra: NodeJS.ProcessEnv = {}) {
+    return promisify(execFile)(process.execPath, ['dist/main.js','corporate-homologate',...homologationArgs], {
+      env: { ...base, ...homologationEnv, ATTEMPTS_PERSISTENCE_MODE: 'corporate',
+        OLOS_CORPORATE_DATABASE_URL: remoteUrl.toString(), OLOS_CORPORATE_CA_FILE: process.env.OLOS_DIRECT_TEST_CA_FILE!,
+        OLOS_CORPORATE_WRITE_ENABLED: 'false', ...extra }, timeout: 15000,
+    });
+  }
   try {
+    await t.test('history exige exclusividade com o Admin', async () => {
+      const cfg = await pausedQueue();
+
+      await local.query(await readFile(
+        new URL('../admin/migrations/002_worker_administration.sql', import.meta.url),
+        'utf8'
+      ));
+
+      const admin = new AdminRepository(localUrl.toString(), 'synthetic-direct');
+      await admin.open(120000, 'STOPPED');
+
+      let adminActive = true;
+      const s = await open({ ...cfg, historyCaptureAuthorized: true });
+
+      try {
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_ADMIN_ACTIVE/
+        );
+
+        await admin.close();
+        adminActive = false;
+
+        await s.assertHistoryReady();
+        await s.assertHistoryReady();
+
+        const competing = new AdminRepository(
+          localUrl.toString(),
+          'synthetic-direct'
+        );
+
+        try {
+          await assert.rejects(
+            competing.open(120000, 'STOPPED'),
+            /SCHEDULER_ALREADY_ACTIVE/
+          );
+        } finally {
+          await competing.close();
+        }
+      } finally {
+        await close(s);
+        if (adminActive) await admin.close();
+      }
+
+      const restarted = new AdminRepository(
+        localUrl.toString(),
+        'synthetic-direct'
+      );
+
+      try {
+        await restarted.open(120000, 'STOPPED');
+        assert.equal((await restarted.settings()).runtime_state, 'STOPPED');
+      } finally {
+        await restarted.close();
+      }
+    });
+
+    await t.test('history bloqueia estados corporativos inválidos e leituras pendentes', async () => {
+      const cfg = await pausedQueue();
+
+      await local.query(await readFile(
+        new URL('../admin/migrations/002_worker_administration.sql', import.meta.url),
+        'utf8'
+      ));
+
+      const admin = new AdminRepository(localUrl.toString(), 'synthetic-direct');
+      await admin.open(120000, 'STOPPED');
+      await admin.close();
+
+      const unauthorized = await open(cfg);
+      try {
+        await assert.rejects(
+          unauthorized.assertHistoryReady(),
+          /HISTORY_CAPTURE_NOT_AUTHORIZED/
+        );
+      } finally {
+        await close(unauthorized);
+      }
+
+      const s = await open({ ...cfg, historyCaptureAuthorized: true });
+
+      try {
+        await s.assertHistoryReady();
+
+        await local.query(
+          `UPDATE olos_http.worker_settings
+           SET desired_state='PAUSED'
+           WHERE source_key='synthetic-direct'`
+        );
+
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_SCHEDULER_NOT_STOPPED/
+        );
+
+        await local.query(
+          `UPDATE olos_http.worker_settings
+           SET desired_state='STOPPED'
+           WHERE source_key='synthetic-direct'`
+        );
+
+        await s.assertHistoryReady();
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET paused=false'
+        );
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_CORPORATE_STATE_INVALID/
+        );
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET paused=true,blocked=true'
+        );
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_CORPORATE_STATE_INVALID/
+        );
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET blocked=false,ready=false'
+        );
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_CORPORATE_STATE_INVALID/
+        );
+
+        await local.query(
+          'UPDATE olos_http.corporate_control SET ready=true'
+        );
+
+        const pending = await s.beginRead({ kind: 'history' });
+
+        await assert.rejects(
+          s.assertHistoryReady(),
+          /HISTORY_RECOVERY_REQUIRED/
+        );
+
+        assert.equal(
+          (await local.query(
+            'SELECT state FROM olos_http.reads WHERE id=$1',
+            [pending]
+          )).rows[0].state,
+          'reading'
+        );
+      } finally {
+        await close(s);
+      }
+    });
+
+    await t.test('history falha remota não repete consumo após reinício', async () => {
+      const cfg = await pausedQueue();
+
+      await local.query(await readFile(
+        new URL('../admin/migrations/002_worker_administration.sql', import.meta.url),
+        'utf8'
+      ));
+
+      const admin = new AdminRepository(
+        localUrl.toString(), 'synthetic-direct'
+      );
+      await admin.open(120000, 'STOPPED');
+      await admin.close();
+
+      let consuming = 0;
+
+      const catalog = [
+        { TableName: 'AttemptsRawData', Columns: [
+          'AttemptsRawDataID', 'CallId', 'StartDate',
+          'OriginalPhoneNumber', 'AgentId', 'CampaignId', 'DispositionId'
+        ] },
+        { TableName: 'Users', Columns: ['AgentId', 'UserName'] },
+        { TableName: 'Campaign', Columns: ['CampaignId', 'Description'] },
+        { TableName: 'Disposition', Columns: ['DispositionId', 'Description'] }
+      ];
+
+      const auth = new OlosAuthManager(
+        async () => JSON.stringify({
+          access_token: 'synthetic-token',
+          refresh_token: 'synthetic-refresh',
+          expires_in: 3600,
+          token_type: 'bearer'
+        }),
+        {
+          username: 'fixture',
+          password: 'fixture',
+          clientId: 'fixture',
+          clientSecret: 'fixture'
+        }
+      );
+
+      const api = new OlosApi(async path => {
+        if (path.endsWith('/available-tables')) {
+          return JSON.stringify(catalog);
+        }
+        if (path.endsWith('/read-data')) {
+          return '[]';
+        }
+        if (path.endsWith('/read-data-previous-days')) {
+          consuming++;
+          throw new Error('synthetic uncertain remote response');
+        }
+        throw new Error('Unexpected synthetic API request');
+      }, auth, async () => {});
+
+      const options = {
+        ...cfg,
+        historyCaptureAuthorized: true
+      };
+
+      const first = await open(options);
+
+      try {
+        const worker = new Worker(
+          first, api, new StaticCache(api, 3600000)
+        );
+
+        await assert.rejects(
+          worker.cycle({ kind: 'history' }),
+          /RECOVERY_REQUIRED/
+        );
+
+        assert.equal(consuming, 1);
+
+        const pending = await first.unresolved();
+        assert.equal(pending.length, 1);
+        assert.equal(pending[0]!.state, 'reading');
+        assert.equal(pending[0]!.spec.kind, 'history');
+
+        await assert.rejects(
+          worker.cycle({ kind: 'history' }),
+          /HISTORY_RECOVERY_REQUIRED/
+        );
+
+        assert.equal(consuming, 1);
+      } finally {
+        await close(first);
+      }
+
+      const restarted = await open(options);
+
+      try {
+        const worker = new Worker(
+          restarted, api, new StaticCache(api, 3600000)
+        );
+
+        await assert.rejects(
+          worker.cycle({ kind: 'history' }),
+          /HISTORY_RECOVERY_REQUIRED/
+        );
+
+        assert.equal(consuming, 1);
+        assert.equal((await restarted.unresolved()).length, 1);
+
+        const state = await control();
+        assert.equal(state.paused, true);
+
+        assert.equal((await outbox()).length, 9);
+      } finally {
+        await close(restarted);
+      }
+    });
+
+    await t.test('homologation CLI confirms exactly five, remains paused, never calls OLOS and never drains a second batch', async () => {
+      const cfg = await pausedQueue();
+      const before = await outbox(), state = await control();
+      const legacy = (await local.query('SELECT * FROM corporate_sync.receipts ORDER BY internal_id_olos')).rows;
+      const reads = (await local.query('SELECT * FROM olos_http.reads ORDER BY id')).rows;
+      let requests = 0;
+      const server = createServer((_, response) => { requests++; response.writeHead(500); response.end(); });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const port = (server.address() as { port: number }).port;
+        const result = await homologationCli({ OLOS_BASE_URL: `http://127.0.0.1:${port}` });
+        assert.match(result.stdout, /corporate_homologation_completed/);
+        assert.match(result.stdout, /"confirmed":5,"inserted":5,"existing":0/);
+      } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+      assert.equal(requests, 0); assert.equal(await destinationCount(), 7);
+      const after = await control(); assert.equal(after.paused, true); assert.equal(after.blocked, false);
+      assert.equal(BigInt(after.confirmed_count), BigInt(state.confirmed_count) + 5n);
+      assert.equal(BigInt(after.generation), BigInt(state.generation) + 1n);
+      const entries = await outbox();
+      assert.equal(entries.filter(e => e.state === 'confirmed').length, 7);
+      assert.equal(entries.filter(e => e.state === 'pending').length, 2);
+      for (let i = 0; i < entries.length; i++) {
+        for (const key of ['source_id','source_key','source_hash','target_id','payload_hash','payload']) assert.deepEqual(entries[i][key], before[i][key]);
+        if (entries[i].state === 'confirmed') { assert.ok(entries[i].confirmed_at); assert.ok(entries[i].remote_raw_id); }
+      }
+      assert.deepEqual((await local.query('SELECT * FROM corporate_sync.receipts ORDER BY internal_id_olos')).rows, legacy);
+      assert.deepEqual((await local.query('SELECT * FROM olos_http.reads ORDER BY id')).rows, reads);
+      const s = await open(cfg); s.delivery!.allow(); s.delivery!.kick(); await s.delivery!.settle(); await s.delivery!.tick();
+      assert.equal(await destinationCount(), 7); assert.deepEqual(await outbox(), entries);
+      assert.equal(cfg.corporateDelivery!.connection.writeEnabled, false);
+    });
+    await t.test('homologation recognizes existing calls without reinserting or changing Kommo', async () => {
+      const cfg = await pausedQueue();
+      for (const entry of (await outbox()).filter(e => e.state === 'pending').slice(0,2)) {
+        await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')},kommo_event_hash,kommo_tentativas)
+          VALUES(${columns.map((_,i) => `$${i+1}`).join(',')},'sentinel',9)`, columns.map(name => entry.payload[name]));
+      }
+      const existing = (await remote.query('SELECT * FROM raw.olos_calls WHERE internal_id_olos IN (3,4) ORDER BY internal_id_olos')).rows;
+      const result = await corporateHomologation(cfg, homologationArgs, homologationEnv);
+      assert.deepEqual(result, { confirmed: 5, inserted: 3, existing: 2 });
+      assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls WHERE internal_id_olos IN (3,4) ORDER BY internal_id_olos')).rows, existing);
+      assert.equal((await remote.query('SELECT last_value::text FROM raw.olos_calls_raw_olos_call_id_seq')).rows[0].last_value, '8000000006');
+      assert.equal((await control()).paused, true); assert.equal(await destinationCount(), 7);
+    });
+    await t.test('homologation remote failure is explicit, preserves pause and receipts, and requires a new authorized attempt', async () => {
+      const cfg = await pausedQueue(), before = await outbox();
+      await assert.rejects(corporateHomologation(cfg, homologationArgs, homologationEnv, {
+        beforeRemoteCommit: async () => { throw Object.assign(new Error('synthetic'), { code: '40001' }); },
+      }), /DATABASE_TRANSIENT_FAILURE/);
+      assert.equal(await destinationCount(), 2); assert.deepEqual(await outbox(), before);
+      assert.equal((await control()).paused, true); assert.equal((await control()).confirmed_count, '2');
+      assert.equal((await control()).last_code, 'DATABASE_TRANSIENT_FAILURE');
+      await pause();
+      assert.equal((await corporateHomologation(cfg, homologationArgs, homologationEnv)).confirmed, 5);
+      assert.equal(await destinationCount(), 7);
+    });
+    await t.test('homologation ambiguous COMMIT stays unconfirmed locally and a new attempt recognizes the same five', async () => {
+      const cfg = await pausedQueue(), before = await outbox();
+      await assert.rejects(corporateHomologation(cfg, homologationArgs, homologationEnv, {
+        afterRemoteCommit: async () => { throw new Error('synthetic lost acknowledgement'); },
+      }), /CORPORATE_COMMIT_UNKNOWN/);
+      assert.equal(await destinationCount(), 7); assert.deepEqual(await outbox(), before);
+      assert.equal((await control()).paused, true); assert.equal((await control()).confirmed_count, '2');
+      assert.equal((await control()).last_code, 'CORPORATE_COMMIT_UNKNOWN');
+      const sequence = (await remote.query('SELECT last_value::text FROM raw.olos_calls_raw_olos_call_id_seq')).rows;
+      await pause();
+      assert.deepEqual(await corporateHomologation(cfg, homologationArgs, homologationEnv), { confirmed: 5, inserted: 0, existing: 5 });
+      assert.deepEqual((await remote.query('SELECT last_value::text FROM raw.olos_calls_raw_olos_call_id_seq')).rows, sequence);
+      assert.equal((await control()).confirmed_count, '7'); assert.equal((await control()).paused, true);
+    });
+    await t.test('homologation never masks a failed local confirmation after a successful remote COMMIT', async () => {
+      const cfg = await pausedQueue(), before = await outbox();
+      await assert.rejects(corporateHomologation(cfg, homologationArgs, homologationEnv, {
+        beforeLocalCommit: async () => { throw new Error('synthetic local failure'); },
+      }), /synthetic local failure/);
+      assert.equal(await destinationCount(), 7); assert.deepEqual(await outbox(), before);
+      assert.equal((await control()).paused, true); assert.equal((await control()).confirmed_count, '2');
+      assert.deepEqual(await corporateHomologation(cfg, homologationArgs, homologationEnv), { confirmed: 5, inserted: 0, existing: 5 });
+    });
+    await t.test('homologation CLI excludes independent source, Admin and Corporate Sync lock owners', async () => {
+      await pausedQueue(); const before = await outbox();
+      for (const [sql,values,code] of [
+        ['SELECT pg_advisory_lock(hashtextextended($1,0))', [`olos-http:AttemptsRawData:${base.OLOS_SOURCE_KEY}`], 'CONSUMER_ALREADY_ACTIVE'],
+        ['SELECT pg_advisory_lock(hashtextextended($1,0))', [`olos-admin:${base.OLOS_SOURCE_KEY}`], 'CORPORATE_HOMOLOGATION_ADMIN_ACTIVE'],
+        ['SELECT pg_advisory_lock(17320914,1)', [], 'CORPORATE_SYNC_STILL_RUNNING'],
+      ] as const) {
+        await local.query(sql, [...values]);
+        try { await assert.rejects(homologationCli(), (error: any) => error.code === 1 && error.stdout.includes(code)); }
+        finally { await local.query('SELECT pg_advisory_unlock_all()'); }
+      }
+      assert.deepEqual(await outbox(), before); assert.equal(await destinationCount(), 2);
+    });
+    await t.test('homologation holds pause against concurrent resume, blocks another CLI and permits only one attempt per instance', async () => {
+      const cfg = await pausedQueue(), s = await open(cfg);
+      let entered = false, release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const pending = s.delivery!.homologate(s.client!, 5, homologationEnv.OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION, new AbortController().signal, {
+        beforeRemoteCommit: async () => { entered = true; await gate; },
+      });
+      try {
+        await eventually(() => entered);
+        await assert.rejects(homologationCli(), (error: any) => error.code === 1 && error.stdout.includes('CONSUMER_ALREADY_ACTIVE'));
+        await assert.rejects(corporateControl(makeConfig(), 'corporate-resume'), /CORPORATE_HOMOLOGATION_ACTIVE/);
+        assert.equal((await control()).paused, true);
+      } finally { release(); await pending; }
+      await assert.rejects(s.delivery!.homologate(s.client!, 5, homologationEnv.OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION, new AbortController().signal), /ALREADY_ATTEMPTED/);
+      s.delivery!.allow(); s.delivery!.kick(); await s.delivery!.settle(); await s.delivery!.tick();
+      assert.equal(await destinationCount(), 7); assert.equal((await control()).paused, true);
+    });
+    await t.test('homologation without authorization, without pause or with a structural conflict fails closed', async () => {
+      const cfg = await pausedQueue(), before = await outbox();
+      await assert.rejects(homologationCli({ OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION: '' }), (error: any) => error.code === 1 && error.stdout.includes('HOMOLOGATION_NOT_AUTHORIZED'));
+      assert.deepEqual(await outbox(), before);
+      await local.query('UPDATE olos_http.corporate_control SET paused=false');
+      await assert.rejects(corporateHomologation(cfg, homologationArgs, homologationEnv), /REQUIRES_PAUSE/);
+      await local.query('UPDATE olos_http.corporate_control SET paused=true');
+      const changed = { ...before[2].payload, telefone: 'divergent' };
+      await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_,i) => `$${i+1}`).join(',')})`, columns.map(name => changed[name]));
+      await assert.rejects(corporateHomologation(cfg, homologationArgs, homologationEnv), /INTERNAL_ID_COLLISION/);
+      assert.equal((await control()).blocked, true); assert.equal((await control()).paused, true);
+      assert.deepEqual(await outbox(), before); assert.equal(await destinationCount(), 3);
+      await assert.rejects(corporateHomologation(cfg, homologationArgs, homologationEnv), /CORPORATE_DELIVERY_BLOCKED/);
+    });
+    await t.test('homologation interruption before remote COMMIT rolls back without confirming or resuming', async () => {
+      const cfg = await pausedQueue(), before = await outbox(), s = await open(cfg);
+      const abort = new AbortController();
+      await assert.rejects(s.delivery!.homologate(s.client!, 5, homologationEnv.OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION, abort.signal, {
+        beforeRemoteCommit: async () => { abort.abort(); },
+      }), /CORPORATE_HOMOLOGATION_INTERRUPTED/);
+      assert.equal(await destinationCount(), 2); assert.deepEqual(await outbox(), before);
+      assert.equal((await control()).paused, true); assert.equal((await control()).confirmed_count, '2');
+    });
+    await t.test('homologation preserves hash, schema and TLS guards and does not skip poisoned pending rows', async () => {
+      for (const kind of ['hash','schema','tls'] as const) {
+        const cfg = await pausedQueue();
+        if (kind === 'hash') await local.query("UPDATE olos_http.corporate_outbox SET payload_hash=repeat('a',64) WHERE target_id=3");
+        if (kind === 'schema') await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN raw_olos_call_id SET GENERATED BY DEFAULT');
+        if (kind === 'tls') cfg.corporateDelivery!.connection.destinationUrl = remoteUrl.toString().replace('localhost','127.0.0.1');
+        const before = await outbox();
+        await assert.rejects(corporateHomologation(cfg, homologationArgs, homologationEnv),
+          kind === 'hash' ? /CORPORATE_PAYLOAD_CHANGED/ : kind === 'schema' ? /CORPORATE_IDENTITY_ALWAYS_REQUIRED/ : /DATABASE_OR_RUNTIME_FAILURE/);
+        assert.deepEqual(await outbox(), before); assert.equal(await destinationCount(), 2);
+        assert.equal((await control()).paused, true); assert.equal((await control()).blocked, true);
+      }
+    });
     await t.test('migration is local/idempotent; activation requires reconciliation and explicit write permission', async () => {
       await reset(); await local.query(await readFile(new URL('../migrations/002_corporate_delivery.sql', import.meta.url), 'utf8'));
       const s = await open(makeConfig(2, { OLOS_CORPORATE_WRITE_ENABLED: 'false' }));
@@ -382,13 +813,21 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       let captures = 0;
       const auth = new OlosAuthManager(async () => JSON.stringify({ access_token: 'synthetic', refresh_token: 'synthetic', expires_in: 3600, token_type: 'bearer' }),
         { username: 'synthetic', password: 'synthetic', clientId: 'synthetic', clientSecret: 'synthetic' });
-      const api = new OlosApi(async path => {
+      const api = new OlosApi(async (path, fields) => {
         if (path.endsWith('available-tables')) return JSON.stringify([
           { TableName: 'AttemptsRawData', Columns: ['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId'] },
           { TableName: 'Users', Columns: ['AgentId','UserName'] }, { TableName: 'Campaign', Columns: ['CampaignId','Description'] },
           { TableName: 'Disposition', Columns: ['DispositionId','Description'] },
         ]);
-        if (path.endsWith('/read-data')) return '[]';
+        if (path.endsWith('/read-data')) {
+          if (fields?.TableName === 'Users')
+            return JSON.stringify([{ AgentId: '7', UserName: 'Agent' }]);
+          if (fields?.TableName === 'Campaign')
+            return JSON.stringify([{ CampaignId: '8', Description: 'Campaign' }]);
+          if (fields?.TableName === 'Disposition')
+            return JSON.stringify([{ DispositionId: '9', Description: 'Disposition' }]);
+          return '[]';
+        }
         return JSON.stringify([record(900 + ++captures)]);
       }, auth, async () => {});
       const worker = new Worker(s, api, new StaticCache(api, 3600000));

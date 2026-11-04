@@ -3,12 +3,30 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { config } from '../src/config.js';
-import { deliveryConfig } from '../src/corporate-delivery/config.js';
+import { deliveryConfig, homologationRequest, assertHomologationAuthorization } from '../src/corporate-delivery/config.js';
+import { corporateHomologation } from '../src/corporate-delivery/homologation.js';
 import { tma } from '../src/corporate-sync/mapping.js';
 import { handlingSeconds } from '../src/mapping.js';
 
 const env = { DATABASE_URL: 'postgresql://test@localhost/local', OLOS_SOURCE_KEY: 'synthetic',
   ATTEMPTS_PERSISTENCE_MODE: 'corporate', OLOS_CORPORATE_DATABASE_URL: 'postgresql://test@localhost/madm' };
+test('homologation requires its own authorization and an explicit integer limit from one to five', () => {
+  const authorization = { OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_CORPORATE_HOMOLOGATION' };
+  for (const args of [[], ['5'], ['--limit'], ['--limit','0'], ['--limit','6'], ['--limit','1.5'], ['--limit','05'], ['--limit','5','extra']]) {
+    assert.throws(() => homologationRequest(args, authorization), /HOMOLOGATION_LIMIT_REQUIRED/);
+  }
+  for (const limit of [1,5]) assert.equal(homologationRequest(['--limit',String(limit)], authorization).limit, limit);
+  for (const limit of [0,6,NaN,Infinity,1.5]) assert.throws(() => assertHomologationAuthorization(limit, authorization.OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION), /LIMIT_INVALID/);
+  assert.throws(() => homologationRequest(['--limit','5'], {}), /HOMOLOGATION_NOT_AUTHORIZED/);
+  assert.throws(() => homologationRequest(['--limit','5'], { OLOS_CORPORATE_WRITE_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_DIRECT_DELIVERY' }), /HOMOLOGATION_NOT_AUTHORIZED/);
+});
+test('homologation refuses continuous write authorization before opening any database', async () => {
+  const cfg = config({ ...env, OLOS_CORPORATE_WRITE_ENABLED: 'true', OLOS_CORPORATE_WRITE_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_DIRECT_DELIVERY' });
+  await assert.rejects(corporateHomologation(cfg, ['--limit','5'], {}), /HOMOLOGATION_NOT_AUTHORIZED/);
+  await assert.rejects(corporateHomologation(cfg, ['--limit','5'], {
+    OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_CORPORATE_HOMOLOGATION',
+  }), /REQUIRES_CONTINUOUS_WRITE_DISABLED/);
+});
 test('corporate direct mode is opt-in and independent from Corporate Sync configuration', () => {
   assert.equal(config({ DATABASE_URL: env.DATABASE_URL, OLOS_SOURCE_KEY: 'test', CORPORATE_SYNC_ENABLED: 'true' }).corporateDelivery, undefined);
   const cfg = deliveryConfig(env)!;

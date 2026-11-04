@@ -10,6 +10,19 @@ export interface DeliveryConfig {
   reconcileAuthorized: boolean;
 }
 
+export function assertHomologationAuthorization(limit: number, confirmation: string | undefined): void {
+  if (confirmation !== 'AUTHORIZE_EXPORTDATA_CORPORATE_HOMOLOGATION') throw new WorkerError('CORPORATE_HOMOLOGATION_NOT_AUTHORIZED');
+  if (!Number.isInteger(limit) || limit < 1 || limit > 5) throw new WorkerError('CORPORATE_HOMOLOGATION_LIMIT_INVALID');
+}
+
+export function homologationRequest(args: string[], env: NodeJS.ProcessEnv): { limit: number; confirmation: string } {
+  if (args.length !== 2 || args[0] !== '--limit' || !/^[1-5]$/.test(args[1]!)) throw new WorkerError('CORPORATE_HOMOLOGATION_LIMIT_REQUIRED');
+  const confirmation = env.OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION;
+  const limit = Number(args[1]);
+  assertHomologationAuthorization(limit, confirmation);
+  return { limit, confirmation: confirmation! };
+}
+
 export function deliveryConfig(env: NodeJS.ProcessEnv): DeliveryConfig | undefined {
   const mode = env.ATTEMPTS_PERSISTENCE_MODE ?? 'local';
   if (mode === 'local') return undefined;

@@ -121,6 +121,7 @@ Comandos adicionados ao **mesmo** `dist/main.js`, sem autenticar/consumir OLOS:
 | `corporate-pause` | pausa somente entrega; captura pode continuar |
 | `corporate-resume` | retoma entrega com autorização; pode rearmar falha transitória/COMMIT incerto após esgotar tentativas |
 | `corporate-deliver-once` | uma tentativa de um lote, respeitando pausa/backoff; exige o lock da origem e não concorre com o serviço ativo |
+| `corporate-homologate --limit N` | homologação de um único lote de até N registros, com N obrigatório entre 1 e 5, mantendo a pausa; autorização exclusiva e escrita contínua desabilitada |
 
 Status/check/pause/resume usam uma conexão de controle local independente e podem operar com o worker ativo. Pausa espera a transação de entrega atual terminar antes de retornar; não abandona um commit em curso. Um bloqueio estrutural, de identidade ou payload não é apagado por resume. Requer investigação e resolução com evidência, fora de um mecanismo automático de “pular erro”.
 
@@ -140,6 +141,37 @@ Pausar o agendador existente suspende admissão de novas entregas e espera a atu
 - Não existe garantia de unicidade lógica contra outros escritores que não participam deste protocolo. O índice corporativo protege IDs internos; diferenças e colisões observadas bloqueiam.
 
 Logs têm somente eventos, contagens, tentativas, duração/códigos fixos e UUIDs de captura já usados no worker. Sem credenciais, SQL, detalhes de erro PostgreSQL, CPF, e-mail, telefone ou conteúdo de payload. Respostas e outbox locais contêm dados pessoais necessários à recuperação: proteger acesso, disco e backups.
+
+## Homologação pontual com a entrega pausada
+
+`corporate-homologate` usa o mesmo executável ExportDataV3 e a mesma outbox, sem construir transporte OLOS, autenticar, capturar, recuperar leituras ou iniciar agendador. É uma alternativa específica de homologação; `corporate-deliver-once` mantém seu comportamento anterior de respeitar a pausa.
+
+A autorização é **somente para a invocação**: `OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION=AUTHORIZE_EXPORTDATA_CORPORATE_HOMOLOGATION`. O comando exige `OLOS_CORPORATE_WRITE_ENABLED=false`, modo `corporate` e `--limit` explícito de 1 a 5. A confirmação da entrega contínua não autoriza homologação. Não persistir a autorização de homologação no arquivo privado, no Environment, no Compose ou em um serviço com restart automático.
+
+Procedimento para uma janela operacional separadamente autorizada (não executado nesta implementação):
+
+1. Confirmar que a versão instalada inclui este comando. Preservar a configuração privada da origem, binding e destino/CA; não alterar URLs nem checkpoints. Registrar `corporate-status` antes da tentativa e exigir `ready=true`, `paused=true`, `blocked=false`, sem backoff pendente.
+2. Encerrar de forma controlada o processo Admin/agendador e manter Corporate Sync e captura OLOS parados. Apenas pausar a captura na interface não basta: o processo Admin conserva seu lock e será rejeitado. Não contornar locks nem iniciar outro worker.
+3. No ambiente autorizado do mesmo executável, executar **uma única vez**, sem supervisor que repita o comando:
+
+   ```sh
+   OLOS_CORPORATE_WRITE_ENABLED=false \
+   OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION=AUTHORIZE_EXPORTDATA_CORPORATE_HOMOLOGATION \
+   node dist/main.js corporate-homologate --limit 5
+   ```
+
+4. Conferir exit code zero, evento `corporate_homologation_completed` e contagens `confirmed`, `inserted`, `existing`, `limit`, `paused=true`. Conferir novamente `corporate-status` e as evidências autorizadas no destino. O limite conta registros selecionados, incluindo os já existentes: não busca registros adicionais para completar cinco INSERTs. Se houver menos pendentes, confirma somente os disponíveis; fila vazia retorna zero.
+5. Manter `paused=true` e escrita contínua desabilitada. Não executar `corporate-resume` para esta homologação. A operação não muda configuração, não liga serviços e não restaura automaticamente a captura.
+
+A chamada adquire os locks existentes da origem (`olos-http:AttemptsRawData:<source>`), Corporate Sync `(17320914,1)` e Admin (`olos-admin:<source>`). Um lock adicional de sessão `(17320914,4)`, sem migration, impede `corporate-resume` concorrente; a linha de controle e as linhas selecionadas ficam bloqueadas na transação local. Os locks são liberados ao fechar o Store. O valor persistido de `paused` nunca é escrito pela homologação. Essa instância não admite outra tentativa nem `tick` após homologar.
+
+O lote reutiliza a validação de schema/trigger, TLS, hashes, identidade lógica e campos obrigatórios da entrega normal. Não envia a PK/identity corporativa no INSERT nem altera Kommo, chamadas existentes, checkpoints/recibos legados ou payloads. Novos recibos da outbox e `confirmed_count`/`generation` só são confirmados localmente após COMMIT corporativo confirmado.
+
+Falhas remotas são registradas como antes, mas o comando termina com erro em vez de aparentar sucesso; não há retry automático. Em `CORPORATE_COMMIT_UNKNOWN`, os registros ficam pendentes, sem incremento local, mantendo a pausa. Após avaliar o erro e respeitar o backoff, uma nova invocação explicitamente autorizada pode reconhecer as mesmas chamadas já existentes, sem reinseri-las. Não executar resume para limpar bloqueios. Divergência de schema, hash ou identidade bloqueia a fila inteira; nada é pulado ou apagado. Falha local ao confirmar ou ao registrar uma falha remota também termina com erro, sem mascaramento.
+
+SIGINT/SIGTERM solicita interrupção antes de novos INSERTs/COMMIT remoto; se o COMMIT remoto já foi confirmado, conclui-se a confirmação local quando a sessão proprietária permanece válida. Perda de conexão/COMMIT incerto mantém a recuperação pela outbox; uma interrupção forçada não garante rollback remoto. Não reduzir `stop_grace_period` nem presumir ausência de escrita por um exit code de erro.
+
+O contexto operacional informado para esta etapa (725284 itens, 15605 confirmados e 709679 pendentes) não foi consultado nos bancos reais. Se os cinco selecionados forem ausentes e o lote concluir, o incremento esperado é de cinco confirmações; os testes usam dados sintéticos menores. O padrão histórico de conciliação continua em 12605, sem nova conciliação ou alteração de controles existentes.
 
 ## Validação da release sem Billing
 
