@@ -1,5 +1,9 @@
 # Drenagem administrativa e limitada do backlog v1
 
+Otimização sobre `1e50a89`: [índice local, EXPLAIN comparativo e homologação com
+timeout de 2 segundos](drain-plan-performance.md). A migration 008 é manual;
+não é aplicada pelo comando de planejamento.
+
 > Atualização sobre `b4aea2d`: novas entregas exigem IDs originais mesmo antes da adoção. A migração coordenada continua em [original-identity-migration-v1.md](original-identity-migration-v1.md); diagnósticos e resultados anteriores abaixo permanecem como evidência histórica.
 
 Implementação sobre `d1b60bf`, no worktree `export-data-v3-history`. Os comandos abaixo são um procedimento para uma janela futura autorizada; não foram executados em VPS, OLOS ou MADM reais.

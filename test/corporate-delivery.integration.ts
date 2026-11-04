@@ -1,4 +1,5 @@
 import { identityCommand } from '../src/identity/migrate.js';
+import { applyDrainIndex, benchmarkDrainSelection } from './drain-plan-performance.fixture.js';
 import { prepareGaps, beginGap, stageGap, recoveredGapProof, gapConsent, bodyHash, type GapPlan } from '../src/history-gaps.js';
 import { HttpTransport } from '../src/http.js';
 import { dependencies, referenceRows } from '../src/identity/dependencies.js';
@@ -1800,6 +1801,17 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       responses:(await local.query('SELECT * FROM olos_http.history_gap_responses ORDER BY read_id')).rows,
       members:(await local.query('SELECT * FROM olos_http.history_gap_members ORDER BY source_key,source_id')).rows,
     });
+    await t.test('local operator index migration preserves receipts/history and indexed drain still validates empty children',async()=>{
+      const {cfg}=await emptyGapBacklog(),before=await backlogEvidence(),journal=await gapJournals();
+      await applyDrainIndex(local);
+      assert.deepEqual(await backlogEvidence(),before);assert.deepEqual(await gapJournals(),journal);
+      const index=(await local.query(`SELECT indisvalid,indisready,pg_get_expr(indpred,indrelid) AS predicate
+        FROM pg_index WHERE indexrelid='olos_http.records_identified_operator_order'::regclass`)).rows[0];
+      assert.equal(index.indisvalid,true);assert.equal(index.indisready,true);assert.ok(index.predicate.includes(identifiedAgentPattern));
+      const run=await backlogPlan(cfg);await drainCommand(cfg,run);
+      assert.equal(await destinationCount(),102);assert.deepEqual(await backlogEvidence(),before);assert.deepEqual(await gapJournals(),journal);
+      await local.query("SET statement_timeout='0'; SET lock_timeout='0'");
+    });
     await t.test('drain empty-child exception rejects unknown/orphaned/uncertain/nonempty reads and journal or manifest divergence',async()=>{
       const changes=[
         "INSERT INTO olos_http.reads(id,source_key,target_table,spec) SELECT gen_random_uuid(),source_key,target_table,'{\"kind\":\"current\"}' FROM olos_http.reads WHERE id=$1",
@@ -3007,6 +3019,24 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
         await s.delivery!.settle(); assert.ok(await destinationCount() >= 4);
       } finally { scheduler.shutdown(); await running; }
       assert.equal(scheduler.status().state, 'STOPPED');
+    });
+    if(process.env.OLOS_DRAIN_PERFORMANCE_TEST==='true')await t.test('representative drain planning: 725287 rows, both distributions, 2-second statements and real progressive plans',async()=>{
+      for(const distribution of ['uniform','tail'] as const){
+        const cfg=await gapFixture(),s=await open(cfg),p=await prepareGaps(s,gapInput()),a=gapAuth(p,'CAPTURE');
+        const id=await beginGap(s,a);await stageGap(s,a,id,'[]',1);await close(s);
+        const reads=(await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r ORDER BY id')).rows,journals=await gapJournals();
+        await benchmarkDrainSelection(local,cfg,distribution);
+        for(const batchSize of [100,250,500,1000]){
+          const start=performance.now(),request=await backlogPlan(cfg,{...drainLimits,batchSize});
+          console.log('DRAIN_BENCH '+JSON.stringify({distribution,phase:'full_plan',batchSize,wall_ms:performance.now()-start,statement_timeout_ms:2000}));
+          assert.equal((await backlogJournal(request.runId))[0].evidence.length,batchSize);
+          await drainCommand(cfg,request);await drainCommand(cfg,request);
+        }
+        assert.equal(await destinationCount(),1852);
+        assert.deepEqual((await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r ORDER BY id')).rows,reads);
+        assert.deepEqual(await gapJournals(),journals);assert.equal((await control()).paused,true);
+        await local.query("SET statement_timeout='0'; SET lock_timeout='0'");
+      }
     });
   } finally { for (const s of stores.splice(0)) await s.close().catch(() => {}); await local.end(); await remote.end(); }
 });

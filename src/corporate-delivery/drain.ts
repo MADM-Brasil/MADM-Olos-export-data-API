@@ -13,7 +13,8 @@ import { columns, quote, type Shape } from '../corporate-sync/mapping.js';
 import { corporateSchema, matches } from './contract.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { operatorColumn } from './payload.js';
-import { hasIdentifiedOperator, identifiedAgentPattern, operatorNameWhitespace, operatorNamePlaceholderPattern } from './identified-operator.js';
+import { hasIdentifiedOperator } from './identified-operator.js';
+import { drainSelection } from './drain-selection.js';
 import { historyPeriod, inHistoryPeriod } from './history-period.js';
 import { preservedHistoryRead } from './preserved-history.js';
 import { lockRemoteSelection, selectedRows, type SelectedEntry } from './selective-commit.js';
@@ -180,20 +181,8 @@ async function plan(store: Store, cfg: Config, limits: DrainLimits) {
   const first=await assertStage(local,cfg,limits,control.schema_hash);
   // LIMIT is only used to make a durable manifest; execution never selects new IDs.
   const period=historyPeriod(new Map(control.destination_shape),cfg.corporateDelivery!.connection.timestampZone);
-  const recoveredCandidate=await gapInstalled(local) ? `EXISTS(SELECT 1 FROM olos_http.history_gap_members gm
-    JOIN olos_http.reads gr ON gr.id=gm.read_id WHERE gm.source_key=o.source_key AND gm.source_id=o.source_id AND gr.state='done')` : 'false';
-  const ids=(await local.query(`SELECT o.source_id FROM olos_http.corporate_outbox o
-    JOIN olos_http.records r USING(source_key,source_id) JOIN olos_http.reads h ON h.id=$2
-    WHERE o.source_key=$1 AND o.state='pending' AND ((o.created_at<h.started_at AND r.created_at<h.started_at) OR ${recoveredCandidate})
-    AND o.target_id::text=o.source_id AND r.target_id=o.target_id
-    AND r.agent_id ~ $4 AND jsonb_typeof(o.payload->'nome_agente')='string'
-    AND btrim(o.payload->>'nome_agente',$5)<>''
-    AND btrim(o.payload->>'nome_agente',$5) !~* $6
-    AND jsonb_typeof(o.payload->'data_ligacao')='string' AND o.payload->>'data_ligacao' ~ $7
-    AND (o.payload->>'data_ligacao') COLLATE "C" >= $8 AND (o.payload->>'data_ligacao') COLLATE "C" < $9
-    ORDER BY o.target_id LIMIT $3 FOR UPDATE OF o,r NOWAIT`,
-  [cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,identifiedAgentPattern,operatorNameWhitespace,
-    operatorNamePlaceholderPattern,period.pattern,period.start,period.end])).rows.map(r => r.source_id as string);
+  const ids=(await local.query(drainSelection(cfg.sourceKey,limits.batchSize*limits.maxBatches,period,await gapInstalled(local))))
+    .rows.map(r => r.source_id as string);
   if (!ids.length || first && ids.length !== 100) throw new SyncError('DRAIN_INSUFFICIENT_BACKLOG');
   const selected=await entries(local,cfg.sourceKey,store.target,ids,cfg);
   if (selected.some(e => e.target_id !== e.source_id)) throw new SyncError('DRAIN_ORIGINAL_ID_REQUIRED');

@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+performance_test=false
+pg_size=768m
+if [ "${1:-}" = '--drain-performance' ] && [ "$#" = 1 ]; then
+  performance_test=true
+  pg_size=3g
+elif [ "$#" != 0 ]; then
+  printf 'Usage: %s [--drain-performance]\n' "$0" >&2
+  exit 2
+fi
 # Discardable PostgreSQL only. No real environment, passwords or existing DB containers are reused.
 suffix="$(date +%s)-$$"
 container="olos-direct-test-${suffix}"
@@ -14,7 +23,7 @@ trap cleanup EXIT
 printf 'DISPOSABLE_RESOURCES container=%s network=%s certs=%s\n' "$container" "$network" "$certs"
 docker network create --internal "$network" >/dev/null
 docker run --detach --name "$container" --network "$network" \
-  --label olos-direct.disposable-test=true --tmpfs /var/lib/postgresql/data:rw,size=768m \
+  --label olos-direct.disposable-test=true --tmpfs "/var/lib/postgresql/data:rw,size=$pg_size" \
   -e POSTGRES_HOST_AUTH_METHOD=trust --entrypoint bash postgres:16-bookworm -c '
     openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/test.key -out /tmp/test.crt -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost >/dev/null 2>&1
     chown postgres:postgres /tmp/test.key /tmp/test.crt
@@ -43,6 +52,7 @@ chmod 644 "$certs/ca.crt"
 docker run --rm --network "container:$container" --user "$(id -u):$(id -g)" \
   -v "$PWD:/app:ro" -v "$certs:/certs:ro" -w /app \
   -e OLOS_DIRECT_DISPOSABLE_TEST=true \
+  -e "OLOS_DRAIN_PERFORMANCE_TEST=$performance_test" \
   -e OLOS_DIRECT_TEST_SOURCE_URL=postgresql://postgres@127.0.0.1:5432/olos_direct_test \
   -e OLOS_DIRECT_TEST_DESTINATION_URL=postgresql://postgres@localhost:5432/madm \
   -e OLOS_DIRECT_TEST_CA_FILE=/certs/ca.crt \
