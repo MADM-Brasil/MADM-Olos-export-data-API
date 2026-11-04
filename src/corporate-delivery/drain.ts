@@ -1,5 +1,5 @@
-import { identityAdopted, identityDeliveryGate } from '../identity/gates.js';
-import { gapInstalled, recoveredGapProof } from '../history-gaps.js';
+import { identityDeliveryGate } from '../identity/gates.js';
+import { assertEmptyGapChildren, gapInstalled, recoveredGapProof } from '../history-gaps.js';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -82,8 +82,8 @@ async function guard(local: PoolClient, cfg: Config, target: string, run?: Run, 
   }
   const pending=(await local.query(`SELECT to_jsonb(h) AS snapshot FROM olos_http.reads h
     WHERE source_key=$1 AND state IN ('reading','received') FOR SHARE NOWAIT`,[cfg.sourceKey])).rows;
-  const h=pending[0]?.snapshot;
-  if (pending.length !== 1 || h.id !== preservedHistoryRead || h.spec.kind !== 'history' || h.state !== 'reading' ||
+  const h=pending.find(p => p.snapshot.id === preservedHistoryRead)?.snapshot;
+  if (!h || h.spec.kind !== 'history' || h.state !== 'reading' ||
     h.error_code !== 'RESPONSE_TOO_LARGE' || h.response_body !== null || h.processed_count !== 0 || h.finished_at !== null ||
     h.resolution !== null || h.target_table !== target || run && drainHash(h) !== drainHash(run.history_snapshot)) {
     throw new SyncError('DRAIN_HISTORY_CHANGED');
@@ -104,6 +104,8 @@ async function guard(local: PoolClient, cfg: Config, target: string, run?: Run, 
   if ((await local.query("SELECT 1 FROM olos_http.corporate_selective_commits WHERE state='unresolved'")).rowCount) {
     throw new SyncError('SELECTIVE_COMMIT_RECONCILIATION_REQUIRED');
   }
+  await assertEmptyGapChildren(local,cfg,target,h,control.schema_hash,
+    pending.filter(p => p.snapshot.id !== preservedHistoryRead).map(p => p.snapshot.id as string));
   return {history:h as Record<string,unknown>,control};
 }
 
@@ -132,6 +134,7 @@ async function batchEntries(local: PoolClient, run: Run, batch: Batch, shape: Sh
   if (drainHash(frozen(found)) !== drainHash(batch.evidence)) throw new SyncError('DRAIN_EVIDENCE_CHANGED');
   selectedRows(found,shape,cfg.corporateDelivery!);
   // Used only for admission to a new write, never for uncertain-COMMIT reconciliation.
+  if (found.some(e => e.target_id !== e.source_id)) throw new SyncError('DRAIN_ORIGINAL_ID_PLAN_CANCEL_REQUIRED');
   if (found.some(e => !hasIdentifiedOperator(e))) throw new SyncError('DRAIN_OPERATOR_PLAN_CANCEL_REQUIRED');
   const period=historyPeriod(shape,cfg.corporateDelivery!.connection.timestampZone);
   if (found.some(e => !inHistoryPeriod(e.payload,period))) throw new SyncError('DRAIN_PERIOD_PLAN_CANCEL_REQUIRED');
@@ -176,24 +179,24 @@ async function plan(store: Store, cfg: Config, limits: DrainLimits) {
   }
   const first=await assertStage(local,cfg,limits,control.schema_hash);
   // LIMIT is only used to make a durable manifest; execution never selects new IDs.
-  const originalOnly=await identityAdopted(local);
   const period=historyPeriod(new Map(control.destination_shape),cfg.corporateDelivery!.connection.timestampZone);
   const recoveredCandidate=await gapInstalled(local) ? `EXISTS(SELECT 1 FROM olos_http.history_gap_members gm
     JOIN olos_http.reads gr ON gr.id=gm.read_id WHERE gm.source_key=o.source_key AND gm.source_id=o.source_id AND gr.state='done')` : 'false';
   const ids=(await local.query(`SELECT o.source_id FROM olos_http.corporate_outbox o
     JOIN olos_http.records r USING(source_key,source_id) JOIN olos_http.reads h ON h.id=$2
-    WHERE o.source_key=$1 AND o.state='pending' AND (o.created_at<h.started_at OR ${recoveredCandidate})
-    AND (NOT $4::boolean OR o.target_id::text=o.source_id)
-    AND r.agent_id ~ $5 AND jsonb_typeof(o.payload->'nome_agente')='string'
-    AND btrim(o.payload->>'nome_agente',$6)<>''
-    AND btrim(o.payload->>'nome_agente',$6) !~* $7
-    AND jsonb_typeof(o.payload->'data_ligacao')='string' AND o.payload->>'data_ligacao' ~ $8
-    AND (o.payload->>'data_ligacao') COLLATE "C" >= $9 AND (o.payload->>'data_ligacao') COLLATE "C" < $10
+    WHERE o.source_key=$1 AND o.state='pending' AND ((o.created_at<h.started_at AND r.created_at<h.started_at) OR ${recoveredCandidate})
+    AND o.target_id::text=o.source_id AND r.target_id=o.target_id
+    AND r.agent_id ~ $4 AND jsonb_typeof(o.payload->'nome_agente')='string'
+    AND btrim(o.payload->>'nome_agente',$5)<>''
+    AND btrim(o.payload->>'nome_agente',$5) !~* $6
+    AND jsonb_typeof(o.payload->'data_ligacao')='string' AND o.payload->>'data_ligacao' ~ $7
+    AND (o.payload->>'data_ligacao') COLLATE "C" >= $8 AND (o.payload->>'data_ligacao') COLLATE "C" < $9
     ORDER BY o.target_id LIMIT $3 FOR UPDATE OF o,r NOWAIT`,
-  [cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,originalOnly,identifiedAgentPattern,operatorNameWhitespace,
+  [cfg.sourceKey,preservedHistoryRead,limits.batchSize*limits.maxBatches,identifiedAgentPattern,operatorNameWhitespace,
     operatorNamePlaceholderPattern,period.pattern,period.start,period.end])).rows.map(r => r.source_id as string);
   if (!ids.length || first && ids.length !== 100) throw new SyncError('DRAIN_INSUFFICIENT_BACKLOG');
   const selected=await entries(local,cfg.sourceKey,store.target,ids,cfg);
+  if (selected.some(e => e.target_id !== e.source_id)) throw new SyncError('DRAIN_ORIGINAL_ID_REQUIRED');
   if (selected.some(e => !hasIdentifiedOperator(e))) throw new SyncError('DRAIN_OPERATOR_REQUIRED');
   if (selected.some(e => !inHistoryPeriod(e.payload,period))) throw new SyncError('DRAIN_PERIOD_REQUIRED');
   const remote=await connect(remoteConfig(cfg,limits),'destination');

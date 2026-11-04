@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import type { Store } from './store.js';
 import type { Config } from './config.js';
-import { readFields, type ReadSpec } from './api.js';
+import { readFields, rows, type ReadSpec } from './api.js';
 import { WorkerError } from './errors.js';
 import { drainHash } from './corporate-delivery/drain-request.js';
 import { preservedHistoryRead } from './corporate-delivery/preserved-history.js';
@@ -195,6 +195,45 @@ export async function recordGapMembers(store:Store,scope:GapScope,ids:string[]){
   WHERE source_key=$1 AND source_id=$2 ON CONFLICT(source_key,source_id) DO NOTHING`,[store.cfg.sourceKey,id,scope.readId]);
 }
 
+// Drain-only exception for durable empty responses. This does not recover a
+// block, grant membership, change a read, or authorize another OLOS request.
+// Caller holds the source/history/delivery locks and rechecks before COMMIT.
+export async function assertEmptyGapChildren(db:PoolClient,cfg:Config,target:string,history:unknown,schema:string,ids:string[]){
+ if(!ids.length)return;
+ if(!await gapInstalled(db))fail('GAP_PENDING_CHILD_INVALID');
+ const children=(await db.query(`SELECT r.*,c.plan_id,c.block,p.manifest,p.hash,s.body_hash,s.bytes,
+   r.started_at>=h.started_at AS after_parent,
+   EXISTS(SELECT 1 FROM olos_http.history_gap_members gm WHERE gm.read_id=r.id) AS has_members
+   FROM olos_http.reads r JOIN olos_http.history_gap_children c ON c.read_id=r.id
+   JOIN olos_http.history_gap_plans p ON p.id=c.plan_id
+   JOIN olos_http.history_gap_responses s ON s.read_id=r.id
+   JOIN olos_http.reads h ON h.id=$2
+   WHERE r.id=ANY($1::uuid[]) FOR SHARE OF r,c,p,s NOWAIT`,[ids,preservedHistoryRead])).rows;
+ if(children.length!==ids.length)fail('GAP_PENDING_CHILD_INVALID');
+ for(const r of children){
+  const m=r.manifest as GapManifest;
+  if(!m||m.version!==1||m.parent!==preservedHistoryRead||!Array.isArray(m.blocks)||!m.blocks.length||m.blocks.length>40||
+   m.source!==cfg.sourceKey||m.target!==target||m.binding!==cfg.corporateDelivery!.binding||m.schema!==schema||
+   r.hash!==drainHash(m)||drainHash(m.history)!==drainHash(history))fail('GAP_PENDING_CHILD_INVALID');
+  // Reuse the original range/evidence bounds; a JSON spec alone is not a journal.
+  const ranges=m.blocks.flatMap(b=>splitGapRanges({evidenceSha256:m.evidenceSha256,referencesSha256:m.referencesSha256,ranges:[b]}));
+  same(ranges,m.blocks.map(b=>({date:b.date,start:b.start,end:b.end})),'GAP_PENDING_CHILD_INVALID');
+  if(ranges.some((a,i)=>ranges.slice(0,i).some(b=>BigInt(a.start)<=BigInt(b.end)&&BigInt(a.end)>=BigInt(b.start))))fail('GAP_PENDING_CHILD_INVALID');
+  const b=m.blocks[r.block-1];
+  if(!b||!Array.isArray(b.missing)||!b.missing.length||!Array.isArray(b.existing)||
+   r.source_key!==m.source||r.target_table!==target||!r.after_parent||r.state!=='received'||r.processed_count!==0||
+   (r.received_count!==null&&r.received_count!==0)||r.finished_at!==null||r.resolution!==null||r.has_members||
+   typeof r.response_body!=='string'||!/^\s*\[\s*\]\s*$/.test(r.response_body)||
+   r.body_hash!==bodyHash(r.response_body)||r.bytes!==Buffer.byteLength(r.response_body)||
+   !Number.isSafeInteger(m.maxResponseBytes)||r.bytes>m.maxResponseBytes)fail('GAP_PENDING_CHILD_INVALID');
+  // JSON whitespace only. Do not accept BOM/other text as an empty JSON array.
+  try{const body=JSON.parse(r.response_body);if(!Array.isArray(body)||body.length)fail('GAP_PENDING_CHILD_INVALID');}
+  catch{fail('GAP_PENDING_CHILD_INVALID');}
+  same(r.spec,{kind:'reread',date:b.date,start:b.start,end:b.end,
+   gap:{planId:r.plan_id,hash:r.hash,block:r.block}},'GAP_PENDING_CHILD_INVALID');
+ }
+}
+
 // Used only for newly admitted drain entries. Old run manifests do not acquire
 // this exception implicitly. The immutable membership is bound into new evidence.
 export async function recoveredGapProof(db:PoolClient,cfg:Config,entries:{source_id:string;target_id:string;source_hash:string;payload_hash:string}[]){
@@ -215,6 +254,8 @@ export async function recoveredGapProof(db:PoolClient,cfg:Config,entries:{source
   if(p.state!=='done'||p.processed_count!==p.received_count||!b||m.version!==1||m.parent!==preservedHistoryRead||m.schema!==schema||
    m.source!==cfg.sourceKey||m.binding!==cfg.corporateDelivery!.binding||m.target!==p.target_table||p.read_source!==m.source||
    p.hash!==drainHash(m)||p.body_hash!==bodyHash(p.response_body)||p.bytes!==Buffer.byteLength(p.response_body))fail('GAP_PROVENANCE_INVALID');
+  const received=rows(p.response_body);
+  if(!received.length||received.length!==p.received_count)fail('GAP_PROVENANCE_INVALID');
   same(history,m.history,'GAP_PARENT_CHANGED');
   same(p.spec,{kind:'reread',date:b.date,start:b.start,end:b.end,gap:{planId:p.plan_id,hash:p.hash,block:p.block}},'GAP_CHILD_CHANGED');
   valid.set(p.read_id,{read_id:p.read_id,plan_hash:p.hash,body_hash:p.body_hash});

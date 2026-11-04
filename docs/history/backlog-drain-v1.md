@@ -1,6 +1,6 @@
 # Drenagem administrativa e limitada do backlog v1
 
-> Atualização: a implementação posterior e o procedimento vigente de migração coordenada estão em [original-identity-migration-v1.md](original-identity-migration-v1.md). Após a adoção, a entrega exige IDs originais; diagnósticos e resultados anteriores abaixo permanecem como evidência histórica.
+> Atualização sobre `b4aea2d`: novas entregas exigem IDs originais mesmo antes da adoção. A migração coordenada continua em [original-identity-migration-v1.md](original-identity-migration-v1.md); diagnósticos e resultados anteriores abaixo permanecem como evidência histórica.
 
 Implementação sobre `d1b60bf`, no worktree `export-data-v3-history`. Os comandos abaixo são um procedimento para uma janela futura autorizada; não foram executados em VPS, OLOS ou MADM reais.
 
@@ -10,11 +10,68 @@ Usar Node 24 e configuração privada já revisada para a origem/destino correto
 
 É necessária a migration **exclusivamente local** `migrations/005_backlog_drain.sql`, além dos controles/journal seletivo anteriores. Ela cria duas tabelas de auditoria independentes; não altera tabelas existentes, payloads, IDs ou MADM. O runtime não aplica migrations. A aplicação em ambiente operacional é uma etapa manual separada, sujeita à revisão/autorização daquele ambiente. Ausência da estrutura gera `DRAIN_LOCAL_MIGRATION_REQUIRED`.
 
-A única pendência permitida é `132eb226-f4e4-419d-b79f-21dd0e6e64c1`, `history/reading`, `RESPONSE_TOO_LARGE`, sem resposta, término ou resolução e com zero processados. O plano conserva uma cópia JSON da linha completa, com precisão PostgreSQL, e compara todos os campos novamente durante execução/reconciliação. Nenhuma coluna dessa leitura é atualizada.
+O pai obrigatório é `132eb226-f4e4-419d-b79f-21dd0e6e64c1`, `history/reading`, `RESPONSE_TOO_LARGE`, sem resposta, término ou resolução e com zero processados. O plano conserva uma cópia JSON da linha completa, com precisão PostgreSQL, e compara todos os campos novamente durante execução/reconciliação. Nenhuma coluna dessa leitura é atualizada. A guarda `guard()` também admite filhos `received` com array vazio comprovado pelos journals; `assertStage()` mantém sua função de controlar os degraus de lote.
+
+Essa exceção requer `history_gap_plans`, `history_gap_children`, `history_gap_responses`
+e `history_gap_members` da migration local 007 já existente, sem migration nova.
+Cada filho pendente deve ter vínculo real, manifesto íntegro do mesmo pai/origem/
+destino/binding/schema, bloco e spec exatos, início posterior ao pai, resposta
+vazia com hash/tamanho íntegros, zero processados, recebido NULL/zero, nenhum
+término/resolução e nenhum membro recuperado. A validação usa locks de linha e
+se repete após a intenção durável, antes do COMMIT remoto. Não exige autenticação
+nem configuração HTTP para drenar: os vínculos de entrega e journals locais são
+conferidos sem chamar a OLOS. Uma leitura sem prova ou em `reading` bloqueia;
+simplesmente colocar `gap` no JSON não autoriza a exceção.
 
 O plano seleciona somente pendentes da origem, ordenados pelo `target_id` existente, cuja admissão local antecede `started_at` dessa leitura. O mapping também deve antecedê-la. A revisão sobre `f0ce103` restringe a data da chamada a setembro/outubro de 2026 em America/Sao_Paulo, com operador identificado, antes do LIMIT; ver [regra e lacunas atuais](identified-operator-import-v1.md). Admissões locais posteriores exigem a proveniência de recuperação descrita abaixo. Aceitam-se `capture` e `legacy_backlog`; outras origens, mappings ausentes, hash divergente, identidade divergente ou payload fora dos 14 campos v1 bloqueiam. Não se pula uma linha inválida dentro da seleção para completar o lote.
 
 A exceção dos três registros de homologação e seu journal de até três registros permanecem inalterados. Os comandos seletivos antigos não ganham escopo adicional.
+
+## Homologação com filho vazio preservado
+
+Procedimento para janela operacional autorizada; não executado nesta revisão.
+O incidente informado identifica o filho `09aeaeaa-cc32-415c-8137-2b95729ac131`,
+manifesto `62f98c90-d3db-498c-a93b-ba844619e6a4`, bloco 1. Não há whitelist desses
+UUIDs: possuir esses nomes sem os journals válidos não autoriza entrega.
+
+1. Manter Admin encerrado, scheduler disabled/STOPPED, Delivery ready/paused,
+   escrita geral false e ausência de COMMIT incerto. Conferir as migrations
+   locais existentes; não executar `resolve`, `reset-read-data`, `capture-history`
+   ou releitura. Preservar os arquivos de configuração/credenciais privados.
+2. Guardar evidência privada somente leitura do pai, filho e journals antes da
+   operação. Por exemplo, em transação `BEGIN READ ONLY`, consultar
+   `SELECT to_jsonb(r) FROM olos_http.reads r WHERE id IN
+   ('132eb226-f4e4-419d-b79f-21dd0e6e64c1','09aeaeaa-cc32-415c-8137-2b95729ac131')`;
+   conferir plano/vínculo/resposta nas tabelas `history_gap_*`. O filho deve
+   continuar `received` com `[]` e sem membros. Não editar hashes nem estados.
+3. Preparar o plano de 100 abaixo, revisar UUID/hash e IDs selecionados no journal.
+   Devem ser pendentes com operador/período válidos e IDs originais. Mapping e
+   outbox devem anteceder o pai ou apresentar prova de filho `done` não vazio.
+   Se faltarem 100 elegíveis para a primeira etapa, parar; não completar com
+   tentativas sem operador, IDs legados ou dados posteriores sem proveniência.
+4. Executar somente o UUID/hash/parâmetros revisados por `corporate-drain-backlog`
+   e conferir `corporate-drain-status`. Comparar integralmente pai, filho,
+   journals de lacunas e confirmados anteriores com a evidência inicial.
+   Conferir novos recibos e igualdade dos payloads. O bloco vazio continua sem
+   recuperação e não gera nenhum membro, chamada ou confirmação própria.
+5. Crescer 100 → 250 → 500 → 1.000 somente pelas etapas existentes. Interrupção
+   com intenção durável exige `corporate-drain-reconcile` específico, sem retry.
+   Se uma prova mudar, conservar o bloqueio e investigar; não reparar leituras
+   ou journals para fazê-los passar na guarda.
+
+Planos antigos ainda não iniciados com IDs legados são rejeitados antes de novas
+escritas; cancelar e replanejar pelo fluxo existente, sem reescrever seus hashes.
+Intenções antigas conservam reconciliação com o escopo original. O filtro de IDs
+originais não altera os recibos de uma entrega anterior.
+
+Validação da revisão sobre `b4aea2d`: typecheck/build e 111 unitários aprovados;
+163 testes no runner Corporate Delivery/Store/Admin e 39 no Corporate Sync,
+todos sem skips, em PostgreSQL 16 descartável. Cobertura inclui pai sozinho,
+filho vazio preservado, órfãos/desconhecidos, POST incerto, manifesto/hash
+divergente, filho `done` com proveniência coexistindo com filho vazio,
+registros anteriores/posteriores ao corte, IDs originais antes da adoção,
+operador/período, deduplicação, recibos e COMMIT incerto. Nenhum banco real,
+serviço OLOS real, commit, push ou deploy foi acionado.
 
 ## Plano e autorização
 

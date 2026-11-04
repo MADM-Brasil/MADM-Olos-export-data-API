@@ -1,5 +1,5 @@
 import { identityCommand } from '../src/identity/migrate.js';
-import { prepareGaps, gapConsent, bodyHash, type GapPlan } from '../src/history-gaps.js';
+import { prepareGaps, beginGap, stageGap, recoveredGapProof, gapConsent, bodyHash, type GapPlan } from '../src/history-gaps.js';
 import { HttpTransport } from '../src/http.js';
 import { dependencies, referenceRows } from '../src/identity/dependencies.js';
 import { randomUUID } from 'node:crypto';
@@ -1762,7 +1762,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       const b=p.manifest.blocks[0]!;
       return gapWorker(s,response).captureReread(p.manifest.parent,b.date,b.start,b.end,gapAuth(p,'CAPTURE'),hooks);
     };
-    await t.test('gaps: empty reread of 100 IDs is not recovery, never retries, preserves backlog and cannot bypass drain guards',async()=>{
+    await t.test('gaps: empty reread stays received while old original-ID backlog drains, without recovery or retry',async()=>{
       const cfg=await gapFixture(Array.from({length:100},(_,i)=>record(1000000+i))),s=await open(cfg);
       const p=await prepareGaps(s,gapInput()),parent=await gapParent(),box=await outbox(),destination=await remoteRows();
       let calls=0;const id=await gapCapture(s,p,async()=>{calls++;return '[]';});
@@ -1777,8 +1777,132 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       assert.deepEqual((await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r WHERE id=$1',[id])).rows[0],child);
       assert.equal(await count(local,'olos_http.history_gap_members'),0);assert.equal(calls,1);
       await close(resumed);
-      await assert.rejects(backlogPlan(cfg),/DRAIN_HISTORY_CHANGED/);
-      assert.deepEqual(await gapParent(),parent);assert.deepEqual(await outbox(),box);assert.deepEqual(await remoteRows(),destination);
+      const run=await backlogPlan(cfg);await drainCommand(cfg,run);await drainCommand(cfg,run);
+      assert.equal(await destinationCount(),destination.length+100);assert.equal(calls,1);
+      assert.deepEqual((await remoteRows()).slice(0,destination.length),destination);
+      assert.deepEqual(await gapParent(),parent);
+      assert.deepEqual((await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r WHERE id=$1',[id])).rows[0],child);
+      assert.equal(await count(local,'olos_http.history_gap_members'),0);
+      const after=await outbox();
+      assert.deepEqual(after.map(e=>[e.payload,e.payload_hash,e.source_hash,e.target_id]),box.map(e=>[e.payload,e.payload_hash,e.source_hash,e.target_id]));
+      assert.ok(after.every(e=>e.state==='confirmed'));
+    });
+    async function emptyGapBacklog(body='[]'){
+      const cfg=await gapFixture(Array.from({length:104},(_,i)=>record(1000000+i,
+        i===0?{AgentId:'0'}:i===1?{StartDate:'2026-11-01T00:00:00-03:00'}:i===2?{AgentId:'8'}:{})));
+      const s=await open(cfg),p=await prepareGaps(s,gapInput()),a=gapAuth(p,'CAPTURE');
+      const id=await beginGap(s,a);await stageGap(s,a,id,body,1);
+      await close(s);return {cfg,p,id};
+    }
+    const gapJournals=async()=>({
+      plans:(await local.query('SELECT * FROM olos_http.history_gap_plans ORDER BY id')).rows,
+      children:(await local.query('SELECT * FROM olos_http.history_gap_children ORDER BY read_id')).rows,
+      responses:(await local.query('SELECT * FROM olos_http.history_gap_responses ORDER BY read_id')).rows,
+      members:(await local.query('SELECT * FROM olos_http.history_gap_members ORDER BY source_key,source_id')).rows,
+    });
+    await t.test('drain empty-child exception rejects unknown/orphaned/uncertain/nonempty reads and journal or manifest divergence',async()=>{
+      const changes=[
+        "INSERT INTO olos_http.reads(id,source_key,target_table,spec) SELECT gen_random_uuid(),source_key,target_table,'{\"kind\":\"current\"}' FROM olos_http.reads WHERE id=$1",
+        "DELETE FROM olos_http.history_gap_responses WHERE read_id=$1",
+        "DELETE FROM olos_http.history_gap_children WHERE read_id=$1",
+        "DELETE FROM olos_http.history_gap_plans WHERE id=(SELECT plan_id FROM olos_http.history_gap_children WHERE read_id=$1)",
+        "UPDATE olos_http.reads SET state='reading',response_body=NULL WHERE id=$1",
+        "UPDATE olos_http.reads SET response_body='[{}]' WHERE id=$1",
+        "UPDATE olos_http.reads SET response_body='[ ]' WHERE id=$1",
+        "UPDATE olos_http.reads SET processed_count=1 WHERE id=$1",
+        "UPDATE olos_http.reads SET received_count=1 WHERE id=$1",
+        "UPDATE olos_http.reads SET finished_at=clock_timestamp() WHERE id=$1",
+        "UPDATE olos_http.reads SET resolution='invented' WHERE id=$1",
+        "UPDATE olos_http.reads SET target_table='wrong' WHERE id=$1",
+        "UPDATE olos_http.reads SET started_at='2020-01-01' WHERE id=$1",
+        "UPDATE olos_http.reads SET spec=jsonb_set(spec,'{gap,block}','2') WHERE id=$1",
+        "UPDATE olos_http.history_gap_responses SET bytes=3 WHERE read_id=$1",
+        "UPDATE olos_http.history_gap_plans SET hash=repeat('f',64) WHERE id=(SELECT plan_id FROM olos_http.history_gap_children WHERE read_id=$1)",
+        "INSERT INTO olos_http.history_gap_members(source_key,source_id,read_id,target_id,source_hash,payload_hash) SELECT source_key,source_id,$1,target_id::text,source_hash,payload_hash FROM olos_http.corporate_outbox WHERE source_id='1000003'",
+      ];
+      for(const sql of changes){
+        const {cfg,id}=await emptyGapBacklog();
+        // Deliberate disposable corruption only, including otherwise immutable journals/FKs.
+        await local.query("SET session_replication_role='replica'");
+        try{await local.query(sql,[id]);}finally{await local.query("SET session_replication_role='origin'");}
+        const before=await backlogEvidence(),box=await outbox(),journal=await gapJournals(),destination=await remoteRows();
+        await assert.rejects(backlogPlan(cfg),/GAP_PENDING_CHILD_INVALID|SOURCE_DESTINATION_BINDING_CHANGED/);
+        assert.deepEqual(await backlogEvidence(),before);assert.deepEqual(await outbox(),box);
+        assert.deepEqual(await gapJournals(),journal);assert.deepEqual(await remoteRows(),destination);
+        assert.equal(await count(local,'olos_http.corporate_drain_runs'),0);
+      }
+      for(const body of ['[{}]','null','{}','invalid']){
+        const {cfg}=await emptyGapBacklog(body);
+        await assert.rejects(backlogPlan(cfg),/GAP_PENDING_CHILD_INVALID/);
+        assert.equal(await destinationCount(),2);
+      }
+      for(const field of ['parent','source','target','binding','schema','history'] as const){
+        const {cfg,p}=await emptyGapBacklog();
+        const m={...p.manifest,[field]:field==='history'?{...p.manifest.history as object,error_code:'changed'}:'changed'};
+        await local.query("SET session_replication_role='replica'");
+        try{await local.query('UPDATE olos_http.history_gap_plans SET manifest=$2,hash=$3 WHERE id=$1',[p.id,m,drainHash(m)]);}
+        finally{await local.query("SET session_replication_role='origin'");}
+        await assert.rejects(backlogPlan(cfg),/GAP_PENDING_CHILD_INVALID/);
+        assert.equal(await destinationCount(),2);
+      }
+    });
+    await t.test('drain empty-child exception retains operator/date/cutoff filters and requires original IDs before adoption',async()=>{
+      const {cfg,id}=await emptyGapBacklog();
+      // 1000003 is otherwise eligible, but its mapping was created after the parent.
+      await local.query("UPDATE olos_http.records SET created_at=clock_timestamp() WHERE source_id='1000003'");
+      const s=await open(cfg);await seedLegacyIds(s.client!,cfg,[record(1000999)],cache);await close(s);
+      const before=await backlogEvidence(),box=await outbox(),journal=await gapJournals();
+      const run=await backlogPlan(cfg);
+      assert.deepEqual((await backlogJournal(run.runId))[0].evidence.map((e:any)=>e.source_id),
+        Array.from({length:100},(_,i)=>String(1000004+i)));
+      await drainCommand(cfg,run);
+      assert.deepEqual(await backlogEvidence(),before);assert.deepEqual(await gapJournals(),journal);
+      assert.deepEqual((await outbox()).filter(e=>e.state==='pending'),box.filter(e=>['1000000','1000001','1000002','1000003','1000999'].includes(e.source_id)));
+      assert.equal((await local.query('SELECT state FROM olos_http.reads WHERE id=$1',[id])).rows[0].state,'received');
+      // A coherent old ID is still excluded even with no identity_contract installed.
+      for(const table of ['records','corporate_outbox'])await local.query(`UPDATE olos_http.${table}
+        SET created_at=(SELECT started_at-interval '1 second' FROM olos_http.reads WHERE id=$1) WHERE source_id='1000999'`,[preservedHistoryRead]);
+      await assert.rejects(backlogPlan(cfg,{...drainLimits,batchSize:1}),/DRAIN_INSUFFICIENT_BACKLOG/);
+      const old=await legacyBacklogPlan(cfg,['1000999'],{...drainLimits,batchSize:1});
+      await assert.rejects(drainCommand(cfg,old),/DRAIN_ORIGINAL_ID_PLAN_CANCEL_REQUIRED/);
+    });
+    await t.test('drain revalidates empty-child evidence after durable intent and retains UNKNOWN until reconciliation',async()=>{
+      for(const afterRemote of [false,true]){
+        const {cfg,id}=await emptyGapBacklog(),run=await backlogPlan(cfg),journal=await gapJournals(),parent=await gapParent();
+        await assert.rejects(drainCommand(cfg,run,undefined,afterRemote?
+          {afterRemoteCommit:async()=>{throw new Error('lost ACK');}}:
+          {afterIntent:async()=>{await local.query("UPDATE olos_http.reads SET response_body='[ ]' WHERE id=$1",[id]);}}),/CORPORATE_COMMIT_UNKNOWN/);
+        assert.equal(await destinationCount(),afterRemote?102:2);
+        await assert.rejects(drainCommand(cfg,run),/DRAIN_RECONCILIATION_REQUIRED/);
+        if(!afterRemote){
+          await assert.rejects(drainCommand(cfg,backlogReconciliation(run)),/GAP_PENDING_CHILD_INVALID/);
+          // Restore synthetic bytes only; runtime never repairs a response.
+          await local.query("UPDATE olos_http.reads SET response_body='[]' WHERE id=$1",[id]);
+        }
+        const destination=await remoteRows();await drainCommand(cfg,backlogReconciliation(run));
+        assert.deepEqual(await remoteRows(),destination);assert.deepEqual(await gapJournals(),journal);assert.deepEqual(await gapParent(),parent);
+        assert.equal((await local.query('SELECT state FROM olos_http.reads WHERE id=$1',[id])).rows[0].state,'received');
+        assert.equal((await control()).paused,true);assert.equal((await control()).blocked,false);
+      }
+    });
+    await t.test('empty block cannot become recovery proof by changing state to done and fabricating membership',async()=>{
+      const {cfg,id}=await emptyGapBacklog(),s=await open(cfg);
+      await seedLegacyIds(s.client!,cfg,[record(46671511)],cache);
+      const entry=(await outbox()).find(e=>e.source_id==='46671511')!;
+      const payload={...entry.payload,internal_id_olos:'46671511'} as Row;
+      await local.query("UPDATE olos_http.records SET target_id=46671511 WHERE source_id='46671511'");
+      await local.query("UPDATE olos_http.corporate_outbox SET target_id=46671511,payload=$1,payload_hash=$2 WHERE source_id='46671511'",[payload,digest(payload)]);
+      await local.query(`INSERT INTO olos_http.history_gap_members(source_key,source_id,read_id,target_id,source_hash,payload_hash)
+        SELECT source_key,source_id,$1,target_id::text,source_hash,payload_hash FROM olos_http.corporate_outbox WHERE source_id='46671511'`,[id]);
+      const proof={source_id:'46671511',target_id:'46671511',source_hash:entry.source_hash,payload_hash:digest(payload)};
+      for(const count of [0,1]){
+        // Deliberately inconsistent fixture; no production repair is implemented.
+        await local.query("UPDATE olos_http.reads SET state='done',processed_count=$2,received_count=$2,finished_at=clock_timestamp() WHERE id=$1",[id,count]);
+        const before=await backlogEvidence(),journal=await gapJournals();
+        await assert.rejects(recoveredGapProof(s.client!,cfg,[proof]),/GAP_PROVENANCE_INVALID/);
+        assert.deepEqual(await backlogEvidence(),before);assert.deepEqual(await gapJournals(),journal);
+      }
+      await close(s);assert.equal(await destinationCount(),2);
     });
     await t.test('gaps: exact interior holes, unchanged confirmed evidence, raw response before persistence, no baseline discard and idempotent recovery',async()=>{
       const start=46671511,records=Array.from({length:5},(_,i)=>record(start+i,{CallId:String(start+i),StartDate:'2026-09-01T10:00:00-03:00'}));
@@ -1944,6 +2068,9 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       const raw=JSON.stringify(Array.from({length:352},(_,i)=>record(46671511+i,{AgentId:i===0?'0':i===200?'8':'7',
         StartDate:'2026-09-15T10:00:00-03:00',CallId:String(46671511+i)})));
       const child=await gapCapture(s,p,async()=>raw);await s.recoverGap(gapAuth(p,'PERSIST'),gapRefs);
+      const emptyPlan=await prepareGaps(s,gapInput(46672000,46672099)),emptyAuth=gapAuth(emptyPlan,'CAPTURE');
+      const emptyId=await beginGap(s,emptyAuth);await stageGap(s,emptyAuth,emptyId,'[]',1);
+      const emptyBefore=(await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r WHERE id=$1',[emptyId])).rows[0];
       // An unrelated post-cutoff record has no recovery membership and stays excluded.
       await seedLegacyIds(s.client!,cfg,[record(46671999)],cache);await close(s);
       const box=await outbox();const excluded=box.filter(e=>['46671511','46671711','46671999'].includes(e.source_id));
@@ -1960,6 +2087,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
         await drainCommand(cfg,run);await drainCommand(cfg,run);
       }
       assert.equal(await destinationCount(),352);assert.deepEqual(await gapParent(),parent);
+      assert.deepEqual((await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r WHERE id=$1',[emptyId])).rows[0],emptyBefore);
       assert.deepEqual((await outbox()).filter(e=>['46671511','46671711','46671999'].includes(e.source_id)),excluded);
       assert.deepEqual(await corporateMetadata(),metadata);assert.equal((await control()).paused,true);
       assert.ok((await outbox()).filter(e=>e.source_id!=='46671999').every(e=>String(e.target_id)===e.source_id||e.origin==='legacy_receipt'));
@@ -1976,7 +2104,8 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       const before=await incidentEvidence();
       const excludedBefore=(await outbox()).filter(e=>Number(e.source_id)<600000&&e.state==='pending');
       await assert.rejects(identityPlan(cfg,'pending',ids.slice(0,100)),/IDENTITY_STAGE_NOT_PROVEN/);
-      const stale=await backlogPlan(cfg);
+      await assert.rejects(backlogPlan(cfg),/DRAIN_INSUFFICIENT_BACKLOG/);
+      const stale=await legacyBacklogPlan(cfg,ids.slice(0,100));
       await assert.rejects(identityPlan(cfg,'pending',ids.slice(0,3)),/DRAIN_OPEN_RUN_EXISTS/);
       await drainCommand(cfg,{kind:'cancel',runId:stale.runId,planHash:stale.planHash,confirmation:drainConsent('cancel',stale.runId,stale.planHash)});
       let offset=0;

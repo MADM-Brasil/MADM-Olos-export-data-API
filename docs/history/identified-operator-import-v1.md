@@ -1,6 +1,6 @@
 # Importação histórica v1 somente com operador
 
-Revisão atual sobre `feature/exportdata-history`, HEAD `f0ce103` (04/11/2026).
+Revisão atual sobre `feature/exportdata-history`, HEAD `b4aea2d` (04/11/2026).
 Escopo: admissão de pendentes em `identity-main` e em `corporate-drain-backlog`.
 O volume atualizado de **11.259 pendentes com operador** foi informado pelo
 responsável, sem nova consulta operacional. Reaproveitar essa outbox existente;
@@ -16,11 +16,15 @@ pela validação de nome e pelas proteções de identidade/proveniência.
 | `corporate-drain-plan` / `corporate-drain-backlog` | Já usa os pendentes locais e filtra por operador antes do LIMIT. Faltava limitar a data da chamada. Agora seleciona setembro/outubro e rejeita nomes que sejam números/marcadores de ausência, revalidando antes de novas escritas. |
 
 Uma resposta vazia preservada em filho `received` continua bloqueando novas
-faixas e a drenagem (`DRAIN_HISTORY_CHANGED` por haver outra leitura pendente).
-Não marcar o filho como `done`/`resolved`, apagar a resposta ou alterar o pai para
-liberar entregas. Esse estado exige revisão/reconciliação específica com evidência;
-esta correção não cria uma exceção para contorná-lo. Se o filho já estiver
-concluído por outro caminho, isso não comprova recuperação dos IDs ausentes.
+capturas e não pode ser recuperada como bloco completo. A drenagem agora permite
+a coexistência desse filho somente após validar os journals de plano, vínculo e
+resposta, hash do manifesto/corpo, bloco, origem, destino, binding, schema e
+snapshot integral do pai. Exige zero processados, contador recebido NULL/zero,
+nenhum término/resolução e nenhum membro recuperado. Leituras desconhecidas,
+órfãs, em `reading`, respostas não vazias e divergências continuam bloqueadas.
+Não marcar o filho como `done`/`resolved`, apagar a resposta ou alterar o pai.
+Mesmo `done`, um corpo vazio não fornece proveniência de recuperação.
+Ver [homologação da coexistência com filho vazio](backlog-drain-v1.md#homologação-com-filho-vazio-preservado).
 
 Não há evidência nova de cobertura integral de setembro ou outubro. A faixa de
 100 IDs com `[]` permanece **não recuperada**; sem consultar o banco operacional
@@ -65,7 +69,10 @@ o source_hash e as evidências antigas no journal.
 
 `corporate-drain-plan` filtra antes do LIMIT e aplica os limites e degraus já
 existentes. Se não houver 100 elegíveis para a primeira drenagem, recusa o plano.
-Após a adoção de identidade, exige também `target_id = source_id`, como antes.
+Exige `payload.internal_id_olos = outbox.target_id = records.target_id = source_id`
+mesmo antes da adoção de identidade. IDs legados ficam pendentes para o procedimento
+de migração já existente. Mapping e outbox devem anteceder o início do pai; registros
+posteriores exigem membro de filho `done` com proveniência íntegra.
 A execução confere **todos** os lotes do manifesto antes de iniciar o primeiro,
 e repete a validação em cada lote e antes do COMMIT remoto. Tentativas excluídas
 permanecem locais e pendentes, com os mesmos IDs, payloads, hashes e timestamps.
@@ -77,6 +84,8 @@ plano anterior. Um plano compatível pode executar com seu UUID/hash original.
 Um plano ainda não iniciado com item sem operador falha com
 `IDENTITY_OPERATOR_PLAN_CANCEL_REQUIRED` ou `DRAIN_OPERATOR_PLAN_CANCEL_REQUIRED`.
 Na drenagem, datas fora de setembro/outubro geram `DRAIN_PERIOD_PLAN_CANCEL_REQUIRED`.
+IDs legados geram `DRAIN_ORIGINAL_ID_PLAN_CANCEL_REQUIRED` antes de novas escritas;
+a reconciliação de intenções antigas preserva o escopo original.
 Permanece `planned`, preservando evidências e sem iniciar entrega parcial.
 É necessário **cancelamento autorizado** pelo comando existente e, depois,
 novo plano com escopo elegível. Novos planos continuam bloqueados enquanto houver
@@ -97,9 +106,10 @@ recebem o novo filtro. Este patch não renumera nem modifica chamadas confirmada
    `OLOS_CORPORATE_WRITE_ENABLED=false` e Delivery pausado. Usar o novo binário
    compatível e a revisão de dependências aprovada. Preservar a leitura
    `132eb226-f4e4-419d-b79f-21dd0e6e64c1` em `reading/RESPONSE_TOO_LARGE`.
-2. Conferir primeiro as leituras pendentes e os planos existentes. Se a releitura
-   vazia ainda estiver `received`, **não executar a drenagem**: o bloqueio descrito
-   acima permanece. Para um plano incompatível ainda `planned`,
+2. Conferir primeiro as leituras pendentes e os planos existentes. Uma releitura
+   vazia `received` só pode coexistir após passar integralmente pelas validações
+   descritas acima; a CLI as executa sob locks, inclusive antes do COMMIT remoto.
+   Para um plano incompatível ainda `planned`,
    revisar UUID/hash e obter autorização específica de cancelamento. Usar
    `identity-main cancel` ou `corporate-drain-cancel`, conforme os procedimentos
    vinculados abaixo. Para intenção incerta, seguir a reconciliação existente.
@@ -146,15 +156,17 @@ de São Paulo, equivalência SQL/JavaScript, lotes 3/100/250/500/1.000,
 tabulações, preservação integral dos excluídos, v1, deduplicação/idempotência,
 planos antigos e cancelamento autorizado, reconciliação de entrega anterior sem
 operador/fora do período, locks, recibos, Kommo e leitura interrompida. O caso
-específico `[]` para 100 IDs preserva pai, filho, resposta e backlog, não repete
-HTTP nem permite contornar o bloqueio de drenagem. Nenhum comando operacional
+específico `[]` para 100 IDs preserva pai, filho, resposta, payloads e journals,
+não repete HTTP e permite somente a drenagem dos elegíveis com identidade original.
+Filhos desconhecidos/órfãos/incertos e divergências de resposta/manifesto são
+rejeitados; deriva após intenção durável conserva COMMIT_UNKNOWN. Nenhum comando operacional
 foi executado; nenhum banco real foi acessado.
 
 Resultados desta revisão, em Node 24 e PostgreSQL 16 descartável (04/11/2026):
 
 - `npm run typecheck` e `npm run build`: aprovados.
 - `npm test`: 111/111, sem skips.
-- `scripts/test-corporate-delivery.sh`: 159/159, sem skips, incluindo Store/Admin.
+- `scripts/test-corporate-delivery.sh`: 163/163, sem skips, incluindo Store/Admin.
 - `scripts/test-corporate-sync.sh`: 39/39, sem skips.
 - `git diff --check`: aprovado.
 
