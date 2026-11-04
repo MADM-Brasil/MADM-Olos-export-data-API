@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Client, PoolClient } from 'pg';
 import { Store } from '../store.js';
+import { assertEmptyGapChildren } from '../history-gaps.js';
 import type { Config } from '../config.js';
 import { originalInternalId } from '../mapping.js';
 import { quote } from '../schema.js';
@@ -41,14 +42,16 @@ async function guard(db:PoolClient,cfg:Config,owns=false){
  const s=(await db.query('SELECT * FROM olos_http.worker_settings WHERE source_key=$1 FOR SHARE NOWAIT',[cfg.sourceKey])).rows[0];
  if(!s||s.enabled||s.desired_state!=='STOPPED'||s.runtime_state!=='STOPPED')throw new SyncError('HISTORY_SCHEDULER_NOT_STOPPED');
  const reads=(await db.query("SELECT to_jsonb(h) AS h FROM olos_http.reads h WHERE source_key=$1 AND state IN ('reading','received') FOR SHARE NOWAIT",[cfg.sourceKey])).rows;
- const h=reads[0]?.h;
- if(reads.length!==1||h.id!==preservedHistoryRead||h.state!=='reading'||h.error_code!=='RESPONSE_TOO_LARGE'||h.spec.kind!=='history'||h.processed_count!==0||h.response_body!==null||h.finished_at!==null||h.resolution!==null||h.target_table!=='"raw"."olos_calls"')throw new SyncError('IDENTITY_HISTORY_CHANGED');
+ const h=reads.find(r=>r.h.id===preservedHistoryRead)?.h;
+ if(!h||h.state!=='reading'||h.error_code!=='RESPONSE_TOO_LARGE'||h.spec.kind!=='history'||h.processed_count!==0||h.response_body!==null||h.finished_at!==null||h.resolution!==null||h.target_table!=='"raw"."olos_calls"')throw new SyncError('IDENTITY_HISTORY_CHANGED');
  const c=(await db.query('SELECT * FROM olos_http.corporate_control WHERE singleton FOR UPDATE NOWAIT')).rows[0];
  if(!c?.ready||!c.paused||c.binding!==cfg.corporateDelivery!.binding||c.source_key!==cfg.sourceKey||c.target_table!==h.target_table||new Map(c.destination_shape).has('id_operador_olos'))throw new SyncError('IDENTITY_CONTROL_INVALID');
  if(owns?(!c.blocked||c.last_code!==identityBlock):c.blocked||c.last_code==='CORPORATE_COMMIT_UNKNOWN')throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
  if((await db.query("SELECT 1 FROM olos_http.corporate_selective_commits WHERE state='unresolved'")).rowCount)throw new SyncError('SELECTIVE_COMMIT_RECONCILIATION_REQUIRED');
  if((await db.query("SELECT 1 FROM olos_http.corporate_drain_runs WHERE state IN ('planned','running','failed')")).rowCount)throw new SyncError('DRAIN_OPEN_RUN_EXISTS');
  if((await db.query('SELECT 1 FROM corporate_sync.control WHERE pending IS NOT NULL')).rowCount)throw new SyncError('LEGACY_STATE_NOT_RECONCILED');
+ await assertEmptyGapChildren(db,cfg,h.target_table,h,c.schema_hash,
+  reads.filter(r=>r.h.id!==preservedHistoryRead).map(r=>r.h.id as string));
  await db.query('LOCK TABLE raw.olos_calls IN ACCESS EXCLUSIVE MODE NOWAIT');
  await db.query('LOCK TABLE olos_http.records,olos_http.corporate_outbox,corporate_sync.receipts,corporate_sync.control IN SHARE ROW EXCLUSIVE MODE NOWAIT');
  return {history:h,control:c};

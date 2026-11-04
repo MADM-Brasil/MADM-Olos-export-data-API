@@ -195,7 +195,7 @@ export async function recordGapMembers(store:Store,scope:GapScope,ids:string[]){
   WHERE source_key=$1 AND source_id=$2 ON CONFLICT(source_key,source_id) DO NOTHING`,[store.cfg.sourceKey,id,scope.readId]);
 }
 
-// Drain-only exception for durable empty responses. This does not recover a
+// Drain/identity exception for durable empty responses. This does not recover a
 // block, grant membership, change a read, or authorize another OLOS request.
 // Caller holds the source/history/delivery locks and rechecks before COMMIT.
 export async function assertEmptyGapChildren(db:PoolClient,cfg:Config,target:string,history:unknown,schema:string,ids:string[]){

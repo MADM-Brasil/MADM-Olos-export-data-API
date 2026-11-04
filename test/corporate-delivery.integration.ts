@@ -1801,6 +1801,183 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
       responses:(await local.query('SELECT * FROM olos_http.history_gap_responses ORDER BY read_id')).rows,
       members:(await local.query('SELECT * FROM olos_http.history_gap_members ORDER BY source_key,source_id')).rows,
     });
+    async function identityHistoryFixture(body:string|null='[]',initialIdsLast=false){
+      const cfg={...await historyConfig(),ingestionBaseline:'2026-09-01T00:00:00Z'};
+      for(const file of ['003_selective_commit.sql','005_backlog_drain.sql','006_original_identity.sql','007_history_gaps.sql'])
+        await local.query(await readFile(new URL(`../migrations/${file}`,import.meta.url),'utf8'));
+      const ids=Array.from({length:103},(_,i)=>String((initialIdsLast&&i<3?2000000:1000000)+i)),s=await open(cfg);
+      await seedLegacyIds(s.client!,cfg,ids.map((id,i)=>record(Number(id),{
+        StartDate:i%2?'2026-09-15T10:00:00-03:00':'2026-10-15T10:00:00-03:00'})),cache);
+      await close(s);
+      await local.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,error_code)
+        VALUES($1,$2,$3,'{"kind":"history"}','RESPONSE_TOO_LARGE')`,[preservedHistoryRead,cfg.sourceKey,'"raw"."olos_calls"']);
+      // Prove the existing 3 -> 100 stage by executing the real disposable protocol.
+      const initial=await identityPlan(cfg,'pending',ids.slice(0,3));await identityCommand(cfg,identityAction(initial));
+      let child:string|null=null;
+      if(body!==null){
+        const store=await open(cfg),plan=await prepareGaps(store,gapInput()),auth=gapAuth(plan,'CAPTURE');
+        child=await beginGap(store,auth);await stageGap(store,auth,child,body,1);await close(store);
+      }
+      return {cfg,ids:ids.slice(3),child};
+    }
+    const identityHistoryEvidence=async()=>({
+      local:await coordinatedLocalEvidence(),
+      reads:(await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r ORDER BY id')).rows,
+      gaps:await gapJournals(),destination:await remoteRows(),metadata:await corporateMetadata(),
+      control:await control(),contract:(await local.query('SELECT * FROM olos_http.identity_contract')).rows,
+    });
+    await t.test('identity CLI history: exact 100 pending IDs with parent alone or proven empty child; invalid evidence fails closed',async t=>{
+      let requests=0;const server=createServer((_,res)=>{requests++;res.end('unexpected');});
+      await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const env={...base,ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:remoteUrl.toString(),
+        OLOS_CORPORATE_CA_FILE:process.env.OLOS_DIRECT_TEST_CA_FILE!,OLOS_CORPORATE_WRITE_ENABLED:'false',
+        OLOS_BASE_URL:`http://127.0.0.1:${(server.address() as {port:number}).port}`};
+      const cases:{name:string;body:string|null;sql?:string;error?:string}[]=[
+        {name:'parent alone',body:null},
+        {name:'received empty child with intact journals',body:'[]'},
+        {name:'nonempty received body with its original hash',body:'[{}]',error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'child without response journal',body:'[]',sql:'DELETE FROM olos_http.history_gap_responses WHERE read_id=$1',error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'orphan child',body:'[]',sql:'DELETE FROM olos_http.history_gap_children WHERE read_id=$1',error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'divergent response hash',body:'[]',sql:"UPDATE olos_http.history_gap_responses SET body_hash=repeat('f',64) WHERE read_id=$1",error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'divergent manifest hash',body:'[]',sql:"UPDATE olos_http.history_gap_plans SET hash=repeat('f',64) WHERE id=(SELECT plan_id FROM olos_http.history_gap_children WHERE read_id=$1)",error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'unknown received child',body:'[]',sql:`INSERT INTO olos_http.reads(id,source_key,target_table,spec,state,response_body)
+          SELECT gen_random_uuid(),source_key,target_table,spec,'received','[]' FROM olos_http.reads WHERE id=$1`,error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'uncertain reading child',body:'[]',sql:"UPDATE olos_http.reads SET state='reading',response_body=NULL WHERE id=$1",error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'raw body altered after receipt',body:'[]',sql:"UPDATE olos_http.reads SET response_body='[ ]' WHERE id=$1",error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'manifest link altered',body:'[]',sql:"UPDATE olos_http.reads SET spec=jsonb_set(spec,'{gap,planId}',to_jsonb(gen_random_uuid()::text)) WHERE id=$1",error:'GAP_PENDING_CHILD_INVALID'},
+        {name:'parent altered',body:'[]',sql:"UPDATE olos_http.reads SET processed_count=1 WHERE id='132eb226-f4e4-419d-b79f-21dd0e6e64c1' AND $1::uuid IS NOT NULL",error:'IDENTITY_HISTORY_CHANGED'},
+      ];
+      try{
+        for(const c of cases)await t.test(c.name,async()=>{
+          const {ids,child}=await identityHistoryFixture(c.body);
+          if(c.sql){
+            // Deliberate corruption only in the disposable database, including immutable journals.
+            await local.query("SET session_replication_role='replica'");
+            try{await local.query(c.sql,[child]);}finally{await local.query("SET session_replication_role='origin'");}
+          }
+          const before=await identityHistoryEvidence();
+          const plans=(await local.query('SELECT * FROM olos_http.identity_plans ORDER BY id')).rows;
+          const runs=(await local.query('SELECT * FROM olos_http.identity_runs ORDER BY id')).rows;
+          const events=(await local.query('SELECT * FROM olos_http.identity_events ORDER BY seq')).rows;
+          const cli=()=>promisify(execFile)(process.execPath,['dist/identity-main.js','plan','--kind','pending',
+            '--source-ids',ids.join(','),'--dependency-review','b'.repeat(64)],{env,timeout:15000});
+          if(c.error){
+            await assert.rejects(cli(),(e:any)=>e.code===1&&JSON.parse(e.stdout.trim()).error===c.error);
+            assert.deepEqual((await local.query('SELECT * FROM olos_http.identity_plans ORDER BY id')).rows,plans);
+            assert.deepEqual((await local.query('SELECT * FROM olos_http.identity_runs ORDER BY id')).rows,runs);
+            assert.deepEqual((await local.query('SELECT * FROM olos_http.identity_events ORDER BY seq')).rows,events);
+          }else{
+            const output=JSON.parse((await cli()).stdout.trim());assert.equal(output.selected,100);assert.equal(output.state,'planned');
+            const plan=(await local.query('SELECT manifest,hash FROM olos_http.identity_plans WHERE id=$1',[output.id])).rows[0];
+            assert.deepEqual(plan.manifest.ids,ids.slice().sort());assert.equal(plan.hash,drainHash(plan.manifest));
+            assert.deepEqual(plan.manifest.history,before.reads.find(r=>r.r.id===preservedHistoryRead)!.r);
+            assert.ok(plan.manifest.entries.every((e:any)=>e.new_payload.internal_id_olos===e.source_id&&hasIdentifiedOperator(e)));
+            assert.equal(await count(local,'olos_http.identity_plans'),plans.length+1);
+            if(child)assert.equal(before.reads.find(r=>r.r.id===child)!.r.state,'received');
+            assert.equal(await count(local,'olos_http.history_gap_members'),0);
+          }
+          assert.deepEqual(await identityHistoryEvidence(),before);assert.equal(requests,0);
+        });
+      }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));}
+    });
+    await t.test('identity history: child evidence is revalidated after planning before any mapping changes',async()=>{
+      const {cfg,ids,child}=await identityHistoryFixture(),plan=await identityPlan(cfg,'pending',ids);
+      await local.query("UPDATE olos_http.reads SET response_body='[{}]' WHERE id=$1",[child]);
+      const before=await identityHistoryEvidence();
+      await assert.rejects(identityCommand(cfg,identityAction(plan)),/GAP_PENDING_CHILD_INVALID/);
+      assert.equal((await identityCommand(cfg,{action:'status',id:plan.id})).state,'planned');
+      assert.deepEqual(await identityHistoryEvidence(),before);
+    });
+    const drainIndexCatalog=async()=>(await local.query(`SELECT c.oid::text,c.relfilenode::text,to_jsonb(i) AS catalog,
+      pg_get_indexdef(i.indexrelid) AS definition FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid
+      WHERE c.oid=to_regclass('olos_http.records_identified_operator_order')`)).rows;
+    await t.test('identity index 008: CLI plans/migrates exactly 100 operator calls then drain delivers them, with or without index',async t=>{
+      let requests=0;const server=createServer((_,res)=>{requests++;res.end('unexpected');});
+      await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const env={...base,ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:remoteUrl.toString(),
+        OLOS_CORPORATE_CA_FILE:process.env.OLOS_DIRECT_TEST_CA_FILE!,OLOS_CORPORATE_WRITE_ENABLED:'false',
+        OLOS_BASE_URL:`http://127.0.0.1:${(server.address() as {port:number}).port}`};
+      const cli=(args:string[])=>promisify(execFile)(process.execPath,['dist/identity-main.js',...args],{env,timeout:15000});
+      try{
+        for(const indexed of [false,true])await t.test(indexed?'official migration installed':'index absent',async()=>{
+          // Keep the initial three above the selected 100 in deterministic drain order.
+          const {cfg,ids}=await identityHistoryFixture('[]',true);
+          if(indexed)await applyDrainIndex(local);
+          const before=await identityHistoryEvidence(),index=await drainIndexCatalog();
+          const output=JSON.parse((await cli(['plan','--kind','pending','--source-ids',ids.join(','),'--dependency-review','b'.repeat(64)])).stdout.trim());
+          assert.equal(output.selected,100);assert.equal(output.state,'planned');
+          assert.deepEqual(await identityHistoryEvidence(),before);
+          const plan=(await local.query('SELECT manifest,hash FROM olos_http.identity_plans WHERE id=$1',[output.id])).rows[0];
+          assert.equal(plan.hash,drainHash(plan.manifest));assert.deepEqual(plan.manifest.ids,ids.slice().sort());
+          const definitions=plan.manifest.local_dependencies.controls.find((c:any)=>c.table==='olos_http.records').indexes;
+          assert.equal(definitions.some((i:any)=>i.definition.includes('records_identified_operator_order')),indexed);
+          await cli(['execute','--id',output.id,'--hash',output.hash,'--confirm',output.confirmation]);
+          assert.equal(JSON.parse((await cli(['status','--id',output.id])).stdout.trim()).state,'completed');
+          assert.deepEqual(await remoteRows(),before.destination);
+          for(const row of (await outbox()).filter(r=>ids.includes(r.source_id))){
+            const old=before.local.outbox.find(r=>r.source_id===row.source_id)!;
+            assert.equal(String(row.target_id),row.source_id);assert.equal(row.state,'pending');
+            assert.equal(row.source_hash,old.source_hash);assert.equal(row.payload_hash,deliveryDigest(row.payload));
+            assert.deepEqual(row.payload,{...old.payload,internal_id_olos:row.source_id});
+          }
+          const run=await backlogPlan(cfg);
+          assert.deepEqual((await backlogJournal(run.runId))[0].evidence.map((e:any)=>e.source_id),ids);
+          await drainCommand(cfg,run);await drainCommand(cfg,run);
+          assert.equal(await destinationCount(),102);
+          assert.ok((await outbox()).filter(r=>ids.includes(r.source_id)).every(r=>r.state==='confirmed'));
+          assert.deepEqual((await remoteRows()).filter(r=>before.destination.some(b=>b.raw_olos_call_id===r.raw_olos_call_id)),before.destination);
+          assert.deepEqual((await local.query('SELECT to_jsonb(r) AS r FROM olos_http.reads r ORDER BY id')).rows,before.reads);
+          assert.deepEqual(await gapJournals(),before.gaps);assert.deepEqual(await corporateMetadata(),before.metadata);
+          assert.deepEqual(await drainIndexCatalog(),index);assert.equal((await control()).paused,true);assert.equal(requests,0);
+          assert.deepEqual((await local.query('SELECT manifest,hash FROM olos_http.identity_plans WHERE id=$1',[output.id])).rows[0],plan);
+          await local.query("SET statement_timeout='0'; SET lock_timeout='0'");
+        });
+      }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));}
+    });
+    await t.test('identity index 008: divergent definitions, invalid states and additional unknown indexes block without writes',async t=>{
+      const original="CREATE INDEX records_identified_operator_order ON olos_http.records (source_key,target_id) WHERE agent_id ~ '^[1-9][0-9]*$'";
+      const changes=[
+        {name:'invalid',sql:"UPDATE pg_index SET indisvalid=false WHERE indexrelid='olos_http.records_identified_operator_order'::regclass"},
+        {name:'not ready',sql:"UPDATE pg_index SET indisready=false WHERE indexrelid='olos_http.records_identified_operator_order'::regclass"},
+        {name:'not live',sql:"UPDATE pg_index SET indislive=false WHERE indexrelid='olos_http.records_identified_operator_order'::regclass"},
+        {name:'reversed columns',sql:original.replace('(source_key,target_id)','(target_id,source_key)'),replace:true},
+        {name:'different predicate',sql:original.replace("'^[1-9][0-9]*$'",()=>"'^[0-9]+$'"),replace:true},
+        {name:'missing predicate',sql:original.split(' WHERE')[0]!,replace:true},
+        {name:'different access method',sql:original.replace('ON olos_http.records (','ON olos_http.records USING brin ('),replace:true},
+        {name:'expression',sql:original.replace('(source_key,target_id)','(lower(source_key),target_id)'),replace:true},
+        {name:'extra included column',sql:original.replace(' WHERE',' INCLUDE (source_id) WHERE'),replace:true},
+        {name:'unique',sql:original.replace('CREATE INDEX','CREATE UNIQUE INDEX'),replace:true},
+        {name:'descending order',sql:original.replace('(source_key,target_id)','(source_key,target_id DESC)'),replace:true},
+        {name:'wrong table under official name',sql:original.replace('olos_http.records','olos_http.corporate_outbox').replace("agent_id ~ '^[1-9][0-9]*$'","state='pending'"),replace:true},
+        {name:'renamed official index',sql:'ALTER INDEX olos_http.records_identified_operator_order RENAME TO unknown_operator_index'},
+        {name:'additional unknown partial index',sql:original.replace('records_identified_operator_order','unknown_operator_index')},
+        {name:'additional unknown expression index',sql:'CREATE INDEX unknown_operator_index ON olos_http.records ((target_id+1))'},
+        {name:'additional unknown unique index',sql:'CREATE UNIQUE INDEX unknown_operator_index ON olos_http.records (source_key,target_id)'},
+      ];
+      for(const c of changes)await t.test(c.name,async()=>{
+        const {cfg,ids}=await identityHistoryFixture();await applyDrainIndex(local);
+        // Catalog corruption/replacement is restricted to this disposable fixture.
+        if(c.replace)await local.query('DROP INDEX olos_http.records_identified_operator_order');
+        await local.query(c.sql);
+        const before=await identityHistoryEvidence(),index=await drainIndexCatalog();
+        const plans=(await local.query('SELECT * FROM olos_http.identity_plans ORDER BY id')).rows;
+        await assert.rejects(identityPlan(cfg,'pending',ids),/IDENTITY_CONTROL_DEPENDENCY/);
+        assert.deepEqual(await identityHistoryEvidence(),before);assert.deepEqual(await drainIndexCatalog(),index);
+        assert.deepEqual((await local.query('SELECT * FROM olos_http.identity_plans ORDER BY id')).rows,plans);
+        await local.query("SET statement_timeout='0'; SET lock_timeout='0'");
+      });
+    });
+    await t.test('identity index 008: index drift after planning blocks before local migration without rewriting the manifest',async()=>{
+      const {cfg,ids}=await identityHistoryFixture();await applyDrainIndex(local);
+      const plan=await identityPlan(cfg,'pending',ids),journal=(await local.query('SELECT * FROM olos_http.identity_plans ORDER BY id')).rows;
+      await local.query("UPDATE pg_index SET indisvalid=false WHERE indexrelid='olos_http.records_identified_operator_order'::regclass");
+      const before=await identityHistoryEvidence();
+      await assert.rejects(identityCommand(cfg,identityAction(plan)),/IDENTITY_CONTROL_DEPENDENCY/);
+      assert.deepEqual(await identityHistoryEvidence(),before);
+      assert.deepEqual((await local.query('SELECT * FROM olos_http.identity_plans ORDER BY id')).rows,journal);
+      assert.equal((await identityCommand(cfg,{action:'status',id:plan.id})).state,'planned');
+      await local.query("SET statement_timeout='0'; SET lock_timeout='0'");
+    });
     await t.test('local operator index migration preserves receipts/history and indexed drain still validates empty children',async()=>{
       const {cfg}=await emptyGapBacklog(),before=await backlogEvidence(),journal=await gapJournals();
       await applyDrainIndex(local);

@@ -1,5 +1,11 @@
 # Migração coordenada v1 de identidade OLOS
 
+Revisão sobre `3ed2d38`: a validação histórica agora reconhece filhos recebidos
+vazios com evidência íntegra, usando a mesma verificação da drenagem. Ver
+[repetição do planejamento dos 100 IDs](#repetir-o-planejamento-dos-100-ids).
+O validador de dependências também reconhece o índice oficial da migration 008
+após conferir sua definição e estado no catálogo, sem executar DDL.
+
 ## Escopo e autorização
 
 Base conferida: branch `feature/exportdata-history`, HEAD `d1b60bf96288db019676be533a2da9d83697a99b`. Todas as alterações locais anteriores foram preservadas. Esta implementação atende à autorização posterior para mudar a estratégia de identidade **local**; substitui os impedimentos de implementação descritos em `internal-id-origin.md` e `coordinated-internal-id-diagnostic.md`, preservando seus diagnósticos históricos.
@@ -34,7 +40,26 @@ Os manifestos contêm dados pessoais: aplicar controle de acesso, retenção e b
 
 Manter Admin inativo, scheduler disabled/STOPPED, `OLOS_CORPORATE_WRITE_ENABLED=false` e Corporate Delivery pausado. Adquirir locks de origem/Corporate Sync (Store), Delivery, histórico e Admin. Bloquear qualquer intent seletivo, lote legado pendente, plano de drenagem aberto ou conflito de binding/schema. Não resolver bloqueios por SQL.
 
-A única exceção histórica do migrador exige a leitura `132eb226-f4e4-419d-b79f-21dd0e6e64c1`, reading/RESPONSE_TOO_LARGE, sem corpo/resolução/processamento, e somente mappings/outbox anteriores a ela. O snapshot integral é vinculado ao manifesto e revalidado. Nenhum campo da leitura é alterado. A exceção seletiva anterior dos três registros não vira desbloqueio geral: IDs renumerados desses três só são aceitos mediante prova de journal finalizado, hash, origem, mapping, binding e snapshot histórico.
+A exceção histórica do migrador exige a leitura `132eb226-f4e4-419d-b79f-21dd0e6e64c1`, reading/RESPONSE_TOO_LARGE, sem corpo/resolução/processamento, e somente mappings/outbox anteriores a ela. O snapshot integral é vinculado ao manifesto e revalidado. Nenhum campo da leitura é alterado. A exceção seletiva anterior dos três registros não vira desbloqueio geral: IDs renumerados desses três só são aceitos mediante prova de journal finalizado, hash, origem, mapping, binding e snapshot histórico.
+
+A revisão sobre `3ed2d38` remove somente a exigência de que esse pai seja a única
+leitura pendente. O pai é localizado pelo UUID obrigatório e conserva todas as
+validações anteriores. As demais leituras `reading/received` passam por
+`assertEmptyGapChildren`, já utilizada pela drenagem. A função compartilhada
+mantém sua lógica: exige journals da migration 007, manifesto/hash íntegros,
+snapshot integral do mesmo pai, origem/destino/binding/schema iguais, bloco/spec
+e vínculos exatos, estado `received`, corpo JSON vazio com hash/tamanho original,
+zero processados, nenhum término/resolução e ausência de membros recuperados.
+Corpo não vazio, alteração dos bytes sem hash correspondente, filho desconhecido,
+órfão ou `reading` continuam bloqueando. Não há whitelist do UUID do filho.
+
+O filho informado `09aeaeaa-cc32-415c-8137-2b95729ac131`, associado ao manifesto
+`62f98c90-d3db-498c-a93b-ba844619e6a4`, só passa se suas evidências satisfizerem
+essas verificações. Continua `received/[]`; não passa a `done`, não cria membros
+nem comprova recuperação. A validação compartilhada roda em cada chamada da
+guarda existente, inclusive na revalidação anterior às alterações locais.
+Planos e hashes antigos não são reescritos, e nenhum consumidor geral recebe
+essa exceção. Não há migration nova para esta correção.
 
 Limites fixos: um lote atômico por invocação; tamanhos 3, 100, 250, 500 ou 1.000; primeira migração de pendentes exatamente 3. Crescimento depende de uma migração anterior concluída e medida na etapa precedente (3 → 100 → 250 → 500 → 1.000), mesma origem/binding. Budget de 60s verificado nas fronteiras de operações, statements locais até 10s, corporativos até 5s, lock timeout 1s e idle remoto 30s. Um statement já em voo pode terminar depois do budget, até seu timeout. Não existe modo ilimitado ou laço de retry. Esses limites não comprovam saúde/latência de produção; revisar impacto e métricas antes de cada aumento.
 
@@ -72,6 +97,94 @@ OLOS_CORPORATE_WRITE_ENABLED=false node dist/identity-main.js status --id UUID
 A homologação de três pendentes é uma migração local. Enquanto a leitura histórica estiver interrompida, a entrega seletiva mantém o escopo fixo dos três IDs anteriormente autorizados; outros pendentes convertidos aguardam a etapa de 100 pela drenagem controlada.
 
 Depois da adoção, entrega geral/seletiva e `corporate-drain-backlog` rejeitam target_id diferente de source_id. A seleção de novos planos de drenagem considera somente pendentes já convertidos. Planos antigos não são reinterpretados: cancelar planos não iniciados antes de migrar. A entrega da etapa de 100 mantém seu procedimento de `backlog-drain-v1.md`, independente da autorização de migração local. Migrar 100 não autoriza entregá-los. Confirmar performance antes de migrar/entregar 250, depois 500 e 1.000. Registros antigos ainda não migrados continuam intactos e bloqueados para entrega.
+
+## Repetir o planejamento dos 100 IDs
+
+Procedimento para homologação autorizada; não executado na VPS/MADM/OLOS reais.
+
+1. Usar o binário compilado com esta correção e a configuração privada já
+   revisada. Manter Admin encerrado, scheduler disabled/STOPPED, Delivery
+   ready/paused e escrita geral false. Conferir ausência de COMMIT incerto,
+   plano de identidade aberto ou run de drenagem aberto. Conservar as evidências
+   originais do pai, filho e journals. Não executar `resolve`, reset ou captura.
+2. Conferir o estágio anterior de três pendentes realmente concluído, da mesma
+   origem/binding. Sem essa prova, o lote de 100 continua produzindo
+   `IDENTITY_STAGE_NOT_PROVEN`; não fabricar journals para liberá-lo.
+3. Verificar também o índice local 008, sem alterar sua estrutura:
+
+   ```sql
+   SELECT pg_get_indexdef(i.indexrelid) AS definition,
+          i.indisvalid, i.indisready, i.indislive, i.indexprs
+   FROM pg_index i
+   WHERE i.indexrelid=to_regclass('olos_http.records_identified_operator_order');
+   ```
+
+   A definição canônica esperada é:
+
+   ```sql
+   CREATE INDEX records_identified_operator_order ON olos_http.records USING btree (source_key, target_id) WHERE (agent_id ~ '^[1-9][0-9]*$'::text)
+   ```
+
+   Os três flags devem ser true e `indexprs` NULL. O código verifica também a
+   tabela por OID, tipo de relação, ausência de unicidade/PK/exclusão, duas
+   chaves e duas colunas totais (sem INCLUDE). A comparação integral de
+   `pg_get_indexdef` confere nome, tabela, método, ordem/definição das colunas e
+   predicado; nomes semelhantes ou definições equivalentes diferentes não
+   ganham aprovação implícita. A exceção usa somente o OID validado.
+
+   Isso corrige a rejeição anterior de todo predicado parcial em `records`,
+   que produzia `IDENTITY_CONTROL_DEPENDENCY` até com o índice oficial. Índice
+   ausente mantém o comportamento anterior, sem instalar nada. Índice oficial
+   inválido/divergente ou outros índices parciais/de expressão não aprovados
+   continuam bloqueando. Estados inválidos, não prontos ou não ativos também
+   bloqueiam os índices das três tabelas de controle inspecionadas. A política
+   anterior para índices comuns não únicos, sem expressão/predicado, permanece.
+
+   A definição continua dentro do inventário congelado no manifesto, sem mudar
+   seu formato ou recalcular hashes de planos antigos. Mudança após planejamento
+   exige revisão e bloqueia execução. O índice instalado na VPS não foi acessado;
+   seus estados informados precisam ser conferidos nessa homologação. **Não
+   reaplicar a migration 008, remover ou recriar o índice existente.**
+4. Reutilizar **exatamente** a lista dos 100 AttemptsRawDataID já selecionados e
+   o SHA-256 da revisão de dependências vigente. A admissão de operadores e os
+   limites permanecem inalterados. O migrador recebe IDs explícitos; o filtro
+   de setembro/outubro de 2026 em America/Sao_Paulo continua na seleção/drenagem
+   existente, sem novo mecanismo de seleção de datas nesta correção.
+
+   ```bash
+   identity_source_ids='LISTA_EXATA_DOS_100_IDS_JA_SELECIONADOS_SEPARADOS_POR_VIRGULA'
+   identity_review_sha256='SHA256_DA_REVISAO_JA_VALIDADA'
+   OLOS_CORPORATE_WRITE_ENABLED=false node dist/identity-main.js plan \
+     --kind pending --source-ids "$identity_source_ids" \
+     --dependency-review "$identity_review_sha256"
+   ```
+
+5. Conferir saída `state=planned`, `selected=100`, UUID/hash e lista exata no
+   manifesto privado. Comparar integralmente pai, filho, journals, mappings,
+   payloads, hashes e recibos com a evidência anterior. O comando grava somente
+   seu plano/evento/run local; mantém as provas corporativas por leitura/locks,
+   sem DDL/DML corporativo. Não executar a confirmação de migração ou entrega
+   como parte desta repetição do planejamento.
+
+Para homologar a sequência completa, após a revisão do plano, usar a confirmação
+específica de `identity-main.js execute` já descrita neste documento. Conferir
+que somente os pendentes selecionados receberam o AttemptsRawDataID em mapping,
+outbox/payload e linha local quando existente; o source_hash e os outros 13
+campos v1 permanecem iguais. As mudanças esperadas de payload_hash por identidade
+seguem o protocolo existente. Confirmados anteriores não integram esse lote.
+Depois, preparar/revisar o plano de drenagem pelo
+[runbook de backlog](backlog-drain-v1.md#homologação-inicial-de-100), mantendo
+timeout de 2 segundos e os degraus existentes. Comparar a seleção congelada da
+drenagem: outros pendentes elegíveis podem preceder os 100 migrados na ordem de
+target_id; não presumir que migração autoriza uma lista diferente de entrega.
+Após a entrega exata autorizada, conferir recibos, campos v1, índice (incluindo
+OID), schema corporativo, leituras pai/filho e journals. O filho vazio permanece
+sem membros recuperados. Esta sequência foi executada apenas no banco descartável.
+
+Filho sem evidência válida produz `GAP_PENDING_CHILD_INVALID` (ou erro específico
+do manifesto); pai inválido continua produzindo `IDENTITY_HISTORY_CHANGED`.
+Se houver resposta incerta ao criar o plano, consultar o journal/status antes de
+repetir. Nenhum erro autoriza mudar estados históricos ou hashes.
 
 ## Confirmados: escopo fechado e autorização corporativa separada
 
@@ -137,6 +250,56 @@ Intent não pode ser cancelado; precisa de reconciliação. Antes do COMMIT loca
 Depois de qualquer lote concluído não há rollback genérico de dados: uma inversão exigiria novo manifesto, prova de ausência de entrega/colisões e revisão das dependências. A migration down recusa esse caso. Após COMMIT remoto incerto, reconciliar antes de qualquer compensação. Não apagar chamadas/recibos, rebaixar confirmado para pendente ou reativar binários que usem o allocator antigo. O esquema BY DEFAULT e os IDs originais persistem após uma reconciliação not_applied; isso não autoriza entregar legados com ID antigo.
 
 ## Limitações e validação
+
+Validação da compatibilidade com a migration 008 sobre `3ed2d38`, preservando a
+correção histórica local, em 2026-11-04, Node 24 e PostgreSQL 16 descartável:
+
+- `npm run typecheck`, `npm run build`, `git diff --check`: aprovados.
+- `npm test`: **111/111**; `bash scripts/test-corporate-sync.sh`: **39/39**.
+- `bash scripts/test-corporate-delivery.sh`: **199/199**, incluindo Admin/Store,
+  sem falhas/skips na rodada final.
+- Com e sem índice, CLI compilada planejou e migrou 100 pendentes com operador
+  de setembro/outubro; drenagem entregou exatamente os mesmos 100. Replay não
+  duplicou entrega. Estágio anterior de três concluído pelo protocolo real
+  descartável; pai e filho `received/[]` íntegros, zero HTTP pela CLI.
+- Índice oficial preservado integralmente (catálogo, OID, relfilenode e definição)
+  durante planejamento/migração/drenagem; schema e confirmados corporativos
+  anteriores intactos, source_hash e 13 campos não relacionados à identidade
+  preservados, manifesto/hash congelados sem reescrita.
+- Dezesseis variantes negativas: invalid/not ready/not live, ordem de colunas,
+  predicado diferente/ausente, método, expressão, INCLUDE, UNIQUE, ordenação
+  DESC, tabela incorreta, índice renomeado e índices adicionais desconhecidos
+  parciais/de expressão/únicos. Todas bloquearam antes de alterações de dados.
+  Alteração de validade após planejar também bloqueou execução sem mudar o plano.
+
+DDL e corrupção de catálogo dos casos negativos ocorreram somente nas fixtures
+descartáveis. A primeira tentativa do runner falhou no bootstrap do PostgreSQL,
+antes dos testes; uma tentativa intermediária revelou SQL malformado na geração
+do predicado negativo da fixture, corrigido antes da rodada final aprovada.
+Recursos descartáveis removidos. Nenhum acesso a produção, migration real,
+commit, push ou deploy. O desempenho/estado da VPS não foi medido nesta revisão.
+
+Validação anterior da correção histórica, antes da compatibilidade 008,
+sobre `3ed2d38`, em 2026-11-04, Node 24 e
+PostgreSQL 16 descartável:
+
+- Typecheck, build e `git diff --check`: aprovados; 111/111 unitários.
+- `bash scripts/test-corporate-delivery.sh`: **179/179**, incluindo Admin/Store,
+  sem falhas/skips; `bash scripts/test-corporate-sync.sh`: **39/39**.
+- CLI compilada planejou os mesmos 100 IDs com pai sozinho e com filho vazio
+  comprovado. Cada fixture concluiu realmente a migração inicial de três.
+  Corpo não vazio, ausência de journal, órfão, hashes divergentes, filho
+  desconhecido, POST incerto, bytes alterados, vínculo adulterado e pai alterado
+  bloquearam sem escrever plano nem modificar evidências.
+- Comparação integral de leituras em JSON PostgreSQL (incluindo microssegundos),
+  journals de lacunas, mappings, payloads/hashes, recibos, linhas locais,
+  metadados corporativos e destino descartável. Nenhuma requisição HTTP pela CLI.
+- Revalidação após planejamento bloqueou execução com corpo do filho alterado.
+  O índice 008 reproduziu `IDENTITY_CONTROL_DEPENDENCY` sem contornar a proteção.
+
+Recursos descartáveis removidos. Não houve acesso à produção, migrations reais,
+commit, push ou deploy. Os resultados históricos abaixo referem-se à versão
+original do migrador.
 
 A correção de confirmados limita-se aos três exemplos; outros confirmados permanecem preservados e precisam de escopo futuro próprio. Pendentes crescem somente por etapas limitadas. Dependências desconhecidas e FKs não compatíveis bloqueiam em vez de serem adaptadas automaticamente. Um superusuário ou binário antigo que ignore locks/journals não é coberto pelo protocolo; manter todos os participantes operacionais sob controle de versão e janela autorizada.
 

@@ -71,7 +71,26 @@ export async function referenceRows(db:DB,refs:Reference[],ids:string[]){
  return result;
 }
 
+// Only migration 008 receives a new exception. Check the catalog, never just
+// the name; return its OID so no other partial index inherits the exception.
+async function drainOperatorIndex(db:DB):Promise<string|null>{
+ const index=(await db.query(`SELECT c.oid::text AS oid,c.relkind,
+   i.indrelid='olos_http.records'::regclass AS correct_table,
+   i.indisvalid,i.indisready,i.indislive,i.indisunique,i.indisprimary,i.indisexclusion,
+   i.indexprs IS NULL AS no_expressions,i.indnkeyatts,i.indnatts,
+   pg_get_indexdef(i.indexrelid) AS definition
+   FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid
+   WHERE c.oid=to_regclass('olos_http.records_identified_operator_order')`)).rows[0];
+ if(!index)return null;
+ const definition="CREATE INDEX records_identified_operator_order ON olos_http.records USING btree (source_key, target_id) WHERE (agent_id ~ '^[1-9][0-9]*$'::text)";
+ if(index.relkind!=='i'||!index.correct_table||!index.indisvalid||!index.indisready||!index.indislive||
+   index.indisunique||index.indisprimary||index.indisexclusion||!index.no_expressions||
+   index.indnkeyatts!==2||index.indnatts!==2||index.definition!==definition)throw new SyncError('IDENTITY_CONTROL_DEPENDENCY');
+ return index.oid as string;
+}
+
 async function controlDependencies(db:DB){
+ const drainIndex=await drainOperatorIndex(db);
  const allowed:Record<string,{changed:string[];definitions:string[]}>={
   'olos_http.records':{changed:['target_id'],definitions:['PRIMARY KEY (source_key, source_id)','UNIQUE (target_table, target_id)']},
   'olos_http.corporate_outbox':{changed:['target_id','payload','payload_hash'],definitions:[
@@ -96,8 +115,10 @@ async function controlDependencies(db:DB){
    EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=$1::regclass OR inhparent=$1::regclass) OR
    EXISTS(SELECT 1 FROM pg_constraint c JOIN pg_attribute a ON a.attrelid=c.confrelid AND a.attnum=ANY(c.confkey)
      WHERE c.confrelid=$1::regclass AND a.attname=ANY($2::text[])) OR
-   EXISTS(SELECT 1 FROM pg_index i WHERE i.indrelid=$1::regclass AND (i.indexprs IS NOT NULL OR (i.indpred IS NOT NULL AND NOT (i.indrelid='olos_http.corporate_outbox'::regclass AND pg_get_expr(i.indpred,i.indrelid)=$3)) OR
-     (i.indisunique AND NOT EXISTS(SELECT 1 FROM pg_constraint c WHERE c.conindid=i.indexrelid)))) AS unsafe`,[table,spec.changed,"(state = 'pending'::text)"])).rows[0].unsafe;
+   EXISTS(SELECT 1 FROM pg_index i WHERE i.indrelid=$1::regclass AND (NOT i.indisvalid OR NOT i.indisready OR NOT i.indislive OR
+     i.indexprs IS NOT NULL OR (i.indpred IS NOT NULL AND NOT (i.indrelid='olos_http.corporate_outbox'::regclass AND pg_get_expr(i.indpred,i.indrelid)=$3)
+       AND i.indexrelid IS DISTINCT FROM $4::oid) OR
+     (i.indisunique AND NOT EXISTS(SELECT 1 FROM pg_constraint c WHERE c.conindid=i.indexrelid)))) AS unsafe`,[table,spec.changed,"(state = 'pending'::text)",drainIndex])).rows[0].unsafe;
   if(unsafe)throw new SyncError('IDENTITY_CONTROL_DEPENDENCY');
   result.push({table,constraints,
    columns:(await db.query(`SELECT attname,atttypid::text,atttypmod,attidentity,attnotnull,attacl::text FROM pg_attribute
