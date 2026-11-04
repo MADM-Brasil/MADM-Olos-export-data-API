@@ -163,3 +163,10 @@ bash scripts/test-integration.sh
 O smoke de navegador é `test/admin.browser.mjs`, com Playwright instalado fora do projeto (`ADMIN_PLAYWRIGHT_PATH`) e Chromium (`ADMIN_CHROMIUM_PATH`, opcional). Ele acessa exclusivamente `http://localhost:8081` no perfil simulado de homologação, usa o PostgreSQL local e a API fictícia de autenticação, sem carregar `.env` operacional. A captura opcional usa `ADMIN_SCREENSHOT`.
 
 Ainda dependem de homologação autorizada: papel/permissões reais, reverse proxy/HTTPS do Dokploy, fornecimento e backup da chave AES, contas administrativas reais, troca controlada do processo e testes de volume/grace period. Não há integração SSO nesta entrega. Nenhuma garantia distribuída foi adicionada à janela entre consumo OLOS e persistência local.
+
+## Redesign administrativo e relatórios locais
+
+O [relatório do redesign](redesign.md) documenta o novo dashboard, relatório diário,
+CSV, terminal compartilhado, semântica dos indicadores e testes isolados. A única
+rota de dados nova é `GET /api/reports`, autenticada e somente leitura. As ações
+operacionais e os mecanismos de autenticação existentes permanecem preservados.

@@ -28,14 +28,14 @@ export function adminServer(options: {
   origin: string; publicDir: string; auth: AdminAuth;
   credentials: Pick<CredentialService, 'view' | 'save' | 'test'>;
   scheduler: Pick<DynamicScheduler, 'request' | 'status'>;
-  repository: Pick<AdminRepository, 'logs' | 'auditLog' | 'observation'>;
+  repository: Pick<AdminRepository, 'logs' | 'auditLog' | 'observation'> & Partial<Pick<AdminRepository, 'reports'>>;
   events?: () => readonly import('../errors.js').LogEntry[];
 }) {
   const origin = new URL(options.origin);
   if (origin.origin !== options.origin || (origin.protocol !== 'https:' && !(origin.protocol === 'http:' && ['localhost','127.0.0.1'].includes(origin.hostname)))) throw new WorkerError('ADMIN_ORIGIN_INVALID');
   const secure = origin.protocol === 'https:';
   const cookie = (token: string, age: number) => `olos_admin=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${secure ? '; Secure' : ''}`;
-  const files: Record<string, [string, string]> = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/style.css': ['style.css','text/css'] };
+  const files: Record<string, [string, string]> = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/ui.js': ['ui.js','text/javascript'], '/style.css': ['style.css','text/css'] };
   const server = createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -62,6 +62,11 @@ export function adminServer(options: {
       if (path === '/api/status' && req.method === 'GET') {
         send(res, 200, { ...options.scheduler.status(), authentication: { status: 'ACCEPTED', authenticated_at: session.authenticatedAt },
           ...await options.repository.observation() }); return;
+      }
+      if (path === '/api/reports' && req.method === 'GET') {
+        if (!options.repository.reports) throw new WorkerError('REPORT_UNAVAILABLE');
+        const query = new URL(req.url!, options.origin).searchParams;
+        send(res, 200, await options.repository.reports(query.get('from'), query.get('to'))); return;
       }
       if (path === '/api/credentials' && req.method === 'GET') { send(res, 200, await options.credentials.view()); return; }
       if (path === '/api/credentials' && req.method === 'PUT') { send(res, 200, await options.credentials.save(session.actor, await body(req))); return; }

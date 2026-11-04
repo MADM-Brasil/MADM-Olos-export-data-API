@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { AdminReports } from './reports.js';
 import { WorkerError, errorCode } from '../errors.js';
 import { assertSchema } from '../schema.js';
 import type { CycleReport } from '../worker.js';
@@ -161,6 +162,12 @@ export class AdminRepository implements SchedulerRepository {
         status: 'UNKNOWN', latest: null, last_completed: null, pending: null, last_error: null,
       } };
     } finally { db?.release(); }
+  }
+  private reportReader: AdminReports | undefined;
+  reports(from: unknown, to: unknown) {
+    this.check();
+    this.reportReader ??= new AdminReports(this.pool, this.source, this.destination);
+    return this.reportReader.read(from, to);
   }
   async logs() {
     this.check();

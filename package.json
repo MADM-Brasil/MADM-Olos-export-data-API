@@ -12,7 +12,10 @@
     "test": "tsx --test test/*.test.ts",
     "test:integration": "tsx --test test/*.integration.ts",
     "start": "node dist/main.js start",
-    "cli": "tsx src/main.ts"
+    "cli": "tsx src/main.ts",
+    "typecheck:admin": "tsc -p admin/tsconfig.json",
+    "build:admin": "node scripts/build-admin.mjs",
+    "test:admin-ui": "node --test test/admin-ui.test.mjs"
   },
   "dependencies": {
     "lossless-json": "4.3.3",
