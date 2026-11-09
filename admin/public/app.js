@@ -1,4 +1,4 @@
-import {date,count,dayLabel,defaultRange,reportFields,reportCsv,safeEvents,eventLines,renderChart} from './ui.js';
+import {date,count,dayLabel,defaultRange,reportFields,reportCsv,safeEvents,eventLines,renderDashboardChart,renderDashboardMetrics} from './ui.js';
 /** @returns {any} */
 const $=id=>document.getElementById(id);
 let csrf='',revision=0,logged=false,refreshing=false,currentPage='dashboard';
@@ -90,23 +90,28 @@ $('event-pause').addEventListener('click',()=>{eventPaused=!eventPaused;renderEv
 $('event-copy').addEventListener('click',()=>action(async()=>{await navigator.clipboard.writeText(eventLines(eventEntries,$('event-search').value,$('event-level').value).join('\n'));$('event-status').textContent='Logs sanitizados copiados.';},$('event-copy')));
 function syncMenu(){const open=document.body.classList.contains('menu-open');$('menu-toggle').setAttribute('aria-expanded',String(open));$('sidebar').inert=matchMedia('(max-width:760px)').matches&&!open;}
 $('menu-toggle').addEventListener('click',()=>{document.body.classList.toggle('menu-open');syncMenu();});
-window.addEventListener('resize',()=>{syncMenu();if(chartSnapshot&&currentPage==='dashboard')renderChart($('calls-chart'),chartSnapshot.daily,chartSnapshot.from,chartSnapshot.to);});syncMenu();
+window.addEventListener('resize',()=>{syncMenu();if(chartSnapshot&&currentPage==='dashboard')renderDashboardChart($('calls-chart'),chartSnapshot);});syncMenu();
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){document.body.classList.remove('menu-open');syncMenu();}});
 const initialRange=defaultRange();$('report-from').value=initialRange.from;$('report-to').value=initialRange.to;
 function reportUrl(from,to){return '/reports?'+new URLSearchParams({from,to});}
-function clearMetrics(){chartSnapshot=null;for(const id of ['calls','identified','confirmed','pending','errors'])$('metric-'+id).textContent='—';$('metrics-observed').textContent='Indicadores indisponíveis';$('calls-chart').textContent='Série diária indisponível.';}
+function clearMetrics(){chartSnapshot=null;$('metrics-error').textContent='';$('chart-period').textContent='';for(const id of ['calls','identified','confirmed','pending','errors'])$('metric-'+id).textContent='—';$('metrics-observed').textContent='Indicadores indisponíveis';$('calls-chart').textContent='Série diária indisponível.';}
 function resetReports(){reportData=null;reportPage=0;table('report-rows',[]);$('report-summary').replaceChildren();$('report-page').textContent='Sem dados';$('report-prev').disabled=true;$('report-next').disabled=true;$('report-status').textContent='Selecione um período.';$('export-report').disabled=true;clearMetrics();}
 async function dashboardReport(){
   if(!logged||dashboardBusy)return;dashboardBusy=true;const epoch=sessionEpoch,range=defaultRange();$('metrics').setAttribute('aria-busy','true');
-  try{const r=await api(reportUrl(range.from,range.to));if(!logged||epoch!==sessionEpoch)return;
-    for(const [id,value]of [['calls',r.summary.calls],['identified',r.summary.identified_calls],['confirmed',r.summary.confirmed],['pending',r.summary.pending],['errors',r.failed_reads]])$('metric-'+id).textContent=count(value);
-    $('metrics-observed').textContent=`Snapshot local · ${date(r.observed_at)}`;
-    const gaps=[];if(r.summary.undated!=='0')gaps.push(`${count(r.summary.undated)} registros sem data de chamada; fora do gráfico`);if(r.summary.missing_mapping!=='0')gaps.push(`${count(r.summary.missing_mapping)} mappings sem registro local`);if(r.summary.inconsistent&&r.summary.inconsistent!=='0')gaps.push(`${count(r.summary.inconsistent)} recibos divergentes`);
-    $('metrics-error').textContent=gaps.join(' · ');chartSnapshot=r;renderChart($('calls-chart'),r.daily,r.from,r.to);
-    $('chart-period').textContent=`${dayLabel(r.from)} — ${dayLabel(r.to)} · Brasília`;
-  }catch{if(logged&&epoch===sessionEpoch){clearMetrics();$('metrics-error').textContent='Não foi possível consultar os indicadores. Nenhum valor foi estimado. Nova tentativa em 30 s.';}}
-  finally{dashboardBusy=false;$('metrics').setAttribute('aria-busy','false');}
+  let r;
+  try{r=await api(reportUrl(range.from,range.to));}
+  catch{if(logged&&epoch===sessionEpoch){
+    if(!chartSnapshot)clearMetrics();
+    $('metrics-error').textContent=chartSnapshot
+      ? 'Falha ao atualizar. Exibindo o último snapshot, que pode estar desatualizado. Novas consultas históricas respeitam o intervalo de 5 minutos.'
+      : 'Não foi possível consultar os indicadores. Nenhum valor foi estimado. Nova consulta histórica em até 5 minutos.';
+  }return;}
+  finally{dashboardBusy=false;if(epoch===sessionEpoch)$('metrics').setAttribute('aria-busy','false');}
+  if(!logged||epoch!==sessionEpoch)return;
+  renderDashboardMetrics($,r);chartSnapshot=r;
+  renderDashboardChart($('calls-chart'),r);
 }
+
 function renderReport(){
   if(!reportData)return;const rows=reportData.daily,total=rows.length,maxPage=Math.max(0,Math.ceil(total/pageSize)-1);reportPage=Math.min(reportPage,maxPage);
   table('report-rows',rows.slice(reportPage*pageSize,(reportPage+1)*pageSize).map(r=>reportFields.map(key=>key==='day'?dayLabel(r[key]):count(r[key]))));
@@ -117,7 +122,7 @@ async function loadReport(){
   if(!logged||reportBusy)return;reportBusy=true;const epoch=sessionEpoch,from=$('report-from').value,to=$('report-to').value;
   $('apply-report').disabled=true;$('export-report').disabled=true;reportData=null;table('report-rows',[]);$('report-summary').replaceChildren();$('report-prev').disabled=true;$('report-next').disabled=true;$('report-page').textContent='—';$('report-status').textContent='Consultando dados locais…';
   try{const r=await api(reportUrl(from,to));if(!logged||epoch!==sessionEpoch)return;reportData=r;reportPage=0;
-    $('report-status').textContent=`${dayLabel(r.from)} a ${dayLabel(r.to)} · Snapshot ${date(r.observed_at)} · Brasília${r.outbox_available?'':' · Outbox indisponível'}. ${count(r.summary.undated)} registros sem data ficam fora do período.`;
+    $('report-status').textContent=`${dayLabel(r.from)} a ${dayLabel(r.to)} · Snapshot ${date(r.observed_at)} · intervalo de atualização: ${r.cache_seconds ?? 300} s · Brasília${r.outbox_available?'':' · Outbox indisponível'}. ${count(r.summary.undated)} registros sem data ficam fora do período.`;
     for(const [label,value]of [['Chamadas únicas',r.period.calls],['Com operador',r.period.identified_calls],['Operadores distintos no período',r.period.operators],['Confirmações MADM (recibos)',r.period.confirmed]]){const span=document.createElement('span');span.textContent=`${label}: ${count(value)}`;$('report-summary').append(span);}
     renderReport();$('export-report').disabled=!r.daily.length;
   }catch{if(logged&&epoch===sessionEpoch)$('report-status').textContent='Relatório indisponível. Confira um período válido de até 366 dias e tente novamente; nenhuma contagem foi estimada.';}

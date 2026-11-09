@@ -45,7 +45,9 @@ const origin=`http://127.0.0.1:${server.address().port}`;
 const browser=await chromium.launch({headless:true,...(process.env.ADMIN_CHROMIUM_PATH?{executablePath:process.env.ADMIN_CHROMIUM_PATH}:{})});
 const context=await browser.newContext({viewport:{width:1440,height:1100},permissions:['clipboard-read','clipboard-write']});
 const watchdog=setTimeout(()=>void browser.close(),60000);
-const page=await context.newPage();page.setDefaultTimeout(10000);page.on('pageerror',e=>errors.push(e.message));
+const page=await context.newPage();
+await page.addInitScript(()=>{const original=window.setInterval.bind(window);window.setInterval=(fn,ms,...args)=>{if(ms===30000)window.__reportPoll=fn;return original(fn,ms,...args);};});
+page.setDefaultTimeout(10000);page.on('pageerror',e=>errors.push(e.message));
 page.on('request',r=>assert(r.url().startsWith(origin+'/')||r.url().startsWith('blob:'),'Unexpected external request'));
 const waitText=(id,value)=>page.waitForFunction(([id,value])=>document.getElementById(id).textContent.includes(value),[id,value]);
 const nav=async name=>{console.log('UI:',name);await page.getByRole('button',{name,exact:true}).click();};
@@ -58,6 +60,14 @@ try{
   await page.locator('#login-form').getByLabel('Usuário OLOS',{exact:true}).fill('fixture');await page.locator('#login-form').getByLabel('Senha OLOS',{exact:true}).fill('fixture');await nav('Entrar');
   await waitText('metric-calls','60.000');await waitText('event-output','batch_completed');assert.equal(await page.locator('#calls-chart svg').count(),1);assert.equal(await page.locator('#event-output').textContent().then(s=>s.split('\n').length),200);
   assert.equal(writes.length,1,'Dashboard must not perform operational writes');assert.match(await page.locator('#metric-confirmed').textContent(),/11.259/);assert.equal(await page.locator('#corporate-state').textContent(),'Pausado');
+  // Exercise the actual app resize path with an independent SVG failure.
+  await page.evaluate(()=>{const original=document.createElementNS.bind(document);document.createElementNS=()=>{throw new Error('synthetic SVG failure');};window.dispatchEvent(new Event('resize'));document.createElementNS=original;});
+  await waitText('calls-chart','indicadores permanecem válidos');assert.equal(await page.locator('#metric-calls').textContent(),'60.000');
+  await page.evaluate(()=>window.dispatchEvent(new Event('resize')));assert.equal(await page.locator('#calls-chart svg').count(),1);
+  const observed=await page.locator('#metrics-observed').textContent();reportError=true;
+  await page.evaluate(()=>window.__reportPoll());await waitText('metrics-error','último snapshot');
+  assert.equal(await page.locator('#metric-calls').textContent(),'60.000');assert.equal(await page.locator('#metrics-observed').textContent(),observed);
+  reportError=false;await page.evaluate(()=>window.__reportPoll());await page.waitForFunction(()=>document.querySelector('#metrics-error').textContent==='');
   await screenshot('/tmp/olos-admin-dashboard-desktop.png');
   await page.locator('#event-level').selectOption('ERROR');assert.doesNotMatch(await page.locator('#event-output').textContent(),/batch_completed/);assert.match(await page.locator('#event-output').textContent(),/12:00:00/);
   await page.locator('#event-search').fill('absent');await waitText('event-output','Nenhum evento');await page.locator('#event-search').fill('');

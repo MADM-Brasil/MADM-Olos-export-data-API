@@ -80,3 +80,19 @@ export function renderChart(root, rows, from, to) {
     if(i%Math.max(1,Math.ceil(series.length/(width<500?4:7)))===0)svg.append(svgNode('text',{x:x+w/2,y:248,'text-anchor':'middle'},dayLabel(r.day).slice(0,5)));
   });root.append(svg);
 }
+
+// A chart failure must never invalidate a successfully fetched count snapshot.
+export function renderDashboardChart(root, snapshot, draw = renderChart) {
+  try { draw(root, snapshot.daily, snapshot.from, snapshot.to); }
+  catch { root.textContent = 'Não foi possível desenhar o gráfico. Os indicadores permanecem válidos; consulte a série diária em Relatórios.'; }
+}
+export function renderDashboardMetrics(element, r) {
+  for (const [id,value] of [['calls',r.summary.calls],['identified',r.summary.identified_calls],['confirmed',r.summary.confirmed],['pending',r.summary.pending],['errors',r.failed_reads]]) element('metric-'+id).textContent=count(value);
+  element('metrics-observed').textContent=`Snapshot local · ${date(r.observed_at)} · intervalo de atualização: ${r.cache_seconds ?? 300} s`;
+  const gaps=[];
+  if(r.summary.undated!=='0')gaps.push(`${count(r.summary.undated)} registros sem data de chamada; fora do gráfico`);
+  if(r.summary.missing_mapping!=='0')gaps.push(`${count(r.summary.missing_mapping)} mappings sem registro local`);
+  if(r.summary.inconsistent&&r.summary.inconsistent!=='0')gaps.push(`${count(r.summary.inconsistent)} recibos divergentes`);
+  element('metrics-error').textContent=gaps.join(' · ');
+  element('chart-period').textContent=`${dayLabel(r.from)} — ${dayLabel(r.to)} · Brasília`;
+}

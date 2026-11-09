@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { date,count,defaultRange,safeEvents,eventLines,reportCsv } from '../admin/public/ui.js';
+import { date,count,defaultRange,safeEvents,eventLines,reportCsv,renderDashboardMetrics,renderDashboardChart } from '../admin/public/ui.js';
 test('Brasília dates and exact counts never replace unavailable data with zero',()=>{
   assert.match(date('2026-11-01T02:59:00Z'),/31\/10\/2026.*23:59/);
   assert.equal(date('invalid'),'—');assert.equal(count(null),'Indisponível');assert.equal(count('0'),'0');
@@ -18,4 +18,17 @@ test('CSV exports only aggregate schema, all rows, safe cells and unavailable ma
   const csv=reportCsv([{day:'2026-10-31',calls:'9007199254740993',identified_calls:'2',operators:'1',with_cpf:'1',with_email:'0',confirmed:null,pending:'2',not_queued:'0',inconsistent:'0',email:'PRIVATE',payload:'PRIVATE'},
     {day:'=HYPERLINK("secret")',calls:'=1+1'}]);
   assert(csv.startsWith('\ufeff'));assert.match(csv,/31\/10\/2026/);assert.match(csv,/9007199254740993/);assert.match(csv,/Indisponível/);assert.doesNotMatch(csv,/PRIVATE|HYPERLINK|=1\+1/);assert.equal(csv.split('\r\n').length,3);
+});
+
+test('chart exception and resize failure preserve exact independent dashboard metrics',()=>{
+  const nodes=new Map(),element=id=>{if(!nodes.has(id))nodes.set(id,{textContent:''});return nodes.get(id);};
+  const snapshot={from:'2026-10-01',to:'2026-10-31',observed_at:'2026-11-01T12:00:00Z',cache_seconds:300,
+    summary:{calls:'9007199254740993',identified_calls:'17',confirmed:null,pending:'8',undated:'1',missing_mapping:'1',inconsistent:'2'},failed_reads:'3',daily:[{day:'2026-10-01',calls:'2'}]};
+  renderDashboardMetrics(element,snapshot);
+  const broken=()=>{throw new Error('SVG rendering failed');};
+  renderDashboardChart(element('chart'),snapshot,broken);renderDashboardChart(element('chart'),snapshot,broken);
+  assert.equal(element('metric-calls').textContent,'9.007.199.254.740.993');
+  assert.equal(element('metric-confirmed').textContent,'Indisponível');assert.equal(element('metric-pending').textContent,'8');
+  assert.equal(element('metric-errors').textContent,'3');assert.match(element('metrics-observed').textContent,/300 s/);
+  assert.match(element('metrics-error').textContent,/2 recibos divergentes/);assert.match(element('chart').textContent,/indicadores permanecem válidos/);
 });

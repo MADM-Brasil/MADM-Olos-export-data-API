@@ -7,6 +7,7 @@ import type { CredentialService } from './credentials.js';
 import type { DynamicScheduler } from '../scheduler.js';
 import type { AdminRepository, Mode } from './repository.js';
 import { interval } from './repository.js';
+import { reportCacheSeconds } from './reports.js';
 
 async function body(req: IncomingMessage) {
   if (!req.headers['content-type']?.startsWith('application/json')) throw new WorkerError('JSON_REQUIRED');
@@ -89,7 +90,8 @@ export function adminServer(options: {
       send(res, 404, { error: 'NOT_FOUND' });
     } catch (error) {
       const code = errorCode(error);
-      const status = ['LOGIN_FAILED','AUTHENTICATION_REQUIRED'].includes(code) ? 401 : code.endsWith('FORBIDDEN') ? 403 : code === 'LOGIN_RATE_LIMITED' ? 429 : code.endsWith('CONFLICT') ? 409 : error instanceof WorkerError ? 400 : 503;
+      const status = ['LOGIN_FAILED','AUTHENTICATION_REQUIRED'].includes(code) ? 401 : code.endsWith('FORBIDDEN') ? 403 : code === 'LOGIN_RATE_LIMITED' ? 429 : code.endsWith('CONFLICT') ? 409 : ['REPORT_TIMEOUT','REPORT_UNAVAILABLE'].includes(code) ? 503 : error instanceof WorkerError ? 400 : 503;
+      if (status === 503 && req.url?.split('?')[0] === '/api/reports') res.setHeader('Retry-After', String(reportCacheSeconds));
       if (!res.headersSent) send(res, status, { error: code }); else res.end();
     }
   });

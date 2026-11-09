@@ -2,7 +2,7 @@
 set -euo pipefail
 # Dedicated disposable DB only; never loads .env or uses operational DATABASE_URL.
 container="olos-admin-reports-test-$(date +%s)-$$"
-trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+trap 'docker rm -fv "$container" >/dev/null 2>&1 || true' EXIT
 docker run --detach --name "$container" --label olos-http.disposable-test=true \
   -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=olos_admin_reports_test \
   -p 127.0.0.1::5432 postgres:16-bookworm >/dev/null
