@@ -29,14 +29,14 @@ export function adminServer(options: {
   origin: string; publicDir: string; auth: AdminAuth;
   credentials: Pick<CredentialService, 'view' | 'save' | 'test'>;
   scheduler: Pick<DynamicScheduler, 'request' | 'status'>;
-  repository: Pick<AdminRepository, 'logs' | 'auditLog' | 'observation'> & Partial<Pick<AdminRepository, 'reports'>>;
+  repository: Pick<AdminRepository, 'logs' | 'auditLog' | 'observation'> & Partial<Pick<AdminRepository, 'reports' | 'today'>>;
   events?: () => readonly import('../errors.js').LogEntry[];
 }) {
   const origin = new URL(options.origin);
   if (origin.origin !== options.origin || (origin.protocol !== 'https:' && !(origin.protocol === 'http:' && ['localhost','127.0.0.1'].includes(origin.hostname)))) throw new WorkerError('ADMIN_ORIGIN_INVALID');
   const secure = origin.protocol === 'https:';
   const cookie = (token: string, age: number) => `olos_admin=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${secure ? '; Secure' : ''}`;
-  const files: Record<string, [string, string]> = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/ui.js': ['ui.js','text/javascript'], '/style.css': ['style.css','text/css'] };
+  const files: Record<string, [string, string]> = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/ui.js': ['ui.js','text/javascript'], '/dashboard.js': ['dashboard.js','text/javascript'], '/style.css': ['style.css','text/css'] };
   const server = createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -61,8 +61,13 @@ export function adminServer(options: {
         options.auth.logout(session.token); res.setHeader('Set-Cookie', cookie('', 0)); send(res, 200, { ok: true }); return;
       }
       if (path === '/api/status' && req.method === 'GET') {
-        send(res, 200, { ...options.scheduler.status(), authentication: { status: 'ACCEPTED', authenticated_at: session.authenticatedAt },
-          ...await options.repository.observation() }); return;
+        const observation = await options.repository.observation();
+        send(res, 200, { ...observation, ...options.scheduler.status(), server_time: new Date().toISOString(),
+          authentication: { status: 'ACCEPTED', authenticated_at: session.authenticatedAt } }); return;
+      }
+      if (path === '/api/today' && req.method === 'GET') {
+        if (!options.repository.today) throw new WorkerError('REPORT_UNAVAILABLE');
+        send(res, 200, { ...await options.repository.today(), server_time: new Date().toISOString() }); return;
       }
       if (path === '/api/reports' && req.method === 'GET') {
         if (!options.repository.reports) throw new WorkerError('REPORT_UNAVAILABLE');
@@ -91,7 +96,7 @@ export function adminServer(options: {
     } catch (error) {
       const code = errorCode(error);
       const status = ['LOGIN_FAILED','AUTHENTICATION_REQUIRED'].includes(code) ? 401 : code.endsWith('FORBIDDEN') ? 403 : code === 'LOGIN_RATE_LIMITED' ? 429 : code.endsWith('CONFLICT') ? 409 : ['REPORT_TIMEOUT','REPORT_UNAVAILABLE'].includes(code) ? 503 : error instanceof WorkerError ? 400 : 503;
-      if (status === 503 && req.url?.split('?')[0] === '/api/reports') res.setHeader('Retry-After', String(reportCacheSeconds));
+      if (status === 503 && ['/api/reports','/api/today'].includes(req.url?.split('?')[0] ?? '')) res.setHeader('Retry-After', String(reportCacheSeconds));
       if (!res.headersSent) send(res, status, { error: code }); else res.end();
     }
   });

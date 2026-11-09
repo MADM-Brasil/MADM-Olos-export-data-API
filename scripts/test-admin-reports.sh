@@ -8,7 +8,7 @@ docker run --detach --name "$container" --label olos-http.disposable-test=true \
   -p 127.0.0.1::5432 postgres:16-bookworm >/dev/null
 ready=false
 for i in $(seq 1 30); do
-  if docker exec "$container" pg_isready -U postgres -d olos_admin_reports_test >/dev/null 2>&1; then ready=true; break; fi
+  if docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d olos_admin_reports_test >/dev/null 2>&1; then ready=true; break; fi
   sleep 1
 done
 if [ "$ready" != true ]; then exit 1; fi

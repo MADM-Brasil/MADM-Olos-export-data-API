@@ -169,6 +169,11 @@ export class AdminRepository implements SchedulerRepository {
     this.reportReader ??= new AdminReports(this.pool, this.source, this.destination);
     return this.reportReader.read(from, to);
   }
+  today() {
+    this.check();
+    this.reportReader ??= new AdminReports(this.pool, this.source, this.destination);
+    return this.reportReader.today();
+  }
   async logs() {
     this.check();
     return (await this.pool.query(`SELECT id,state,started_at,finished_at,processed_count,received_count,request_ms,error_code,

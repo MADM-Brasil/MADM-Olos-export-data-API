@@ -96,3 +96,22 @@ export function renderDashboardMetrics(element, r) {
   element('metrics-error').textContent=gaps.join(' · ');
   element('chart-period').textContent=`${dayLabel(r.from)} — ${dayLabel(r.to)} · Brasília`;
 }
+
+export function renderTerminal(root, entries, search, level, showAll = false) {
+  const open=new Set([...root.querySelectorAll('details[open]')].map(node=>node.dataset.eventKey));
+  const filtered=entries.map((entry,index)=>({entry,index})).filter(({entry:e})=>e.event.toLowerCase().includes(search.toLowerCase())&&(level==='ALL'||eventLevel(e)===level));
+  filtered.sort((a,b)=>(Date.parse(a.entry.time)||0)-(Date.parse(b.entry.time)||0)||a.index-b.index);
+  const visible=showAll?filtered:filtered.slice(-12);
+  root.replaceChildren();
+  if(!visible.length)root.textContent='Nenhum evento corresponde aos filtros.';
+  for(const {entry:e,index} of visible){
+    const row=document.createElement('details'),summary=document.createElement('summary'),time=document.createElement('span'),badge=document.createElement('span'),name=document.createElement('span'),detail=document.createElement('div');
+    row.className='event-line';row.dataset.eventKey=`${e.time}/${e.event}/${index}`;row.open=open.has(row.dataset.eventKey);
+    time.className='event-time';time.textContent=e.time?new Date(e.time).toLocaleTimeString('pt-BR',{timeZone:zone}):'—';
+    badge.className='event-level';badge.dataset.level=eventLevel(e);badge.textContent=eventLevel(e);
+    name.className='event-name';name.textContent=e.event;
+    detail.className='event-detail';detail.textContent=eventLines([e])[0];
+    summary.append(time,badge,name);row.append(summary,detail);root.append(row);
+  }
+  return {visible:visible.length,total:filtered.length};
+}

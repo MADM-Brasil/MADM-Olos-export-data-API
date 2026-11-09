@@ -20,8 +20,8 @@ export function reportRange(from: unknown, to: unknown) {
 const countFields = ['calls', 'identified_calls', 'with_cpf', 'with_email',
   'confirmed', 'pending', 'not_queued', 'inconsistent', 'missing_mapping'] as const;
 type CountField = typeof countFields[number];
-type Day = Record<CountField, string> & { day: string | null; operator_ids: string[] | null };
-type Snapshot = { days: Day[]; failed_reads: string; observed_at: Date; outbox_available: boolean };
+type Day = Record<CountField, string> & { day: string | null; operator_ids: string[] | null; collected_today: string };
+type Snapshot = { days: Day[]; failed_reads: string; observed_at: Date; outbox_available: boolean; collection_date: string };
 export const reportCacheSeconds = 300;
 export const reportStatementTimeoutMs = 5_000;
 
@@ -30,10 +30,11 @@ export const reportStatementTimeoutMs = 5_000;
 export class AdminReports {
   private cached: { at: number; value: Snapshot } | undefined;
   private pending: Promise<Snapshot> | undefined;
-  private failure: { at: number; error: unknown } | undefined;
+  private failure: { at: number; day: string; error: unknown } | undefined;
   constructor(private readonly pool: Pool, private readonly source: string,
     private readonly destination: { schema: string; table: string },
-    private readonly now: () => number = () => performance.now()) {}
+    private readonly now: () => number = () => performance.now(),
+    private readonly calendarDay: () => string = () => DateTime.now().setZone(reportZone).toISODate()!) {}
 
   async read(from: unknown, to: unknown): Promise<unknown> {
     const range = reportRange(from, to);
@@ -49,6 +50,13 @@ export class AdminReports {
       ...range, timezone: reportZone, outbox_available: snapshot.outbox_available,
       confirmation_source: 'local_outbox_receipts', cache_seconds: reportCacheSeconds };
   }
+  async today() {
+    const snapshot = await this.snapshot();
+    return { date: snapshot.collection_date,
+      calls: snapshot.days.reduce((n, day) => n + BigInt(day.collected_today), 0n).toString(),
+      observed_at: snapshot.observed_at, timezone: reportZone, cache_seconds: reportCacheSeconds,
+      time_basis: 'first_local_persistence', identity: 'source_key/source_id' };
+  }
   private sum(days: Day[], field: CountField) {
     return days.reduce((n, day) => n + BigInt(day[field]), 0n).toString();
   }
@@ -62,14 +70,14 @@ export class AdminReports {
     return { ...counts, operators: String(operators.size) };
   }
   private snapshot(): Promise<Snapshot> {
-    if (this.cached && this.now() - this.cached.at < reportCacheSeconds * 1000) return Promise.resolve(this.cached.value);
+    if (this.cached && this.cached.value.collection_date === this.calendarDay() && this.now() - this.cached.at < reportCacheSeconds * 1000) return Promise.resolve(this.cached.value);
     if (this.pending) return this.pending;
-    if (this.failure && this.now() - this.failure.at < reportCacheSeconds * 1000) return Promise.reject(this.failure.error);
+    if (this.failure && this.failure.day === this.calendarDay() && this.now() - this.failure.at < reportCacheSeconds * 1000) return Promise.reject(this.failure.error);
     this.pending = this.query().then(value => {
       this.cached = { at: this.now(), value }; this.failure = undefined; return value;
     }, error => {
       // No stale snapshot masquerading as current, and no retry storm every 30s.
-      this.failure = { at: this.now(), error }; throw error;
+      this.failure = { at: this.now(), day: this.calendarDay(), error }; throw error;
     }).finally(() => { this.pending = undefined; });
     return this.pending;
   }
@@ -82,7 +90,11 @@ export class AdminReports {
       // Compilation/optimization of this multi-aggregate plan can consume the
       // short reporting budget itself. Scope to this read-only transaction only.
       await db.query('SET LOCAL jit=off');
-      const hasOutbox = (await db.query("SELECT to_regclass('olos_http.corporate_outbox') IS NOT NULL AS present")).rows[0].present === true;
+      const clock = (await db.query(`SELECT to_regclass('olos_http.corporate_outbox') IS NOT NULL AS present,
+        (transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date::text AS collection_date,
+        ((transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date::timestamp AT TIME ZONE 'America/Sao_Paulo') AS start_at,
+        (((transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date + 1)::timestamp AT TIME ZONE 'America/Sao_Paulo') AS end_at`)).rows[0];
+      const hasOutbox = clock.present === true;
       const relation = `${quote(this.destination.schema)}.${quote(this.destination.table)}`;
       const delivery = hasOutbox ? `CASE WHEN o.source_id IS NULL THEN 'not_queued'
         WHEN o.target_id<>r.target_id OR o.source_hash<>r.source_hash THEN 'inconsistent'
@@ -97,6 +109,7 @@ export class AdminReports {
       const days = (await db.query<Day>(`WITH classified AS NOT MATERIALIZED (
         SELECT (d.data_ligacao AT TIME ZONE 'America/Sao_Paulo')::date AS day,
           r.agent_id, btrim(d.nome_agente,$2) AS agent_name,
+          r.created_at >= $5::timestamptz AND r.created_at < $6::timestamptz AS collected_today,
           d.internal_id_olos IS NOT NULL AS mapped,
           coalesce(btrim(d.cpf,$2)<>'',false) AS has_cpf,
           coalesce(btrim(d.email,$2)<>'',false) AS has_email, ${delivery} AS delivery
@@ -105,6 +118,7 @@ export class AdminReports {
         WHERE r.source_key=$1 AND r.target_table=$4
       ), per_identity AS (
         SELECT day, agent_id, agent_name, delivery, count(*) AS calls,
+          count(*) FILTER (WHERE collected_today) AS collected_today,
           count(*) FILTER (WHERE has_cpf) AS with_cpf,
           count(*) FILTER (WHERE has_email) AS with_email,
           count(*) FILTER (WHERE NOT mapped) AS missing_mapping
@@ -112,6 +126,7 @@ export class AdminReports {
       ), per_operator AS (
         SELECT day, CASE WHEN agent_id ~ '^[1-9][0-9]*$' AND agent_name<>''
           AND agent_name !~* $3 THEN agent_id END AS identified_agent, sum(calls) AS calls,
+          sum(collected_today) AS collected_today,
           sum(with_cpf) AS with_cpf, sum(with_email) AS with_email,
           coalesce(sum(calls) FILTER (WHERE delivery='confirmed'),0) AS confirmed,
           coalesce(sum(calls) FILTER (WHERE delivery='pending'),0) AS pending,
@@ -120,18 +135,18 @@ export class AdminReports {
           sum(missing_mapping) AS missing_mapping
         FROM per_identity GROUP BY day, identified_agent
       ) SELECT day::text,
-        sum(calls)::text AS calls,
+        sum(calls)::text AS calls, sum(collected_today)::text AS collected_today,
         coalesce(sum(calls) FILTER (WHERE identified_agent IS NOT NULL),0)::text AS identified_calls,
         array_agg(identified_agent) FILTER (WHERE identified_agent IS NOT NULL) AS operator_ids,
         sum(with_cpf)::text AS with_cpf, sum(with_email)::text AS with_email,
         sum(confirmed)::text AS confirmed, sum(pending)::text AS pending,
         sum(not_queued)::text AS not_queued, sum(inconsistent)::text AS inconsistent,
         sum(missing_mapping)::text AS missing_mapping
-      FROM per_operator GROUP BY day ORDER BY day`, [this.source, reportWhitespace, reportPlaceholder, relation])).rows;
+      FROM per_operator GROUP BY day ORDER BY day`, [this.source, reportWhitespace, reportPlaceholder, relation, clock.start_at, clock.end_at])).rows;
       const meta = (await db.query(`SELECT count(*)::text AS failed_reads,
         transaction_timestamp() AS observed_at FROM olos_http.reads
         WHERE source_key=$1 AND error_code IS NOT NULL`, [this.source])).rows[0];
-      return { days, ...meta, outbox_available: hasOutbox };
+      return { days, ...meta, outbox_available: hasOutbox, collection_date: clock.collection_date };
     } catch (error) {
       if ((error as { code?: string })?.code === '57014') throw new WorkerError('REPORT_TIMEOUT');
       throw error;

@@ -32,11 +32,11 @@ test('snapshot expires once across periods; exact totals, union of operators, no
   const day=(date:string|null,calls:string,ids:string[])=>({day:date,calls,identified_calls:calls,operator_ids:ids,with_cpf:'0',with_email:'0',confirmed:'0',pending:calls,not_queued:'0',inconsistent:'0',missing_mapping:'0'});
   const days=[day('2026-09-30','9007199254740993',['7','9007199254740993']),day('2026-10-01','2',['7']),day(null,'1',['7'])];
   const pool={async connect(){connects++;if(fail)throw new Error('offline');return {async query(sql:string){
-    if(sql.includes('to_regclass'))return {rows:[{present:true}]};
+    if(sql.includes('to_regclass'))return {rows:[{present:true,collection_date:'2026-11-01',start_at:'2026-11-01T03:00:00Z',end_at:'2026-11-02T03:00:00Z'}]};
     if(sql.startsWith('WITH classified'))return {rows:days};
     if(sql.includes('failed_reads'))return {rows:[{failed_reads:'1',observed_at:new Date('2026-11-01')}]};
     return {rows:[]};},release(){}};}} as unknown as Pool;
-  const reader=new AdminReports(pool,'fixture',{schema:'raw',table:'olos_calls'},()=>now);
+  const reader=new AdminReports(pool,'fixture',{schema:'raw',table:'olos_calls'},()=>now,()=> '2026-11-01');
   const first=await reader.read('2026-09-01','2026-10-31') as any;
   assert.equal(first.summary.calls,'9007199254740996');assert.equal(first.period.calls,'9007199254740995');
   assert.equal(first.summary.operators,'2');assert.equal(first.period.operators,'2');assert.equal(first.summary.undated,'1');
@@ -50,4 +50,19 @@ test('snapshot expires once across periods; exact totals, union of operators, no
   now+=300000;fail=true;await assert.rejects(reader.read('2026-09-01','2026-10-31'),/offline/);
   now+=30000;await assert.rejects(reader.read('2026-09-01','2026-10-31'),/offline/);assert.equal(connects,3);
   await assert.rejects(reader.read('bad','bad'),/REPORT_PERIOD_INVALID/);assert.equal(connects,3);
+});
+test('today shares the historical snapshot, preserves zero, refreshes at midnight and after expiry',async()=>{
+  let connects=0,now=0,calendar='2026-10-31',collected='2',empty=false;
+  const pool={async connect(){connects++;const date=calendar;return {async query(sql:string){
+    if(sql.includes('to_regclass'))return {rows:[{present:true,collection_date:date,start_at:date+'T03:00:00Z',end_at:date+'T23:59:59Z'}]};
+    if(sql.startsWith('WITH classified'))return {rows:empty?[]:[{day:'2020-01-01',calls:'10',identified_calls:'1',operator_ids:['7'],with_cpf:'0',with_email:'0',confirmed:'0',pending:'0',not_queued:'10',inconsistent:'0',missing_mapping:'0',collected_today:collected}]};
+    if(sql.includes('failed_reads'))return {rows:[{failed_reads:'0',observed_at:new Date(date+'T12:00:00Z')}]};
+    return {rows:[]};},release(){}};}} as unknown as Pool;
+  const reader=new AdminReports(pool,'fixture',{schema:'raw',table:'olos_calls'},()=>now,()=>calendar);
+  const first=await reader.today();assert.equal(first.calls,'2');assert.equal(first.date,'2026-10-31');assert.equal(first.time_basis,'first_local_persistence');
+  assert.equal((await reader.read('2020-01-01','2020-01-01') as any).summary.calls,'10');assert.equal(connects,1);
+  collected='3';now=30000;assert.equal((await reader.today()).calls,'2');assert.equal(connects,1);
+  now=300000;assert.equal((await reader.today()).calls,'3');assert.equal(connects,2);
+  calendar='2026-11-01';collected='0';assert.equal((await reader.today()).calls,'0');assert.equal(connects,3);
+  empty=true;now+=300000;assert.equal((await reader.today()).calls,'0');
 });

@@ -15,7 +15,7 @@
     "cli": "tsx src/main.ts",
     "typecheck:admin": "tsc -p admin/tsconfig.json",
     "build:admin": "node scripts/build-admin.mjs",
-    "test:admin-ui": "node --test test/admin-ui.test.mjs"
+    "test:admin-ui": "node --test test/admin-ui.test.mjs test/admin-dashboard-ui.test.mjs"
   },
   "dependencies": {
     "lossless-json": "4.3.3",

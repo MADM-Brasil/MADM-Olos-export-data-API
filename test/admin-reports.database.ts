@@ -112,6 +112,27 @@ test('SQL operator/contact semantics preserve canonical IDs, Unicode whitespace 
   const old=(await pool.query(await readFile('test/fixtures/admin-reports-before.sql','utf8'),['semantics','2026-10-01','2026-10-31',reportWhitespace,reportPlaceholder,target])).rows[0];
   for(const key of ['summary','period','daily','failed_reads'])assert.deepEqual(r[key],old[key]);
 });
+test('today counts first persisted source identities in Brasília, not call date, deliveries or duplicates',async()=>{
+  const bounds=(await pool.query(`SELECT (now() AT TIME ZONE 'America/Sao_Paulo')::date::text AS date,
+    ((now() AT TIME ZONE 'America/Sao_Paulo')::date::timestamp AT TIME ZONE 'America/Sao_Paulo') AS start,
+    (((now() AT TIME ZONE 'America/Sao_Paulo')::date+1)::timestamp AT TIME ZONE 'America/Sao_Paulo') AS finish`)).rows[0];
+  const start=new Date(bounds.start).getTime(),finish=new Date(bounds.finish).getTime();
+  for(const [i,at]of [start-1,start,start+1,finish,0].entries()){
+    const id=900+i;
+    await pool.query(`INSERT INTO raw.olos_calls(internal_id_olos,olos_call_id,data_ligacao) OVERRIDING SYSTEM VALUE VALUES($1,'same-call-id','2020-01-01T12:00:00Z')`,[id]);
+    await pool.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,created_at) VALUES('today-fixture',$1,$2,$3,'fixture','0',$4)`,[String(id),target,id,new Date(at)]);
+  }
+  // Reobserving an existing source identity does not add a collected call.
+  await pool.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash) VALUES('today-fixture','901',$1,901,'fixture') ON CONFLICT(source_key,source_id) DO NOTHING`,[target]);
+  await pool.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,created_at) VALUES('today-fixture','other-target','"other"."calls"',9900,'fixture',$1)`,[bounds.start]);
+  let now=0;const r=new AdminReports(pool,'today-fixture',{schema:'raw',table:'olos_calls'},()=>now,()=>bounds.date);
+  const before=await snapshot(),first=await r.today();assert.equal(first.date,bounds.date);assert.equal(first.calls,'2');
+  assert.equal((await r.read(bounds.date,bounds.date) as any).period.calls,'0');assert.equal(await snapshot(),before);
+  await pool.query(`INSERT INTO raw.olos_calls(internal_id_olos,data_ligacao) OVERRIDING SYSTEM VALUE VALUES(906,'2020-01-01T12:00:00Z')`);
+  await pool.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,created_at) VALUES('today-fixture','906',$1,906,'fixture',$2)`,[target,new Date(start+2)]);
+  now=30000;assert.equal((await r.today()).calls,'2');now=300000;assert.equal((await r.today()).calls,'3');
+  assert.equal((await new AdminReports(pool,'no-rows',{schema:'raw',table:'olos_calls'}).today()).calls,'0');
+});
 test('representative local history remains bounded; compare old/new and repeated range requests',async()=>{
   const size=Number(process.env.REPORT_BENCH_ROWS??200000);
   assert(Number.isInteger(size)&&size%10===0&&size>=200000&&size<=1600000,'Use 200000..1600000 synthetic rows, multiple of 10');
