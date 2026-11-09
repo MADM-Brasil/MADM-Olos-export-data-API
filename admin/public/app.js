@@ -37,12 +37,14 @@ async function refreshToday(){
   if(flight.day!==brasiliaDay(clock.now())&&todaySnapshot?.date!==brasiliaDay(clock.now()))void refreshToday();
 }
 
-function showLogin(){sessionEpoch++;resetOperational();resetReports();eventEntries=[];eventPaused=false;eventsFailed=false;renderEvents();logged=false;csrf='';$('app').hidden=true;$('login').hidden=false;$('credentials-form').reset();$('terminal').hidden=true;document.body.classList.remove('menu-open');syncMenu();}
+function showLogin(){sessionEpoch++;resetOperational();resetReports();eventEntries=[];eventPaused=false;eventsFailed=false;eventsUpdatedAt=null;renderEvents();logged=false;csrf='';$('app').hidden=true;$('login').hidden=false;$('credentials-form').reset();$('terminal').hidden=true;document.body.classList.remove('menu-open');syncMenu();}
 function describe(id,details){$(id).replaceChildren();for(const [name,value]of details){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=name;dd.textContent=value??'Não medido';$(id).append(dt,dd);}}
 function table(id,rows){const root=$(id);root.replaceChildren();for(const values of rows){const tr=document.createElement('tr');for(const value of values){const td=document.createElement('td');td.textContent=value??'—';tr.append(td);}root.append(tr);}}
 let scheduleDirty=false;
 $('minutes').addEventListener('input',()=>{scheduleDirty=true;});
 async function refresh(){
+  // The existing 2 s cycle also polls events when a status request is still pending.
+  if(logged&&['dashboard','logs'].includes(currentPage))void refreshEvents();
   if(!logged||refreshing)return;refreshing=true;
   const epoch=sessionEpoch;
   try{
@@ -68,7 +70,7 @@ async function refresh(){
     if(currentPage==='logs')await logs();
 
     if(currentPage==='status'){const rows=await api('/audit');if(!logged||epoch!==sessionEpoch)return;table('audit-rows',rows.map(r=>[date(r.occurred_at),r.actor,r.action]));}
-  }catch(e){if(logged&&epoch===sessionEpoch){statusFailed=true;renderClock();notice('Não foi possível atualizar o estado operacional.',true);$('state').textContent='Indisponível';$('state').classList.add('error');$('corporate-state').textContent='Indisponível';}}finally{refreshing=false;if(logged&&epoch===sessionEpoch&&['dashboard','logs'].includes(currentPage))void refreshEvents();}
+  }catch(e){if(logged&&epoch===sessionEpoch){statusFailed=true;renderClock();notice('Não foi possível atualizar o estado operacional.',true);$('state').textContent='Indisponível';$('state').classList.add('error');$('corporate-state').textContent='Indisponível';}}finally{refreshing=false;}
 }
 async function credentials(){const epoch=sessionEpoch,c=await api('/credentials');if(!logged||epoch!==sessionEpoch)return;revision=c.revision;const f=$('credentials-form');for(const key of ['baseUrl','username'])f.elements.namedItem(key).value=c[key];f.elements.namedItem('password').value='';$('credentials-complete').textContent=`Configuração ${c.complete?'completa':'incompleta'} · ${c.origin==='environment'?'origem: variáveis de ambiente':'origem: banco criptografado'}. Campos secretos vazios preservam os valores atuais.`;$('password-configured').textContent=c.passwordConfigured?'Senha configurada no backend.':'Senha ainda não configurada.';testResult(c.lastTest);}
 function testResult(r){$('test-result').textContent=r?`${r.ok?'Autenticação validada':'Falha no teste'} · ${r.code} · ${r.duration_ms} ms · ${date(r.at)}`:'Nenhum teste registrado para esta configuração.';}
@@ -93,25 +95,24 @@ $('stop').addEventListener('click',()=>$('stop-dialog').showModal());$('cancel-s
 $('confirm-stop').addEventListener('click',(/** @type {any} */ e)=>action(async()=>{await api('/worker/stop','POST',{confirm:true});$('stop-dialog').close();notice('Parada solicitada. Aguardando a conclusão efetiva do consumidor.');await refresh();},e.currentTarget));
 $('refresh-logs').addEventListener('click',(/** @type {any} */ e)=>action(async()=>{await logs();await refreshEvents();},e.currentTarget));$('logout').addEventListener('click',(/** @type {any} */ e)=>action(async()=>{await api('/logout','POST',{});showLogin();},e.currentTarget));
 
-let eventEntries=[],eventPaused=false,eventsBusy=false,eventsFailed=false,reportData=null,reportPage=0,reportBusy=false,chartSnapshot=null;
+let eventEntries=[],eventPaused=false,eventsBusy=false,eventsFailed=false,eventsUpdatedAt=null,reportData=null,reportPage=0,reportBusy=false,chartSnapshot=null;
 const pageSize=14;
 function mountTerminal(){const visible=['dashboard','logs'].includes(currentPage);$('terminal').hidden=!visible;if(visible)$(currentPage==='dashboard'?'dashboard-terminal':'logs-terminal').append($('terminal'));}
 function renderEvents(){
-  const output=$('event-output'),scroll=output.scrollTop;
-  const shown=renderTerminal(output,eventEntries,$('event-search').value,$('event-level').value,$('event-all').checked);
-  output.scrollTop=$('event-autoscroll').checked?output.scrollHeight:scroll;
-  $('event-status').textContent=`${shown.visible} de ${shown.total} eventos filtrados · Brasília${eventsFailed?' · visualização desatualizada':''}`;
+  const shown=renderTerminal($('event-output'),eventEntries,$('event-search').value,$('event-level').value,$('event-autoscroll').checked);
+  $('event-status').textContent=`${shown.visible} de ${shown.total} eventos do buffer disponível${eventsUpdatedAt?' · atualizado '+date(eventsUpdatedAt)+' · Brasília':''}${eventsFailed?' · visualização desatualizada':''}`;
   $('event-pause').textContent=eventPaused?'Retomar visualização':'Pausar visualização';
   $('event-pause').setAttribute('aria-pressed',String(eventPaused));
-  $('terminal-live').textContent=eventPaused?'VISUALIZAÇÃO PAUSADA':eventsFailed?'SEM ATUALIZAÇÃO':'AO VIVO · 2 s';
+  $('terminal-live').textContent=eventPaused?'VISUALIZAÇÃO PAUSADA':eventsFailed?'SEM ATUALIZAÇÃO':eventsUpdatedAt?'AO VIVO · 2 s':'CONECTANDO';
 }
 async function refreshEvents(){
   if(!logged||eventPaused||eventsBusy)return;eventsBusy=true;const epoch=sessionEpoch;
-  try{const events=await api('/events');if(!logged||epoch!==sessionEpoch||eventPaused)return;eventEntries=safeEvents(events);eventsFailed=false;renderEvents();}
+  try{const events=await api('/events');if(!logged||epoch!==sessionEpoch||eventPaused)return;eventEntries=safeEvents(events);eventsFailed=false;eventsUpdatedAt=new Date();renderEvents();}
   catch{if(logged&&epoch===sessionEpoch){eventsFailed=true;$('terminal-live').textContent='SEM ATUALIZAÇÃO';$('event-status').textContent='Eventos indisponíveis. A visualização anterior pode estar desatualizada.';}}
   finally{eventsBusy=false;}
 }
-$('event-search').addEventListener('input',renderEvents);$('event-level').addEventListener('change',renderEvents);$('event-all').addEventListener('change',renderEvents);
+$('event-search').addEventListener('input',renderEvents);$('event-level').addEventListener('change',renderEvents);
+$('event-autoscroll').addEventListener('change',()=>{if($('event-autoscroll').checked)$('event-output').scrollTop=$('event-output').scrollHeight;});
 $('event-pause').addEventListener('click',()=>{eventPaused=!eventPaused;renderEvents();if(!eventPaused)void refreshEvents();});
 $('event-copy').addEventListener('click',()=>action(async()=>{await navigator.clipboard.writeText(eventLines(eventEntries,$('event-search').value,$('event-level').value).join('\n'));$('event-status').textContent='Logs sanitizados copiados.';},$('event-copy')));
 function syncMenu(){const open=document.body.classList.contains('menu-open');$('menu-toggle').setAttribute('aria-expanded',String(open));$('sidebar').inert=matchMedia('(max-width:760px)').matches&&!open;}

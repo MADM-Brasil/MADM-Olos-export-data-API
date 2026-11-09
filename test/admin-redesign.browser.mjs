@@ -8,6 +8,9 @@ import { defaultRange } from '../admin/public/ui.js';
 const require=createRequire(import.meta.url);
 const {chromium}=require(process.env.ADMIN_PLAYWRIGHT_PATH||'playwright');
 const writes=[], requests=[],errors=[];
+const evidenceDir=process.env.ADMIN_EVIDENCE_DIR||'admin/evidence';
+let statusDelay=0,eventDelay=0,eventOffset=0,eventsActive=0,maxEventsActive=0;
+const eventTimes=[];
 let session=false,state='RUNNING',interval=120000,eventPolls=0,reportError=false,statusError=false,eventError=false,empty=false,reportDelay=0;
 let baseServer=Date.now(),baseReal=Date.now(),todayError=false,todayDelay=0,todayCalls='1280',activeCycle=false;
 const serverNow=()=>baseServer+Date.now()-baseReal;
@@ -31,12 +34,13 @@ const server=createServer(async(req,res)=>{
   if(path==='/api/session'){json({actor:'Homologação local',csrf:'fixture-csrf'});return;}
   if(path==='/api/logout'){session=false;json({ok:true});return;}
   if(path==='/api/status'){
+    if(statusDelay)await new Promise(r=>setTimeout(r,statusDelay));
     if(statusError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}
     json({state,desired_state:state,interval_ms:interval,cycle_in_progress:activeCycle,next_run_at:nextAt,server_time:new Date(serverNow()).toISOString(),authentication:{status:'ACCEPTED'},database:{reachable:true,schema_valid:true},ingestion:{status:'CONFIRMED',pending:[],latest:{started_at:'2026-11-04T15:00:00Z',state:'done'},last_completed:{finished_at:'2026-11-04T15:01:00Z',received_count:8,inserted:5,duplicates:3,duration_ms:240}},corporate_delivery:{ready:true,paused:true,blocked:false}});return;
   }
   if(path==='/api/today'){if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence'});return;}
   if(path==='/api/reports'){if(reportDelay)await new Promise(r=>setTimeout(r,reportDelay));if(reportError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else {const r=report(),q=new URL(req.url,'http://localhost').searchParams;r.from=q.get('from')||r.from;r.to=q.get('to')||r.to;r.daily=r.daily.filter(d=>d.day>=r.from&&d.day<=r.to);json(r);}return;}
-  if(path==='/api/events'){eventPolls++;if(eventError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}json(Array.from({length:240},(_,i)=>({time:'2026-11-04T15:00:00.000Z',event:i===239?'scheduler_error':i===238?'poll_retry':'batch_completed',received:eventPolls,error:i===239?'RECOVERY_REQUIRED':undefined,email:'PRIVATE_EMAIL',payload:'PRIVATE_PAYLOAD'})));return;}
+  if(path==='/api/events'){eventPolls++;eventTimes.push(Date.now());eventsActive++;maxEventsActive=Math.max(maxEventsActive,eventsActive);if(eventDelay)await new Promise(r=>setTimeout(r,eventDelay));eventsActive--;if(eventError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}json(Array.from({length:240},(_,i)=>({time:'2026-11-04T15:00:00.000Z',event:i+eventOffset===239?'scheduler_error':i+eventOffset===238?'poll_retry':'batch_completed',received:i+eventOffset,inserted:5,duplicates:2,request_ms:42,skipped:1,next_run_at:'2026-11-04T15:02:00.000Z',error:i+eventOffset===239?'RECOVERY_REQUIRED':undefined,email:'PRIVATE_EMAIL',payload:'PRIVATE_PAYLOAD'})));return;}
   if(path==='/api/logs'){json([{id:'fixture-read',started_at:'2026-11-04T15:00:00Z',state:'done',processed_count:5,received_count:5,request_ms:20}]);return;}
   if(path==='/api/audit'){json([{occurred_at:'2026-11-04T15:00:00Z',actor:'fixture-admin',action:'scheduler_state'}]);return;}
   if(path==='/api/schedule'){interval=input.interval_ms;json({interval_ms:interval});return;}
@@ -61,7 +65,7 @@ const nav=async name=>{console.log('UI:',name);await page.getByRole('button',{na
 const screenshot=async(file)=>{
   await page.evaluate(()=>{const p=document.createElement('p');p.id='fixture-label';p.textContent='HOMOLOGAÇÃO LOCAL · DADOS SINTÉTICOS DE TESTE';document.querySelector('main').prepend(p);});
   if((await page.viewportSize()).width<760)await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=0.5);
-  await page.screenshot({path:file,fullPage:true});await page.locator('#fixture-label').evaluate(e=>e.remove());
+  await page.screenshot({path:file.replace('admin/evidence',evidenceDir),fullPage:true});await page.locator('#fixture-label').evaluate(e=>e.remove());
 };
 try{
   await page.goto(origin);await page.locator('#login').waitFor({state:'visible'});
@@ -71,14 +75,24 @@ try{
   assert.equal(await page.locator('[data-view="dashboard"] #metric-calls').count(),0);
   assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'false');assert.equal(await page.locator('#calls-chart svg').count(),0);
   assert.equal(requests.filter(r=>r.path==='/api/reports').length,0,'collapsed dashboard must not request history');
-  assert.equal(await page.locator('#event-output .event-line').count(),12);
+  assert.equal(await page.locator('#event-output .event-line').count(),200);
   assert.equal(await page.locator('#dashboard-terminal #terminal').count(),1);
   assert(await page.evaluate(()=>{const cards=document.querySelector('#metrics'),terminal=document.querySelector('#dashboard-terminal'),chart=document.querySelector('#chart-panel');return !!(cards.compareDocumentPosition(terminal)&Node.DOCUMENT_POSITION_FOLLOWING)&&!!(terminal.compareDocumentPosition(chart)&Node.DOCUMENT_POSITION_FOLLOWING);}));
   assert.equal(writes.length,1);
+  assert.equal(await page.locator('#event-output details').count(),0,'basic details require no click');
+  assert.match(await page.locator('#event-output .event-line').last().textContent(),/ERROR \| scheduler_error \| received=239 inserted=5 duplicates=2 request_ms=42 skipped=1 next_run_at=04\/11\/2026, 12:02:00 Brasília error=RECOVERY_REQUIRED/);
+  assert.doesNotMatch(await page.locator('#event-output').textContent(),/PRIVATE/);
+  // A slow status call cannot block the real two-second terminal poll.
+  statusDelay=4600;const realPollStart=eventTimes.length;
+  await page.evaluate(()=>{void window.__statusPoll();});await page.waitForTimeout(4200);
+  const timed=eventTimes.slice(realPollStart);assert(timed.length>=3);for(let i=2;i<timed.length;i++)assert(timed[i]-timed[i-1]>=1700&&timed[i]-timed[i-1]<=2400,'single two-second polling cycle');
+  statusDelay=0;await page.waitForTimeout(550);
+  // Slow event responses are coalesced, including manual invocations.
+  eventDelay=300;await page.evaluate(()=>{for(let i=0;i<8;i++)void window.__statusPoll();});await page.waitForTimeout(400);eventDelay=0;assert.equal(maxEventsActive,1);
   const dailyRequests=requests.filter(r=>['/api/today','/api/reports'].includes(r.path)).length;
   await page.evaluate(()=>{for(let i=0;i<100;i++)window.__clockTick();});
   assert.equal(requests.filter(r=>['/api/today','/api/reports'].includes(r.path)).length,dailyRequests,'visual ticks do not fetch');
-  await mkdir('admin/evidence',{recursive:true});
+  await mkdir(evidenceDir,{recursive:true});
   await screenshot('admin/evidence/premium-desktop.png');
   await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   await screenshot('admin/evidence/premium-mobile.png');
@@ -106,15 +120,29 @@ try{
   activeCycle=true;await page.evaluate(()=>window.__statusPoll());await waitText('countdown','Em leitura');activeCycle=false;
   nextAt=new Date(serverNow()+102000).toISOString();await page.evaluate(()=>window.__statusPoll());assert.match(await page.locator('#countdown').textContent(),/^01:(4[01]|39|42)$/);
   await page.locator('#terminal-filters > summary').click();
-  await page.locator('#event-all').check();assert.equal(await page.locator('#event-output .event-line').count(),200);
+  assert.equal(await page.locator('#event-all').count(),0);assert.equal(await page.locator('#event-output .event-line').count(),200);
+  await page.locator('#event-level').selectOption('WARN');assert.equal(await page.locator('#event-output .event-line').count(),1);await waitText('event-output','poll_retry');
+  await page.locator('#event-level').selectOption('INFO');assert.equal(await page.locator('#event-output .event-line').count(),198);
+  await page.locator('#event-search').fill('received=40');assert.equal(await page.locator('#event-output .event-line').count(),1);await page.locator('#event-search').fill('');
   await page.locator('#event-level').selectOption('ERROR');assert.doesNotMatch(await page.locator('#event-output').textContent(),/batch_completed/);assert.match(await page.locator('#event-output').textContent(),/12:00:00/);
   await page.locator('#event-search').fill('absent');await waitText('event-output','Nenhum evento');await page.locator('#event-search').fill('');
-  await nav('Pausar visualização');const frozen=await page.locator('#event-output').textContent();await page.waitForTimeout(2200);assert.equal(await page.locator('#event-output').textContent(),frozen);
-  await nav('Copiar logs');await waitText('event-status','Logs sanitizados copiados');const copy=await page.evaluate(()=>Promise.race([navigator.clipboard.readText(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Clipboard read timeout')),3000))]));assert.match(copy,/scheduler_error/);assert.doesNotMatch(copy,/PRIVATE/);await nav('Retomar visualização');await page.locator('#event-level').selectOption('ALL');
+  await nav('Pausar visualização');const pausedPolls=eventPolls;const frozen=await page.locator('#event-output').textContent();await page.waitForTimeout(2200);assert.equal(await page.locator('#event-output').textContent(),frozen);assert.equal(eventPolls,pausedPolls);
+  await nav('Copiar logs');await waitText('event-status','Logs sanitizados copiados');const copy=await page.evaluate(()=>Promise.race([navigator.clipboard.readText(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Clipboard read timeout')),3000))]));assert.match(copy,/scheduler_error/);assert.equal(copy,await page.locator('#event-output .event-line').first().textContent());assert.doesNotMatch(copy,/PRIVATE/);await nav('Retomar visualização');await page.locator('#event-level').selectOption('ALL');
+  // Keep the same visible row when the retained buffer drops its first event.
+  await page.locator('#event-output').evaluate(e=>{e.scrollTop=500;});
+  const anchor=await page.locator('#event-output').evaluate(e=>{const top=e.getBoundingClientRect().top,row=[...e.children].find(r=>r.getBoundingClientRect().bottom>top);return {key:row.dataset.eventKey,offset:row.getBoundingClientRect().top-top};});
+  eventOffset=1;await page.evaluate(()=>window.__statusPoll());await waitText('event-output','received=240');
+  const anchorAfter=await page.locator('#event-output').evaluate((e,key)=>{const row=[...e.children].find(r=>r.dataset.eventKey===key);return row.getBoundingClientRect().top-e.getBoundingClientRect().top;},anchor.key);
+  assert(Math.abs(anchorAfter-anchor.offset)<1,'manual scroll survives buffer rotation even with Autoscroll checked');
+  await page.locator('#event-output').evaluate(e=>{e.scrollTop=e.scrollHeight;});eventOffset=2;await page.evaluate(()=>window.__statusPoll());await waitText('event-output','received=241');
+  assert(await page.locator('#event-output').evaluate(e=>Math.abs(e.scrollHeight-e.clientHeight-e.scrollTop)<2));
   await page.locator('#event-autoscroll').uncheck();
   await page.locator('#event-output').evaluate(e=>{e.scrollTop=40;});
   await page.evaluate(()=>window.__statusPoll());await page.waitForTimeout(100);
   assert.equal(await page.locator('#event-output').evaluate(e=>e.scrollTop),40);
+  await nav('Copiar logs');await waitText('event-status','Logs sanitizados copiados');
+  const fullCopy=await page.evaluate(()=>navigator.clipboard.readText());assert.equal(fullCopy.split('\n').length,200);
+  assert.equal(fullCopy,(await page.locator('#event-output .event-line').allTextContents()).join('\n'));assert.doesNotMatch(fullCopy,/PRIVATE/);
   eventError=true;await page.evaluate(()=>window.__statusPoll());await waitText('terminal-live','SEM ATUALIZAÇÃO');
   await page.locator('#event-search').fill('scheduler_error');await waitText('terminal-live','SEM ATUALIZAÇÃO');await waitText('event-status','desatualizada');
   eventError=false;await page.locator('#event-search').fill('');await page.locator('#event-autoscroll').check();await page.evaluate(()=>window.__statusPoll());await waitText('terminal-live','AO VIVO');
@@ -149,8 +177,10 @@ try{
   todayDelay=500;await page.evaluate(()=>window.__reportPoll());await nav('Abrir navegação');await nav('Sair');await page.waitForTimeout(650);
   assert.equal(await page.locator('#today-calls').textContent(),'—');assert.equal(await page.locator('#countdown').textContent(),'—');
   todayDelay=0;await page.locator('#login-form input[name=username]').fill('fixture');await page.locator('#login-form input[name=password]').fill('fixture');await nav('Entrar');await waitText('today-calls','2');
+  eventDelay=600;await page.evaluate(()=>window.__statusPoll());
   session=false;await page.evaluate(()=>window.__reportPoll());await page.locator('#login').waitFor({state:'visible'});assert.equal(await page.locator('#today-calls').textContent(),'—');assert(await page.locator('#terminal').isHidden());
+  await page.waitForTimeout(700);assert.equal(await page.locator('#event-output .event-line').count(),0,'late events cannot repopulate an expired session');
   assert.deepEqual(errors,[]);assert(writes.filter(w=>w.path!=='/api/login').every(w=>w.csrf==='fixture-csrf'));
   assert(!writes.some(w=>w.path==='/api/reports'));
-  console.log('PASS browser: premium two cards, daily increment/error/midnight, real countdown states, no requests per tick, accordion keyboard/cache, independent feeds; desktop/mobile, graph, exact metric sources, 200-event bound/filter/pause/copy, pagination/full CSV, all original actions/CSRF/stop dialog, errors/empty states, logout race; no real services.');
+  console.log('PASS browser: premium two cards, daily increment/error/midnight, real countdown states, no requests per tick, accordion keyboard/cache, independent feeds; desktop/mobile, graph, exact metric sources, full 200-event buffer/details/2-second polling/coalescing/filter/pause/copy/scroll anchoring, pagination/full CSV, all original actions/CSRF/stop dialog, errors/empty states, logout race; no real services.');
 }finally{clearTimeout(watchdog);await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}

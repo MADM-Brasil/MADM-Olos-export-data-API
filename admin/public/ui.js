@@ -26,7 +26,7 @@ export function reportCsv(rows) {
   }))].map(row => row.map(cell).join(';')).join('\r\n');
 }
 const events = new Set(['admin_listening','scheduler_started','scheduler_interval_changed','scheduler_paused','scheduler_resumed','scheduler_next_run','scheduler_error','poll_retry','batch_completed','recovery_required','reference_cache_refreshed','local_recovery_completed','olos_tls_verification_disabled','corporate_delivery_confirmed','corporate_delivery_deferred']);
-const numericFields = new Set(['received','inserted','updated','duplicates','duration_ms','request_ms','persistence_ms','interval_ms','retry_ms','port','queued','confirmed']);
+const numericFields = new Set(['received','inserted','updated','duplicates','duration_ms','request_ms','persistence_ms','interval_ms','retry_ms','port','queued','skipped','confirmed']);
 export function safeEvents(input) {
   if (!Array.isArray(input)) return [];
   return input.slice(-200).filter(e => e && events.has(e.event)).map(e => {
@@ -36,6 +36,7 @@ export function safeEvents(input) {
       if (['enabled','blocked'].includes(key) && typeof value === 'boolean') safe[key] = value;
       if (key === 'error' && typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,95}$/.test(value)) safe[key] = value;
       if (key === 'read_id' && typeof value === 'string' && /^[0-9a-f-]{36}$/i.test(value)) safe[key] = value;
+      if (key === 'next_run_at' && typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) safe[key] = value;
     }
     return safe;
   });
@@ -46,8 +47,21 @@ export function eventLevel(event) {
   return 'INFO';
 }
 export function eventLines(entries, search = '', level = 'ALL') {
-  return entries.filter(e => e.event.toLowerCase().includes(search.toLowerCase()) && (level === 'ALL' || eventLevel(e) === level))
-    .map(e => `[${date(e.time)} Brasília] ${eventLevel(e)} ${e.event} ${Object.entries(e).filter(([k]) => !['event','time'].includes(k)).map(([k,v]) => `${k}=${v}`).join(' ')}`);
+  return terminalRows(entries,search,level).map(row=>row.line);
+}
+// Display, search and copy share the same sanitized fields and chronological order.
+export function terminalRows(entries, search = '', level = 'ALL') {
+  const occurrences=new Map();
+  return entries.map((e,index)=>{
+    const identity=JSON.stringify(e),occurrence=occurrences.get(identity)||0;
+    occurrences.set(identity,occurrence+1);
+    const time=`${date(e.time)} Brasília`,severity=eventLevel(e);
+    const detail=Object.entries(e).filter(([k])=>!['event','time'].includes(k))
+      .map(([k,v])=>`${k}=${k==='next_run_at'?date(v)+' Brasília':v}`).join(' ');
+    return {key:`${identity}/${occurrence}`,index,time,severity,event:e.event,detail,
+      timestamp:Date.parse(e.time)||0,line:`${time} | ${severity} | ${e.event} | ${detail}`};
+  }).filter(row=>row.line.toLowerCase().includes(search.toLowerCase())&&(level==='ALL'||row.severity===level))
+    .sort((a,b)=>a.timestamp-b.timestamp||a.index-b.index);
 }
 function svgNode(tag, attrs = {}, text = '') {
   const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
@@ -97,21 +111,28 @@ export function renderDashboardMetrics(element, r) {
   element('chart-period').textContent=`${dayLabel(r.from)} — ${dayLabel(r.to)} · Brasília`;
 }
 
-export function renderTerminal(root, entries, search, level, showAll = false) {
-  const open=new Set([...root.querySelectorAll('details[open]')].map(node=>node.dataset.eventKey));
-  const filtered=entries.map((entry,index)=>({entry,index})).filter(({entry:e})=>e.event.toLowerCase().includes(search.toLowerCase())&&(level==='ALL'||eventLevel(e)===level));
-  filtered.sort((a,b)=>(Date.parse(a.entry.time)||0)-(Date.parse(b.entry.time)||0)||a.index-b.index);
-  const visible=showAll?filtered:filtered.slice(-12);
+export function renderTerminal(root, entries, search, level, autoscroll = true) {
+  const scroll=root.scrollTop,follow=autoscroll&&root.scrollHeight-root.clientHeight-scroll<=24;
+  const top=root.getBoundingClientRect().top;
+  const anchor=[...root.children].find(node=>node.getBoundingClientRect().bottom>top);
+  const anchorKey=anchor?.getAttribute('data-event-key'),offset=anchor?.getBoundingClientRect().top-top;
+  const visible=terminalRows(entries,search,level);
   root.replaceChildren();
   if(!visible.length)root.textContent='Nenhum evento corresponde aos filtros.';
-  for(const {entry:e,index} of visible){
-    const row=document.createElement('details'),summary=document.createElement('summary'),time=document.createElement('span'),badge=document.createElement('span'),name=document.createElement('span'),detail=document.createElement('div');
-    row.className='event-line';row.dataset.eventKey=`${e.time}/${e.event}/${index}`;row.open=open.has(row.dataset.eventKey);
-    time.className='event-time';time.textContent=e.time?new Date(e.time).toLocaleTimeString('pt-BR',{timeZone:zone}):'—';
-    badge.className='event-level';badge.dataset.level=eventLevel(e);badge.textContent=eventLevel(e);
-    name.className='event-name';name.textContent=e.event;
-    detail.className='event-detail';detail.textContent=eventLines([e])[0];
-    summary.append(time,badge,name);row.append(summary,detail);root.append(row);
+  for(const item of visible){
+    const row=document.createElement('div');row.className='event-line';row.dataset.eventKey=item.key;
+    for(const [index,[css,text]] of [['event-time',item.time],['event-level',item.severity],['event-name',item.event],['event-detail',item.detail]].entries()){
+      if(index)row.append(document.createTextNode(' | '));
+      const span=document.createElement('span');span.className=css;span.textContent=text;
+      if(css==='event-level')span.dataset.level=item.severity;
+      row.append(span);
+    }
+    root.append(row);
   }
-  return {visible:visible.length,total:filtered.length};
+  if(follow)root.scrollTop=root.scrollHeight;
+  else {
+    const retained=[...root.children].find(node=>node.getAttribute('data-event-key')===anchorKey);
+    root.scrollTop=retained?root.scrollTop+retained.getBoundingClientRect().top-top-offset:scroll;
+  }
+  return {visible:visible.length,total:entries.length};
 }
