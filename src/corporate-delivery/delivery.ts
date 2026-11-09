@@ -6,6 +6,7 @@ import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
 import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
 import { corporateSchema, freeze, matches, uniqueIdentities } from './contract.js';
+import { eligibleOperator } from './operator-eligibility.js';
 import { reconcileLegacy } from './reconcile.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 
@@ -126,10 +127,10 @@ export class CorporateDelivery {
     finally { this.active = undefined; }
   }
 
-  async enqueue(local: PoolClient, sequence: string, input: MappedRecord[]): Promise<{ queued: number; duplicates: number }> {
+  async enqueue(local: PoolClient, sequence: string, input: MappedRecord[]): Promise<{ queued: number; skipped: number; duplicates: number }> {
     const state = await this.state(local);
     const shape = new Map(state.destination_shape) as Shape;
-    let queued = 0, duplicates = 0;
+    let queued = 0, skipped = 0, duplicates = 0;
     for (const record of input) {
       const previous = (await local.query(`SELECT r.source_hash,r.target_table,r.target_id::text,o.payload_hash
         FROM olos_http.records r LEFT JOIN olos_http.corporate_outbox o USING(source_key,source_id)
@@ -141,13 +142,18 @@ export class CorporateDelivery {
       }
       const id = integerValue((await local.query('SELECT nextval($1::regclass)::text AS id', [sequence])).rows[0].id, 32);
       const payload = (await freeze(local, [{ ...record, internal_id_olos: id }], shape, this.cfg))[0]!;
+      const deliveryState = eligibleOperator(
+        record.agent_id,
+        payload.nome_agente
+      ) ? 'pending' : 'skipped';
       await local.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,campaign_id,disposition_id)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [this.source, record.source_id, this.target, id, record.source_hash, record.agent_id, record.campaign_id, record.disposition_id]);
-      await local.query(`INSERT INTO olos_http.corporate_outbox(source_key,source_id,target_id,source_hash,payload,payload_hash,origin)
-        VALUES($1,$2,$3,$4,$5,$6,'capture')`, [this.source, record.source_id, id, record.source_hash, JSON.stringify(payload), digest(payload)]);
-      queued++;
+      await local.query(`INSERT INTO olos_http.corporate_outbox(source_key,source_id,target_id,source_hash,payload,payload_hash,origin,state)
+        VALUES($1,$2,$3,$4,$5,$6,'capture',$7)`, [this.source, record.source_id, id, record.source_hash, JSON.stringify(payload), digest(payload), deliveryState]);
+      if (deliveryState === 'pending') queued++;
+      else skipped++;
     }
-    return { queued, duplicates };
+    return { queued, skipped, duplicates };
   }
 
   // One bounded attempt per existing scheduler cycle/manual command. No timer, retry loop or scheduler here.

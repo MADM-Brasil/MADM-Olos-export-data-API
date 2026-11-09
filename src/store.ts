@@ -137,8 +137,8 @@ export class Store {
     await this.db().query("UPDATE olos_http.reads SET state='resolved',finished_at=clock_timestamp(),error_code=$2,resolution='HTTP explicit rejection; no successful response' WHERE id=$1 AND source_key=$3 AND state='reading'", [id, code, this.cfg.sourceKey]);
   }
   async drain(cache: Cache) {
-    const total: { received: number; inserted: number; updated: number; duplicates: number; queued?: number } =
-      { received: 0, inserted: 0, updated: 0, duplicates: 0, ...(this.delivery ? { queued: 0 } : {}) };
+    const total: { received: number; inserted: number; updated: number; duplicates: number; queued?: number; skipped?: number } =
+      { received: 0, inserted: 0, updated: 0, duplicates: 0, ...(this.delivery ? { queued: 0, skipped: 0 } : {}) };
     for (const read of await this.unresolved()) {
       if (read.state !== 'received') continue;
       const data = rows(read.response_body!);
@@ -168,6 +168,7 @@ export class Store {
         );
         total.inserted += result.inserted; total.updated += result.updated; total.duplicates += result.duplicates;
         if ('queued' in result && result.queued !== undefined) total.queued = (total.queued ?? 0) + result.queued;
+        if ('skipped' in result && result.skipped !== undefined) total.skipped = (total.skipped ?? 0) + result.skipped;
       }
       await this.db().query("UPDATE olos_http.reads SET state='done',finished_at=clock_timestamp(),received_count=$2 WHERE id=$1 AND source_key=$3 AND processed_count=$2", [read.id, data.length, this.cfg.sourceKey]);
     }
@@ -189,7 +190,7 @@ export class Store {
         await db.query('UPDATE olos_http.reads SET processed_count=$2,received_count=$3 WHERE id=$1', [readId, processed, received]);
         await db.query('COMMIT');
         // Queued locally is not a corporate INSERT or acknowledgement.
-        return { inserted: 0, updated: 0, queued: result.queued, duplicates: input.length - result.queued };
+        return { inserted: 0, updated: 0, queued: result.queued, skipped: result.skipped, duplicates: input.length - result.queued - result.skipped };
       } catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
     }
 

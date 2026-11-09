@@ -5,7 +5,7 @@ const allowedEvents = new Set(['admin_listening', 'scheduler_started', 'schedule
   'batch_completed', 'recovery_required', 'reference_cache_refreshed', 'local_recovery_completed',
   'olos_tls_verification_disabled', 'corporate_delivery_confirmed', 'corporate_delivery_deferred']);
 const numericFields = new Set(['received', 'inserted', 'updated', 'duplicates', 'duration_ms',
-  'request_ms', 'persistence_ms', 'interval_ms', 'retry_ms', 'port', 'queued', 'confirmed']);
+  'request_ms', 'persistence_ms', 'interval_ms', 'retry_ms', 'port', 'queued', 'skipped', 'confirmed']);
 
 // Bounded display of this process's real events; durable read/audit history remains in PostgreSQL.
 export class OperationalEvents {
