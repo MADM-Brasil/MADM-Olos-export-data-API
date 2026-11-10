@@ -13,6 +13,7 @@ let reportHold=null,releaseReport=null,reportHoldFrom=null,todayHold=null,releas
 let statusDelay=0,eventDelay=0,eventOffset=0,eventsActive=0,maxEventsActive=0;
 const eventTimes=[];
 let session=false,state='RUNNING',interval=120000,eventPolls=0,reportError=false,statusError=false,eventError=false,empty=false,reportDelay=0;
+let todayAutomatic=null;
 let baseServer=Date.now(),baseReal=Date.now(),todayError=false,todayDelay=0,todayCalls='1280',activeCycle=false;
 const serverNow=()=>baseServer+Date.now()-baseReal;
 const setServerTime=ms=>{baseServer=ms;baseReal=Date.now();};
@@ -40,7 +41,7 @@ const server=createServer(async(req,res)=>{
     if(statusError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}
     json({state,desired_state:state,interval_ms:interval,cycle_in_progress:activeCycle,next_run_at:nextAt,server_time:new Date(serverNow()).toISOString(),authentication:{status:'ACCEPTED'},database:{reachable:true,schema_valid:true},ingestion:{status:'CONFIRMED',pending:[],latest:{started_at:'2026-11-04T15:00:00Z',state:'done'},last_completed:{finished_at:'2026-11-04T15:01:00Z',received_count:8,inserted:5,duplicates:3,duration_ms:240}},corporate_delivery:{ready:true,paused:true,blocked:false}});return;
   }
-  if(path==='/api/today'){if(todayHold)await todayHold;if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence'});return;}
+  if(path==='/api/today'||path==='/api/today/refresh'){if(path.endsWith('/refresh')&&(req.method!=='POST'||req.headers['x-csrf-token']!=='fixture-csrf')){json({error:'CSRF_FORBIDDEN'},403);return;}if(todayHold)await todayHold;if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence',...(path==='/api/today'&&todayAutomatic?todayAutomatic:{})});return;}
   if(path==='/api/reports'){if(reportHold&&new URL(req.url,'http://localhost').searchParams.get('from')===(reportHoldFrom||daily.at(-14).day))await reportHold;if(reportDelay)await new Promise(r=>setTimeout(r,reportDelay));if(reportError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else {const r=report(),q=new URL(req.url,'http://localhost').searchParams;r.from=q.get('from')||r.from;r.to=q.get('to')||r.to;r.daily=r.daily.filter(d=>d.day>=r.from&&d.day<=r.to);
     r.period={operators:r.daily.length?'12':'0'};
     for(const key of ['calls','identified_calls','with_cpf','with_email','confirmed','pending','not_queued','inconsistent'])r.period[key]=r.daily.reduce((n,d)=>n+BigInt(d[key]),0n).toString();
@@ -87,6 +88,51 @@ try{
   assert.equal(await page.locator('#dashboard-terminal #terminal').count(),1);
   assert(await page.evaluate(()=>{const cards=document.querySelector('#metrics'),terminal=document.querySelector('#dashboard-terminal'),chart=document.querySelector('#chart-panel');return !!(cards.compareDocumentPosition(terminal)&Node.DOCUMENT_POSITION_FOLLOWING)&&!!(terminal.compareDocumentPosition(chart)&Node.DOCUMENT_POSITION_FOLLOWING);}));
   assert.equal(writes.length,1);
+  // Daily manual refresh reuses the existing GET, state and in-flight guard.
+  const refreshToday=page.getByRole('button',{name:'Atualizar coleta do dia',exact:true});
+  const iconStyle=selector=>page.locator(selector).evaluate(e=>{const s=getComputedStyle(e);return [s.width,s.height,s.backgroundColor,s.borderRadius,s.color];});
+  assert.deepEqual(await iconStyle('#refresh-today'),await iconStyle('#countdown-card .metric-icon'));
+  assert.equal(await refreshToday.locator('use').getAttribute('href'),'#icon-refresh');
+  assert.equal(await page.locator('#today-card use[href="#icon-arrow"]').count(),0);
+  const beforeManual=await page.locator('#today-updated').textContent(),manualClock=serverNow();
+  const todayRequests=()=>requests.filter(r=>r.path.startsWith('/api/today')).length;
+  const beforeRequests=todayRequests();todayCalls='1287';setServerTime(manualClock+60000);
+  todayHold=new Promise(resolve=>{releaseToday=resolve;});
+  await refreshToday.click();await page.waitForFunction(()=>document.getElementById('refresh-today').getAttribute('aria-busy')==='true');
+  assert(await refreshToday.isDisabled());assert.equal(await page.locator('#today-calls').textContent(),'1.280');
+  assert.equal(await refreshToday.locator('svg').evaluate(e=>getComputedStyle(e).animationName),'today-refresh-spin');
+  await page.evaluate(()=>{document.getElementById('refresh-today').click();window.__reportPoll();});
+  assert.equal(todayRequests(),beforeRequests+1,'manual/automatic refresh coalesce into the same request');
+  assert.deepEqual(requests.filter(r=>r.path==='/api/today/refresh').at(-1),{method:'POST',path:'/api/today/refresh'});
+  await mkdir(evidenceDir,{recursive:true});await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-loading.png'});
+  await page.emulateMedia({reducedMotion:'reduce'});
+  assert.equal(await refreshToday.locator('svg').evaluate(e=>getComputedStyle(e).animationName),'none');
+  releaseToday();todayHold=null;await waitText('today-calls','1.287');
+  assert(!(await refreshToday.isDisabled()));assert.equal(await refreshToday.getAttribute('aria-busy'),'false');
+  assert.notEqual(await page.locator('#today-updated').textContent(),beforeManual);
+  assert.match(await page.locator('#today-updated').textContent(),/atualização a cada 5 min/);
+  await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-success.png'});
+  // An automatic poll may carry an older published snapshot after a live count.
+  const manualFooter=await page.locator('#today-updated').textContent();
+  todayAutomatic={calls:'1200',observed_at:new Date(manualClock-60000).toISOString()};
+  const staleResponse=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/today');
+  await page.evaluate(()=>window.__reportPoll());await staleResponse;
+  await page.waitForFunction(()=>document.getElementById('refresh-today').getAttribute('aria-busy')==='false');
+  assert.equal(await page.locator('#today-calls').textContent(),'1.287');assert.equal(await page.locator('#today-updated').textContent(),manualFooter);todayAutomatic=null;
+  todayError=true;await refreshToday.focus();
+  assert(await refreshToday.evaluate(e=>parseFloat(getComputedStyle(e).outlineWidth)>=2));
+  await page.keyboard.press('Enter');await waitText('today-updated','falha ao atualizar');
+  assert.equal(await page.locator('#today-calls').textContent(),'1.287');assert(!(await refreshToday.isDisabled()));
+  await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-error.png'});
+  await page.setViewportSize({width:390,height:844});
+  assert.deepEqual(await iconStyle('#refresh-today'),await iconStyle('#countdown-card .metric-icon'));
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-mobile-error.png'});
+  await page.setViewportSize({width:1600,height:1365});
+  todayError=false;todayCalls='1280';
+  await refreshToday.focus();await page.keyboard.press('Space');await waitText('today-calls','1.280');
+  assert.doesNotMatch(await page.locator('#today-updated').textContent(),/falha ao atualizar/);
+  await page.emulateMedia({reducedMotion:'no-preference'});
   assert.equal(await page.locator('#event-output .event-new').count(),0,'initial history must not animate');
   await page.evaluate(()=>{window.__firstTerminalRow=document.querySelector('#event-output .event-line');});
   await page.locator('#event-search').dispatchEvent('input');
@@ -274,7 +320,7 @@ try{
   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.setViewportSize({width:1440,height:1100});
 
   await nav('Próxima');await waitText('report-page','Página 2');await nav('Próxima');assert.equal(await page.locator('#report-rows tr').count(),6);
-  const download=page.waitForEvent('download');await nav('Exportar CSV');const file=await download;assert.match(file.suggestedFilename(),/^olos-chamadas-/);const csv=await readFile(await file.path(),'utf8');assert.equal(csv.split('\r\n').length,31);assert.doesNotMatch(csv,/PRIVATE/);assert.equal(writes.length,1);
+  const download=page.waitForEvent('download');await nav('Exportar CSV');const file=await download;assert.match(file.suggestedFilename(),/^olos-chamadas-/);const csv=await readFile(await file.path(),'utf8');assert.equal(csv.split('\r\n').length,31);assert.doesNotMatch(csv,/PRIVATE/);assert.equal(writes.filter(w=>w.path!=='/api/today/refresh').length,1);
   await page.locator('#report-from').fill(range.to);await page.locator('#report-to').fill(range.to);await nav('Atualizar');await waitText('report-page','1 dias');assert.equal(await page.locator('#report-rows tr').count(),1);
   await page.locator('#report-from').fill(range.from);await nav('Atualizar');await waitText('report-page','Página 1 de 5');
   await page.emulateMedia({reducedMotion:'reduce'});assert.equal(await page.locator('#chart-body').evaluate(e=>getComputedStyle(e).transitionDuration),'0s');await page.emulateMedia({reducedMotion:'no-preference'});
@@ -292,7 +338,7 @@ try{
   reportDelay=500;await nav('Atualizar');await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});await page.waitForTimeout(600);assert.equal(await page.locator('#report-rows tr').count(),0);assert(await page.locator('#terminal').isHidden());
   reportDelay=0;reportError=true;todayError=true;await page.locator('#login-form input[name=username]').fill('fixture');await page.locator('#login-form input[name=password]').fill('fixture');await nav('Entrar');
   await waitText('today-updated','indisponível');assert.equal(await page.locator('#today-calls').textContent(),'—');assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'false');await page.locator('#chart-toggle').click();await waitText('chart-status','Série indisponível');assert.equal(await page.locator('#chart-total').textContent(),'—');todayError=false;await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','1.291');assert.match(await page.locator('#chart-status').textContent(),/Série indisponível/);
-  await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});reportError=false;empty=true;todayError=false;
+  await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});reportError=false;empty=true;todayError=false;setServerTime(Date.parse('2026-11-02T02:59:50Z'));todayCalls='25';
   await page.locator('#login-form input[name=username]').fill('fixture');await page.locator('#login-form input[name=password]').fill('fixture');await nav('Entrar');await page.locator('#chart-toggle').click();await waitText('calls-chart','Nenhuma chamada');
   // Calendar rollover is driven by the synchronized Brasília day, not the browser timezone.
   setServerTime(Date.parse('2026-11-02T02:59:50Z'));todayCalls='25';await page.evaluate(()=>window.__statusPoll());await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','25');

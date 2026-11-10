@@ -29,7 +29,7 @@ export function adminServer(options: {
   origin: string; publicDir: string; auth: AdminAuth;
   credentials: Pick<CredentialService, 'view' | 'save' | 'test'>;
   scheduler: Pick<DynamicScheduler, 'request' | 'status'>;
-  repository: Pick<AdminRepository, 'logs' | 'auditLog' | 'observation'> & Partial<Pick<AdminRepository, 'reports' | 'today'>>;
+  repository: Pick<AdminRepository, 'logs' | 'auditLog' | 'observation'> & Partial<Pick<AdminRepository, 'reports' | 'today' | 'refreshToday'>>;
   events?: () => readonly import('../errors.js').LogEntry[];
 }) {
   const origin = new URL(options.origin);
@@ -69,6 +69,11 @@ export function adminServer(options: {
         if (!options.repository.today) throw new WorkerError('REPORT_UNAVAILABLE');
         send(res, 200, { ...await options.repository.today(), server_time: new Date().toISOString() }); return;
       }
+      if (path === '/api/today/refresh' && req.method === 'POST') {
+        await body(req);
+        if (!options.repository.refreshToday) throw new WorkerError('REPORT_TODAY_UNAVAILABLE');
+        send(res, 200, { ...await options.repository.refreshToday(), server_time: new Date().toISOString() }); return;
+      }
       if (path === '/api/reports' && req.method === 'GET') {
         if (!options.repository.reports) throw new WorkerError('REPORT_UNAVAILABLE');
         const query = new URL(req.url!, options.origin).searchParams;
@@ -95,7 +100,8 @@ export function adminServer(options: {
       send(res, 404, { error: 'NOT_FOUND' });
     } catch (error) {
       const code = errorCode(error);
-      const status = ['LOGIN_FAILED','AUTHENTICATION_REQUIRED'].includes(code) ? 401 : code.endsWith('FORBIDDEN') ? 403 : code === 'LOGIN_RATE_LIMITED' ? 429 : code.endsWith('CONFLICT') ? 409 : (code.startsWith('REPORT_')&&code!=='REPORT_PERIOD_INVALID') ? 503 : error instanceof WorkerError ? 400 : 503;
+      const status = ['LOGIN_FAILED','AUTHENTICATION_REQUIRED'].includes(code) ? 401 : code.endsWith('FORBIDDEN') ? 403 : ['LOGIN_RATE_LIMITED','REPORT_TODAY_RATE_LIMITED','REPORT_TODAY_BUSY'].includes(code) ? 429 : code.endsWith('CONFLICT') ? 409 : (code.startsWith('REPORT_')&&code!=='REPORT_PERIOD_INVALID') ? 503 : error instanceof WorkerError ? 400 : 503;
+      if(code.startsWith('REPORT_TODAY_'))res.setHeader('Retry-After','60');
       if (status === 503 && ['/api/reports','/api/today'].includes(req.url?.split('?')[0] ?? '')) res.setHeader('Retry-After', String(['REPORT_INITIALIZING','REPORT_SNAPSHOT_STALE'].includes(code)?30:reportCacheSeconds));
       if (!res.headersSent) send(res, status, { error: code, ...(code==='REPORT_INITIALIZING'?{snapshot_state:'INITIALIZING'}:{}) }); else res.end();
     }

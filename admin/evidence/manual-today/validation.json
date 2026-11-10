@@ -1,0 +1,21 @@
+{
+  "synthetic": true,
+  "unit_passed": 124,
+  "ui_passed": 18,
+  "database_passed": 5,
+  "smoke_runner": {
+    "passed": 4,
+    "skipped": 1,
+    "reason": "volume opt-in; full volume run passed separately"
+  },
+  "browser": "passed desktop/mobile, live POST and old automatic snapshot rejection",
+  "build": "passed",
+  "admin_build": "passed",
+  "admin_types": "passed",
+  "migrations_executed": false,
+  "production_access": false,
+  "global_types": {
+    "preexisting": 17,
+    "new": 0
+  }
+}

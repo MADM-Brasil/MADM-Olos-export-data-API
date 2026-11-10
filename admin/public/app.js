@@ -1,5 +1,5 @@
 import {date,count,dayLabel,defaultRange,reportFields,reportCsv,safeEvents,eventLines,renderDashboardChart,renderDashboardMetrics,renderTerminal,chartRange,chartModel,chartCompact,chartPercent,reportWindow,reportQuickRange,reportModel} from './ui.js';
-import {ServerClock,brasiliaDay,statusLabels,renderToday,renderCountdown} from './dashboard.js';
+import {ServerClock,brasiliaDay,statusLabels,renderToday,renderCountdown,newerTodayObservation} from './dashboard.js';
 /** @returns {any} */
 const $=id=>document.getElementById(id);
 let csrf='',revision=0,logged=false,refreshing=false,currentPage='dashboard';
@@ -16,7 +16,7 @@ let sessionEpoch=0;
 const clock=new ServerClock();
 let schedulerSnapshot=null,statusAt=0,statusFailed=false,todaySnapshot=null,todayFailed=false,todayFlight=null;
 let activeDay=brasiliaDay(clock.now()),chartOpen=false;
-function resetOperational(){$('state').textContent='Carregando';$('state').dataset.state='UNKNOWN';$('state').classList.remove('error');$('corporate-state').textContent='—';$('corporate-detail').textContent='Aguardando estado do controle local.';$('corporate-observed').textContent='Controle não observado.';schedulerSnapshot=null;statusAt=0;statusFailed=false;todaySnapshot=null;todayFailed=false;todayFlight=null;clock.anchor=null;activeDay=brasiliaDay(clock.now());renderToday($,null,clock.now());renderClock();}
+function resetOperational(){$('state').textContent='Carregando';$('state').dataset.state='UNKNOWN';$('state').classList.remove('error');$('corporate-state').textContent='—';$('corporate-detail').textContent='Aguardando estado do controle local.';$('corporate-observed').textContent='Controle não observado.';schedulerSnapshot=null;statusAt=0;statusFailed=false;todaySnapshot=null;todayFailed=false;todayFlight=null;syncTodayRefresh();clock.anchor=null;activeDay=brasiliaDay(clock.now());renderToday($,null,clock.now());renderClock();}
 function renderClock(){
   const stale=statusFailed||!!schedulerSnapshot&&performance.now()-statusAt>10000;
   renderCountdown($,schedulerSnapshot,clock.now(),stale);
@@ -34,14 +34,20 @@ function tick(){
   const day=brasiliaDay(clock.now());
   if(activeDay!==day){activeDay=day;void refreshToday();if(currentPage==='reports'&&reportPreset!=='custom')setReportPreset(reportPreset);}
 }
-async function refreshToday(){
+function syncTodayRefresh(){
+  const button=$('refresh-today'),busy=!!todayFlight;
+  button.disabled=busy;button.setAttribute('aria-busy',String(busy));
+  button.title=busy?'Atualizando coleta do dia…':todayFailed?'Não foi possível atualizar. Tente novamente.':'Atualizar coleta do dia';
+}
+$('refresh-today').addEventListener('click',()=>void refreshToday(true));
+async function refreshToday(manual=false){
   if(!logged||todayFlight)return;
-  const flight={epoch:sessionEpoch,day:brasiliaDay(clock.now())};todayFlight=flight;
-  try{const r=await api('/today');if(!logged||flight.epoch!==sessionEpoch)return;
+  const flight={epoch:sessionEpoch,day:brasiliaDay(clock.now())};todayFlight=flight;syncTodayRefresh();
+  try{const r=await (manual?api('/today/refresh','POST',{}):api('/today'));if(!logged||flight.epoch!==sessionEpoch)return;
     if(typeof r?.calls!=='string'||!/^\d+$/.test(r.calls)||!/^\d{4}-\d{2}-\d{2}$/.test(r.date)||!Number.isFinite(Date.parse(r.observed_at)))throw new Error('TODAY_INVALID');
-    clock.sync(r.server_time);todaySnapshot=r;todayFailed=false;
+    clock.sync(r.server_time);if(newerTodayObservation(todaySnapshot,r)){todaySnapshot=r;todayFailed=false;}
   }catch{if(logged&&flight.epoch===sessionEpoch)todayFailed=true;}
-  finally{if(todayFlight===flight)todayFlight=null;}
+  finally{if(todayFlight===flight){todayFlight=null;syncTodayRefresh();}}
   if(!logged||flight.epoch!==sessionEpoch)return;
   renderToday($,todaySnapshot,clock.now(),todayFailed);
   if(flight.day!==brasiliaDay(clock.now())&&todaySnapshot?.date!==brasiliaDay(clock.now()))void refreshToday();

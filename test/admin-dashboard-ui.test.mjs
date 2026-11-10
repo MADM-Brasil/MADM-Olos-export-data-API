@@ -1,8 +1,15 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {ServerClock,countdownView,todayView,brasiliaDay} from '../admin/public/dashboard.js';
+import {ServerClock,countdownView,todayView,brasiliaDay,newerTodayObservation} from '../admin/public/dashboard.js';
 const now=Date.parse('2026-11-01T12:00:00Z');
 const active={state:'RUNNING',cycle_in_progress:false,next_run_at:new Date(now+102000).toISOString()};
+test('old automatic snapshots cannot overwrite a newer manual observation, even with a larger count',()=>{
+  const manual={date:'2026-11-01',observed_at:'2026-11-01T12:00:00Z',calls:'20'};
+  assert.equal(newerTodayObservation(manual,{...manual,observed_at:'2026-11-01T11:59:00Z',calls:'999'}),false);
+  assert.equal(newerTodayObservation(manual,{...manual}),false);
+  assert.equal(newerTodayObservation(manual,{...manual,observed_at:'2026-11-01T12:01:00Z',calls:'19'}),true);
+  assert.equal(newerTodayObservation(manual,{...manual,date:'2026-11-02',observed_at:'2026-11-02T03:00:00Z'}),true);
+});
 test('countdown uses actual due timestamp, no assumed interval, hours and expired deadlines',()=>{
   assert.equal(countdownView(active,now).value,'01:42');
   assert.equal(countdownView(active,now+1000).value,'01:41');
@@ -30,6 +37,8 @@ test('daily value is exact, stale on failure/age, and never carries yesterday in
   assert.equal(todayView(snapshot,now).value,'9.007.199.254.740.993');
   assert.equal(todayView({...snapshot,calls:'0'},now).value,'0');
   assert.equal(todayView(snapshot,now,true).state,'stale');
+  assert.match(todayView(snapshot,now,true).detail,/falha ao atualizar.*atualização a cada 5 min/);
+  assert.match(todayView(snapshot,now).detail,/Observado em.*atualização a cada 5 min/);
   assert.equal(todayView(snapshot,now+300001).state,'stale');
   assert.equal(todayView(null,now,true).state,'unavailable');
   assert.equal(todayView({...snapshot,calls:null},now).value,'—');

@@ -35,6 +35,10 @@ export function countdownView(status, now, stale = false) {
   return {value:`${String(Math.floor(remaining/60)).padStart(2,'0')}:${String(remaining%60).padStart(2,'0')}`,detail:`Programada para ${date(status.next_run_at)} · Brasília`,state:'scheduled'};
 }
 
+export function newerTodayObservation(current,incoming) {
+  if(!current)return true;
+  return incoming.date>current.date||(incoming.date===current.date&&Date.parse(incoming.observed_at)>Date.parse(current.observed_at));
+}
 export function todayView(snapshot, now, failed = false) {
   const day=brasiliaDay(now);
   if(!snapshot)return {value:'—',detail:failed?'Contagem indisponível. Aguardando nova observação.':'Buscando primeira observação…',state:failed?'unavailable':'loading'};
@@ -43,7 +47,7 @@ export function todayView(snapshot, now, failed = false) {
   const valid=typeof snapshot.calls==='string'&&/^\d+$/.test(snapshot.calls)&&Number.isFinite(observed);
   if(!valid)return {value:'—',detail:'Contagem indisponível. Nenhum valor foi estimado.',state:'unavailable'};
   const stale=failed||age>(snapshot.cache_seconds??300)*1000||age< -5000;
-  return {value:count(snapshot.calls),detail:`${stale?'Desatualizado · última leitura válida':'Observado em'} ${date(snapshot.observed_at)}${stale?'':' · atualização a cada 5 min'}`,state:stale?'stale':'fresh'};
+  return {value:count(snapshot.calls),detail:`${stale?`Desatualizado · ${failed?'falha ao atualizar · ':''}última leitura válida`:'Observado em'} ${date(snapshot.observed_at)} · atualização a cada 5 min`,state:stale?'stale':'fresh'};
 }
 
 export function renderToday(element, snapshot, now, failed = false) {

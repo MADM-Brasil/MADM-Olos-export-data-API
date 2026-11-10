@@ -8,6 +8,13 @@ export { reportWhitespace, reportPlaceholder, reportCacheSeconds, reportZone } f
 export const reportStatementTimeoutMs = 5_000;
 export const reportReadCacheMs = 1_000;
 export const reportReadWallTimeoutMs = 5_000;
+export const todayRefreshIntervalMs = 60_000;
+export const todayStatementTimeoutMs = 1_000;
+export const todayWallTimeoutMs = 2_000;
+export interface TodayObservation {
+  date:string;calls:string;observed_at:string;timezone:string;cache_seconds:number;
+  time_basis:string;identity:string;observation_source:'local_records';
+}
 export function reportRange(from:unknown,to:unknown) {
   const parse=(value:unknown)=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)?DateTime.fromISO(value,{zone:reportZone}):DateTime.invalid('date');
   const start=parse(from),end=parse(to);
@@ -25,6 +32,8 @@ export class AdminReports {
   private cached:Published|undefined;
   private pending:Promise<Published>|undefined;
   private failure:{at:number;error:unknown}|undefined;
+  private todayPending:Promise<TodayObservation>|undefined;
+  private todayNext=Number.NEGATIVE_INFINITY;
   constructor(private readonly pool:Pool,private readonly source:string,
     private readonly destination:{schema:string;table:string},private readonly now:()=>number=()=>performance.now()) {}
   async read(from:unknown,to:unknown):Promise<unknown> {
@@ -40,6 +49,53 @@ export class AdminReports {
     if(s.data.collection_date!==this.databaseDay(s))throw new WorkerError('REPORT_SNAPSHOT_STALE');
     return {date:s.data.collection_date,calls:s.data.today_calls,observed_at:s.data.observed_at,timezone:reportZone,
       cache_seconds:reportCacheSeconds,time_basis:'first_local_persistence',identity:'source_key/source_id',...this.metadata(s)};
+  }
+  refreshToday():Promise<TodayObservation> {
+    if(this.todayPending)return this.todayPending;
+    if(this.now()<this.todayNext)return Promise.reject(new WorkerError('REPORT_TODAY_RATE_LIMITED'));
+    // All sessions of the single source-owning Admin share this admission gate,
+    // including failures. The transaction lock also excludes other processes.
+    this.todayNext=this.now()+todayRefreshIntervalMs;
+    this.todayPending=this.countToday().finally(()=>{this.todayPending=undefined;});
+    return this.todayPending;
+  }
+  private async countToday():Promise<TodayObservation> {
+    let db:PoolClient|undefined,released=false,discard=false,timedOut=false;
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    const onError=()=>{discard=true;};
+    try{
+      db=await this.pool.connect();db.on('error',onError);
+      timer=setTimeout(()=>{timedOut=true;discard=true;if(db&&!released){released=true;db.release(true);}},todayWallTimeoutMs);timer.unref();
+      await db.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      await db.query(`SET LOCAL statement_timeout='${todayStatementTimeoutMs}ms'`);
+      await db.query("SET LOCAL lock_timeout='100ms'");
+      await db.query("SET LOCAL idle_in_transaction_session_timeout='3s'");
+      await db.query('SET LOCAL max_parallel_workers_per_gather=0');
+      await db.query("SET LOCAL work_mem='1MB'");
+      await db.query('SET LOCAL jit=off');
+      const lock=await db.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired',[`olos-today-refresh:${this.source}`]);
+      if(!lock.rows[0]?.acquired)throw new WorkerError('REPORT_TODAY_BUSY');
+      // Match snapshot first-persistence semantics. Bind precomputed boundaries:
+      // timezone conversion in the records predicate would repeat per row.
+      const clock=(await db.query(`SELECT transaction_timestamp() AS observed_at,
+        (transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date::text AS date,
+        ((transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date::timestamp AT TIME ZONE 'America/Sao_Paulo') AS start_at,
+        (((transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date+1)::timestamp AT TIME ZONE 'America/Sao_Paulo') AS end_at`)).rows[0];
+      const row=(await db.query(`SELECT count(*)::text AS calls FROM olos_http.records
+        WHERE source_key=$1 AND target_table=$2 AND created_at>=$3::timestamptz AND created_at<$4::timestamptz`,
+        [this.source,`${quote(this.destination.schema)}.${quote(this.destination.table)}`,clock.start_at,clock.end_at])).rows[0];
+      if(timedOut)throw new WorkerError('REPORT_TODAY_TIMEOUT');
+      if(typeof row?.calls!=='string'||!/^(0|[1-9][0-9]*)$/.test(row.calls))throw new WorkerError('REPORT_TODAY_UNAVAILABLE');
+      return {date:clock.date,calls:row.calls,observed_at:clock.observed_at.toISOString(),timezone:reportZone,
+        cache_seconds:reportCacheSeconds,time_basis:'first_local_persistence',identity:'source_key/source_id',observation_source:'local_records'};
+    }catch(error){
+      if(timedOut||(error as {code?:string}).code==='57014')throw new WorkerError('REPORT_TODAY_TIMEOUT');
+      if(error instanceof WorkerError)throw error;
+      discard=true;throw new WorkerError('REPORT_TODAY_UNAVAILABLE');
+    }finally{
+      if(db){if(!released)await db.query('ROLLBACK').catch(()=>{discard=true;});if(!released){released=true;db.release(discard);}db.removeListener('error',onError);}
+      if(timer)clearTimeout(timer);
+    }
   }
   private age(s:Published) {return s.age+Math.max(0,this.now()-s.loaded_at)/1000;}
   private databaseDay(s:Published) {return DateTime.fromMillis(s.checked_at+Math.max(0,this.now()-s.loaded_at)).setZone(reportZone).toISODate();}
