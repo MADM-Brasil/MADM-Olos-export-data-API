@@ -111,24 +111,41 @@ export function renderDashboardMetrics(element, r) {
   element('chart-period').textContent=`${dayLabel(r.from)} — ${dayLabel(r.to)} · Brasília`;
 }
 
+const terminalHistory = new WeakMap();
 export function renderTerminal(root, entries, search, level, autoscroll = true) {
   const scroll=root.scrollTop,follow=autoscroll&&root.scrollHeight-root.clientHeight-scroll<=24;
   const top=root.getBoundingClientRect().top;
   const anchor=[...root.children].find(node=>node.getBoundingClientRect().bottom>top);
   const anchorKey=anchor?.getAttribute('data-event-key'),offset=anchor?.getBoundingClientRect().top-top;
   const visible=terminalRows(entries,search,level);
-  root.replaceChildren();
+  const previous=terminalHistory.get(root);
+  const existing=new Map([...root.children].map(node=>[node.getAttribute('data-event-key'),node]));
+  const retainedKeys=new Set(visible.map(row=>row.key));
+  for(const node of [...root.childNodes])if(node.nodeType!==1||!retainedKeys.has(node.getAttribute('data-event-key')))node.remove();
   if(!visible.length)root.textContent='Nenhum evento corresponde aos filtros.';
-  for(const item of visible){
-    const row=document.createElement('div');row.className='event-line';row.dataset.eventKey=item.key;
+  for(const [position,item] of visible.entries()){
+    let row=existing.get(item.key);
+    if(!row){
+    row=document.createElement('div');row.className='event-line';row.dataset.eventKey=item.key;
+    if(previous?.size&&!previous.has(item.key))row.classList.add('event-new');
     for(const [index,[css,text]] of [['event-time',item.time],['event-level',item.severity],['event-name',item.event],['event-detail',item.detail]].entries()){
-      if(index)row.append(document.createTextNode(' | '));
-      const span=document.createElement('span');span.className=css;span.textContent=text;
+      if(index){const separator=document.createElement('span');separator.className='event-separator';separator.textContent=' | ';row.append(separator);}
+      const span=document.createElement('span');span.className=css;
+      if(css==='event-detail'){
+        for(const fragment of text.split(/([a-z_]+=)/g)){
+          const part=document.createElement('span');part.textContent=fragment;
+          if(/^[a-z_]+=$/.test(fragment))part.className='event-param';
+          span.append(part);
+        }
+      }else span.textContent=text;
       if(css==='event-level')span.dataset.level=item.severity;
       row.append(span);
     }
-    root.append(row);
+    }
+    const at=root.children[position];
+    if(at!==row)root.insertBefore(row,at||null);
   }
+  terminalHistory.set(root,new Set(terminalRows(entries).map(row=>row.key)));
   if(follow)root.scrollTop=root.scrollHeight;
   else {
     const retained=[...root.children].find(node=>node.getAttribute('data-event-key')===anchorKey);

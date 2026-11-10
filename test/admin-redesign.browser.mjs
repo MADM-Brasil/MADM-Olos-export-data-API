@@ -1,7 +1,7 @@
 // Standalone UI fixture. No database, scheduler, OLOS or existing HTTP service.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { readFile, mkdir } from 'node:fs/promises';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { once } from 'node:events';
 import { createRequire } from 'node:module';
 import { defaultRange } from '../admin/public/ui.js';
@@ -52,7 +52,7 @@ const server=createServer(async(req,res)=>{
 server.listen(0,'127.0.0.1');await once(server,'listening');
 const origin=`http://127.0.0.1:${server.address().port}`;
 const browser=await chromium.launch({headless:true,...(process.env.ADMIN_CHROMIUM_PATH?{executablePath:process.env.ADMIN_CHROMIUM_PATH}:{})});
-const context=await browser.newContext({viewport:{width:1440,height:1100},permissions:['clipboard-read','clipboard-write']});
+const context=await browser.newContext({viewport:{width:1600,height:1365},permissions:['clipboard-read','clipboard-write']});
 const watchdog=setTimeout(()=>void browser.close(),90000);
 const page=await context.newPage();
 await page.addInitScript(()=>{const original=window.setInterval.bind(window);window.setInterval=(fn,ms,...args)=>{if(ms===30000)window.__reportPoll=fn;if(ms===1000)window.__clockTick=fn;if(ms===2000)window.__statusPoll=fn;return original(fn,ms,...args);};});
@@ -63,7 +63,7 @@ page.on('request',r=>assert(r.url().startsWith(origin+'/')||r.url().startsWith('
 const waitText=(id,value)=>page.waitForFunction(([id,value])=>document.getElementById(id).textContent.includes(value),[id,value]);
 const nav=async name=>{console.log('UI:',name);await page.getByRole('button',{name,exact:true}).click();};
 const screenshot=async(file)=>{
-  await page.evaluate(()=>{const p=document.createElement('p');p.id='fixture-label';p.textContent='HOMOLOGAÇÃO LOCAL · DADOS SINTÉTICOS DE TESTE';document.querySelector('main').prepend(p);});
+  await page.evaluate(()=>{const p=document.createElement('p');p.id='fixture-label';p.style.cssText='position:fixed;bottom:4px;right:8px;z-index:20;margin:0;padding:3px 8px;background:white;border:1px solid #bec9c2;font-size:10px;color:#3f4944';p.textContent='HOMOLOGAÇÃO LOCAL · DADOS SINTÉTICOS DE TESTE';document.querySelector('main').prepend(p);});
   if((await page.viewportSize()).width<760)await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=0.5);
   await page.screenshot({path:file.replace('admin/evidence',evidenceDir),fullPage:true});await page.locator('#fixture-label').evaluate(e=>e.remove());
 };
@@ -79,6 +79,18 @@ try{
   assert.equal(await page.locator('#dashboard-terminal #terminal').count(),1);
   assert(await page.evaluate(()=>{const cards=document.querySelector('#metrics'),terminal=document.querySelector('#dashboard-terminal'),chart=document.querySelector('#chart-panel');return !!(cards.compareDocumentPosition(terminal)&Node.DOCUMENT_POSITION_FOLLOWING)&&!!(terminal.compareDocumentPosition(chart)&Node.DOCUMENT_POSITION_FOLLOWING);}));
   assert.equal(writes.length,1);
+  assert.equal(await page.locator('#event-output .event-new').count(),0,'initial history must not animate');
+  await page.evaluate(()=>{window.__firstTerminalRow=document.querySelector('#event-output .event-line');});
+  await page.locator('#event-search').dispatchEvent('input');
+  assert(await page.evaluate(()=>window.__firstTerminalRow===document.querySelector('#event-output .event-line')),'unchanged rows retain DOM identity');
+  await page.locator('#metrics').evaluate(e=>Promise.all(e.getAnimations({subtree:true}).map(a=>a.finished.catch(()=>{}))));
+  const geometry=await page.evaluate(()=>{
+    const rect=id=>{const {x,y,width,height}=document.getElementById(id).getBoundingClientRect();return {x,y,width,height};};
+    return {viewport:{width:innerWidth,height:innerHeight},sidebar:rect('sidebar'),cards:[rect('today-card'),rect('countdown-card')],terminal:rect('terminal'),chart:rect('chart-panel'),canvas:getComputedStyle(document.documentElement).backgroundColor,terminalSurface:getComputedStyle(document.getElementById('terminal')).backgroundColor,cardRadius:getComputedStyle(document.getElementById('today-card')).borderRadius};
+  });
+  assert.equal(geometry.sidebar.width,320);assert.equal(geometry.cards[0].width,geometry.cards[1].width);assert(Math.abs(geometry.cards[0].y-geometry.cards[1].y)<.1);assert(Math.abs(geometry.cards[0].height-geometry.cards[1].height)<.1);
+  assert.equal(geometry.canvas,'rgb(238, 253, 244)');assert.equal(geometry.terminalSurface,'rgb(13, 30, 23)');assert.equal(geometry.cardRadius,'14px');
+
   assert.equal(await page.locator('#event-output details').count(),0,'basic details require no click');
   assert.match(await page.locator('#event-output .event-line').last().textContent(),/ERROR \| scheduler_error \| received=239 inserted=5 duplicates=2 request_ms=42 skipped=1 next_run_at=04\/11\/2026, 12:02:00 Brasília error=RECOVERY_REQUIRED/);
   assert.doesNotMatch(await page.locator('#event-output').textContent(),/PRIVATE/);
@@ -92,10 +104,15 @@ try{
   const dailyRequests=requests.filter(r=>['/api/today','/api/reports'].includes(r.path)).length;
   await page.evaluate(()=>{for(let i=0;i<100;i++)window.__clockTick();});
   assert.equal(requests.filter(r=>['/api/today','/api/reports'].includes(r.path)).length,dailyRequests,'visual ticks do not fetch');
-  await mkdir(evidenceDir,{recursive:true});
+  await mkdir(evidenceDir,{recursive:true});await writeFile(evidenceDir+'/geometry.json',JSON.stringify(geometry,null,2));
   await screenshot('admin/evidence/premium-desktop.png');
   await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   await screenshot('admin/evidence/premium-mobile.png');
+  await page.setViewportSize({width:900,height:1024});
+  assert.equal(await page.locator('#sidebar').evaluate(e=>e.getBoundingClientRect().width),64);
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  assert(await page.getByRole('button',{name:'Sair',exact:true}).isVisible());
+  await screenshot('admin/evidence/forest-tablet.png');
   await page.setViewportSize({width:1440,height:1100});
   // Keyboard accordion, cached reopening, and independent SVG failure.
   await page.locator('#chart-toggle').focus();await page.keyboard.press('Enter');
@@ -111,14 +128,14 @@ try{
   assert.equal(await page.locator('#today-calls').textContent(),'1.280');assert.equal(await page.locator('#calls-chart svg').count(),1);
   todayError=false;todayCalls='1291';await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','1.291');
   // Status failures cannot hide daily values or stop the independent terminal feed.
-  statusError=true;const polls=eventPolls;await page.evaluate(()=>window.__statusPoll());await waitText('countdown','Sem conexão');
+  statusError=true;const polls=eventPolls;await page.evaluate(()=>window.__statusPoll());await waitText('countdown','Sem conexão');assert.equal(await page.locator('#platform-state').textContent(),'Indisponível');assert.equal(await page.locator('#node-state').textContent(),'Indisponível');
   await page.waitForFunction(()=>document.getElementById('today-calls').textContent==='1.291');await page.waitForTimeout(100);assert(eventPolls>polls);
   statusError=false;await page.evaluate(()=>window.__statusPoll());
   for(const [mode,label]of [['PAUSED','Pausado'],['STOPPED','Parado'],['ERROR','Erro operacional'],['PAUSING','Pausando'],['STOPPING','Finalizando']]){state=mode;await page.evaluate(()=>window.__statusPoll());await waitText('countdown',label);}
   state='RUNNING';nextAt=null;await page.evaluate(()=>window.__statusPoll());await waitText('countdown','Sem agendamento');
   nextAt=new Date(serverNow()-1000).toISOString();await page.evaluate(()=>window.__statusPoll());await waitText('countdown','Aguardando execução');
   activeCycle=true;await page.evaluate(()=>window.__statusPoll());await waitText('countdown','Em leitura');activeCycle=false;
-  nextAt=new Date(serverNow()+102000).toISOString();await page.evaluate(()=>window.__statusPoll());assert.match(await page.locator('#countdown').textContent(),/^01:(4[01]|39|42)$/);
+  nextAt=new Date(serverNow()+102000).toISOString();await page.evaluate(()=>window.__statusPoll());await page.waitForFunction(()=>/^01:(4[01]|39|42)$/.test(document.getElementById('countdown').textContent));assert.match(await page.locator('#countdown').textContent(),/^01:(4[01]|39|42)$/);
   await page.locator('#terminal-filters > summary').click();
   assert.equal(await page.locator('#event-all').count(),0);assert.equal(await page.locator('#event-output .event-line').count(),200);
   await page.locator('#event-level').selectOption('WARN');assert.equal(await page.locator('#event-output .event-line').count(),1);await waitText('event-output','poll_retry');
@@ -131,7 +148,7 @@ try{
   // Keep the same visible row when the retained buffer drops its first event.
   await page.locator('#event-output').evaluate(e=>{e.scrollTop=500;});
   const anchor=await page.locator('#event-output').evaluate(e=>{const top=e.getBoundingClientRect().top,row=[...e.children].find(r=>r.getBoundingClientRect().bottom>top);return {key:row.dataset.eventKey,offset:row.getBoundingClientRect().top-top};});
-  eventOffset=1;await page.evaluate(()=>window.__statusPoll());await waitText('event-output','received=240');
+  eventOffset=1;await page.evaluate(()=>window.__statusPoll());await waitText('event-output','received=240');assert(await page.locator('#event-output .event-line').last().evaluate(e=>e.classList.contains('event-new')));
   const anchorAfter=await page.locator('#event-output').evaluate((e,key)=>{const row=[...e.children].find(r=>r.dataset.eventKey===key);return row.getBoundingClientRect().top-e.getBoundingClientRect().top;},anchor.key);
   assert(Math.abs(anchorAfter-anchor.offset)<1,'manual scroll survives buffer rotation even with Autoscroll checked');
   await page.locator('#event-output').evaluate(e=>{e.scrollTop=e.scrollHeight;});eventOffset=2;await page.evaluate(()=>window.__statusPoll());await waitText('event-output','received=241');
@@ -157,7 +174,7 @@ try{
   await nav('Credenciais OLOS');await waitText('credentials-complete','completa');await nav('Salvar credenciais');await waitText('notice','Credenciais salvas');assert.equal(writes.at(-1).path,'/api/credentials');assert.deepEqual(writes.at(-1).input,{baseUrl:'https://fixture.invalid/WebApiExportData',username:'fixture',password:'',revision:1});await nav('Testar conexão salva');await waitText('test-result','Autenticação validada');
   state='STOPPED';await page.evaluate(()=>window.__statusPoll());await nav('Iniciar Worker');await waitText('state','Operando');await nav('Agendamento');await nav('Pausar agendamento');await waitText('state','Pausado');await nav('Retomar agendamento');await waitText('state','Operando');
   await nav('Parar Worker');await nav('Cancelar');assert.equal(state,'RUNNING');await nav('Parar Worker');await nav('Confirmar parada');await waitText('state','Parado');assert.deepEqual(writes.at(-1).input,{confirm:true});
-  await nav('Status operacional');await waitText('audit-rows','fixture-admin');await nav('Dashboard');
+  await nav('Status operacional');await waitText('audit-rows','fixture-admin');await nav('Auditoria');assert.equal(await page.locator('#audit-heading').evaluate(e=>e===document.activeElement),true);await nav('Dashboard');
   await page.setViewportSize({width:390,height:844});await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=0.5);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.locator('#chart-toggle').click();await page.waitForTimeout(250);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   await nav('Abrir navegação');await nav('Relatórios');await waitText('report-page','Página 1');assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   reportError=true;await nav('Aplicar período');await waitText('report-status','Relatório indisponível');assert(await page.locator('#export-report').isDisabled());assert.equal(await page.locator('#report-rows tr').count(),0);
