@@ -35,6 +35,20 @@ export function countdownView(status, now, stale = false) {
   return {value:`${String(Math.floor(remaining/60)).padStart(2,'0')}:${String(remaining%60).padStart(2,'0')}`,detail:`Programada para ${date(status.next_run_at)} · Brasília`,state:'scheduled'};
 }
 
+export function retryAfterMs(value,responseDate,now=Date.now()) {
+  const text=typeof value==='string'?value.trim():'';
+  if(/^\d+$/.test(text)){
+    const seconds=Number(text);
+    if(Number.isFinite(seconds)&&seconds<=Number.MAX_SAFE_INTEGER/1000)return seconds*1000;
+  }
+  const deadline=/[a-z]/i.test(text)?Date.parse(text):NaN,reference=Date.parse(responseDate);
+  if(Number.isFinite(deadline))return Math.max(0,deadline-(Number.isFinite(reference)?reference:now));
+  return 60000;
+}
+export function todayRefreshState(busy,until,now=performance.now()) {
+  const seconds=Math.max(0,Math.ceil((until-now)/1000));
+  return {busy,seconds,disabled:busy||seconds>0};
+}
 export function newerTodayObservation(current,incoming) {
   if(!current)return true;
   return incoming.date>current.date||(incoming.date===current.date&&Date.parse(incoming.observed_at)>Date.parse(current.observed_at));

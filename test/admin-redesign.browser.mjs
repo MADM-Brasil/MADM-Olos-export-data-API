@@ -13,7 +13,7 @@ let reportHold=null,releaseReport=null,reportHoldFrom=null,todayHold=null,releas
 let statusDelay=0,eventDelay=0,eventOffset=0,eventsActive=0,maxEventsActive=0;
 const eventTimes=[];
 let session=false,state='RUNNING',interval=120000,eventPolls=0,reportError=false,statusError=false,eventError=false,empty=false,reportDelay=0;
-let todayAutomatic=null;
+let todayAutomatic=null,todayManualLimit=null;
 let baseServer=Date.now(),baseReal=Date.now(),todayError=false,todayDelay=0,todayCalls='1280',activeCycle=false;
 const serverNow=()=>baseServer+Date.now()-baseReal;
 const setServerTime=ms=>{baseServer=ms;baseReal=Date.now();};
@@ -41,7 +41,7 @@ const server=createServer(async(req,res)=>{
     if(statusError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}
     json({state,desired_state:state,interval_ms:interval,cycle_in_progress:activeCycle,next_run_at:nextAt,server_time:new Date(serverNow()).toISOString(),authentication:{status:'ACCEPTED'},database:{reachable:true,schema_valid:true},ingestion:{status:'CONFIRMED',pending:[],latest:{started_at:'2026-11-04T15:00:00Z',state:'done'},last_completed:{finished_at:'2026-11-04T15:01:00Z',received_count:8,inserted:5,duplicates:3,duration_ms:240}},corporate_delivery:{ready:true,paused:true,blocked:false}});return;
   }
-  if(path==='/api/today'||path==='/api/today/refresh'){if(path.endsWith('/refresh')&&(req.method!=='POST'||req.headers['x-csrf-token']!=='fixture-csrf')){json({error:'CSRF_FORBIDDEN'},403);return;}if(todayHold)await todayHold;if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence',...(path==='/api/today'&&todayAutomatic?todayAutomatic:{})});return;}
+  if(path==='/api/today'||path==='/api/today/refresh'){if(path.endsWith('/refresh')&&(req.method!=='POST'||req.headers['x-csrf-token']!=='fixture-csrf')){json({error:'CSRF_FORBIDDEN'},403);return;}if(path.endsWith('/refresh')&&todayManualLimit){res.setHeader('Retry-After',todayManualLimit.retryAfter);if(todayManualLimit.date)res.setHeader('Date',todayManualLimit.date);json({error:'REPORT_TODAY_RATE_LIMITED',calls:'999999',observed_at:new Date(serverNow()+86400000).toISOString()},429);return;}if(todayHold)await todayHold;if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence',...(path==='/api/today'&&todayAutomatic?todayAutomatic:{})});return;}
   if(path==='/api/reports'){if(reportHold&&new URL(req.url,'http://localhost').searchParams.get('from')===(reportHoldFrom||daily.at(-14).day))await reportHold;if(reportDelay)await new Promise(r=>setTimeout(r,reportDelay));if(reportError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else {const r=report(),q=new URL(req.url,'http://localhost').searchParams;r.from=q.get('from')||r.from;r.to=q.get('to')||r.to;r.daily=r.daily.filter(d=>d.day>=r.from&&d.day<=r.to);
     r.period={operators:r.daily.length?'12':'0'};
     for(const key of ['calls','identified_calls','with_cpf','with_email','confirmed','pending','not_queued','inconsistent'])r.period[key]=r.daily.reduce((n,d)=>n+BigInt(d[key]),0n).toString();
@@ -62,10 +62,11 @@ const browser=await chromium.launch({headless:true,...(process.env.ADMIN_CHROMIU
 const context=await browser.newContext({viewport:{width:1600,height:1365},hasTouch:true,permissions:['clipboard-read','clipboard-write']});
 const watchdog=setTimeout(()=>void browser.close(),90000);
 const page=await context.newPage();
+await page.clock.install();
 await page.addInitScript(()=>{const original=window.setInterval.bind(window);window.setInterval=(fn,ms,...args)=>{if(ms===30000)window.__reportPoll=fn;if(ms===1000)window.__clockTick=fn;if(ms===2000)window.__statusPoll=fn;return original(fn,ms,...args);};});
 page.setDefaultTimeout(10000);page.on('pageerror',e=>errors.push(e.message));
 // HTTP 401/503 are deliberately injected below; application console errors are not.
-page.on('console',message=>{if(message.type()==='error'&&!/^Failed to load resource: the server responded with a status of (401|404|503)\b/.test(message.text()))errors.push(message.text());});
+page.on('console',message=>{if(message.type()==='error'&&!/^Failed to load resource: (?:the server responded with a status of (401|404|429|503)\b|net::ERR_FAILED)/.test(message.text()))errors.push(message.text());});
 page.on('request',r=>assert(r.url().startsWith(origin+'/')||r.url().startsWith('blob:'),'Unexpected external request'));
 const waitText=(id,value)=>page.waitForFunction(([id,value])=>document.getElementById(id).textContent.includes(value),[id,value]);
 const nav=async name=>{console.log('UI:',name);await page.getByRole('button',{name,exact:true}).click();};
@@ -108,7 +109,7 @@ try{
   await page.emulateMedia({reducedMotion:'reduce'});
   assert.equal(await refreshToday.locator('svg').evaluate(e=>getComputedStyle(e).animationName),'none');
   releaseToday();todayHold=null;await waitText('today-calls','1.287');
-  assert(!(await refreshToday.isDisabled()));assert.equal(await refreshToday.getAttribute('aria-busy'),'false');
+  assert(await refreshToday.isDisabled());assert.equal(await refreshToday.getAttribute('aria-busy'),'false');
   assert.notEqual(await page.locator('#today-updated').textContent(),beforeManual);
   assert.match(await page.locator('#today-updated').textContent(),/atualização a cada 5 min/);
   await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-success.png'});
@@ -119,9 +120,45 @@ try{
   await page.evaluate(()=>window.__reportPoll());await staleResponse;
   await page.waitForFunction(()=>document.getElementById('refresh-today').getAttribute('aria-busy')==='false');
   assert.equal(await page.locator('#today-calls').textContent(),'1.287');assert.equal(await page.locator('#today-updated').textContent(),manualFooter);todayAutomatic=null;
+  // A successful manual read also keeps the button within the known 60s window.
+  const posts=()=>requests.filter(r=>r.path==='/api/today/refresh').length;
+  let beforePosts=posts();
+  await page.evaluate(()=>document.getElementById('refresh-today').dispatchEvent(new MouseEvent('click')));
+  assert.equal(posts(),beforePosts);
+  await page.clock.fastForward(60000);
+  await page.waitForFunction(()=>!document.getElementById('refresh-today').disabled);
+  // Another administrator can still own the source cooldown. A 429 is never data.
+  todayAutomatic={calls:'1200',observed_at:new Date(manualClock-60000).toISOString()};
+  todayManualLimit={retryAfter:'60'};
+  const preservedFooter=await page.locator('#today-updated').textContent();
+  const limited=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/today/refresh');
+  await refreshToday.click();assert.equal((await limited).status(),429);
+  await waitText('today-refresh-status','60 s');assert(await refreshToday.isDisabled());
+  assert.equal(await refreshToday.getAttribute('aria-busy'),'false');assert.equal(await refreshToday.getAttribute('aria-describedby'),'today-refresh-status');
+  assert.equal(await page.locator('#today-refresh-status').getAttribute('role'),'timer');
+  assert.equal(await page.locator('#today-calls').textContent(),'1.287');assert.equal(await page.locator('#today-updated').textContent(),preservedFooter);
+  beforePosts=posts();const gets=requests.filter(r=>r.path==='/api/today').length;
+  await page.evaluate(()=>{document.getElementById('refresh-today').dispatchEvent(new MouseEvent('click'));window.__reportPoll();});
+  await page.clock.fastForward(30000);await waitText('today-refresh-status','30 s');
+  assert.equal(posts(),beforePosts);assert(requests.filter(r=>r.path==='/api/today').length>gets);
+  assert.equal(await page.locator('#today-calls').textContent(),'1.287');assert.equal(await page.locator('#today-updated').textContent(),preservedFooter);
+  await mkdir(evidenceDir,{recursive:true});await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-cooldown.png'});
+  await page.clock.fastForward(29000);await waitText('today-refresh-status','1 s');assert(await refreshToday.isDisabled());
+  await page.clock.fastForward(1000);await page.waitForFunction(()=>!document.getElementById('refresh-today').disabled);assert.equal(posts(),beforePosts);
+  todayManualLimit={retryAfter:new Date(serverNow()+2000).toUTCString(),date:new Date(serverNow()).toUTCString()};
+  await refreshToday.click();await waitText('today-refresh-status','2 s');
+  await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-cooldown-mobile.png'});
+  await page.clock.fastForward(2000);await page.waitForFunction(()=>!document.getElementById('refresh-today').disabled);
+  await page.setViewportSize({width:1600,height:1365});todayManualLimit=null;
+  // Network errors preserve data and allow a deliberate retry; no silent POST retry.
+  await page.route('**/api/today/refresh',route=>route.abort('failed'));
+  await refreshToday.click();await waitText('today-updated','falha ao atualizar');assert.equal(await page.locator('#today-calls').textContent(),'1.287');
+  assert(!(await refreshToday.isDisabled()));await page.unroute('**/api/today/refresh');todayAutomatic=null;
   todayError=true;await refreshToday.focus();
   assert(await refreshToday.evaluate(e=>parseFloat(getComputedStyle(e).outlineWidth)>=2));
-  await page.keyboard.press('Enter');await waitText('today-updated','falha ao atualizar');
+  const failedResponse=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/today/refresh');
+  await page.keyboard.press('Enter');await failedResponse;await page.waitForFunction(()=>document.getElementById('refresh-today').getAttribute('aria-busy')==='false');await waitText('today-updated','falha ao atualizar');
   assert.equal(await page.locator('#today-calls').textContent(),'1.287');assert(!(await refreshToday.isDisabled()));
   await page.locator('#today-card').screenshot({path:evidenceDir+'/daily-refresh-error.png'});
   await page.setViewportSize({width:390,height:844});

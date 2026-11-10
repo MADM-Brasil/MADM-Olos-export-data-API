@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import type {Pool} from 'pg';
-import {AdminReports} from '../src/admin/reports.js';
+import {AdminReports,TodayRefreshRateLimited} from '../src/admin/reports.js';
 const dest={schema:'raw',table:'olos_calls'};
 function fixture(options:{count?:string;error?:string;busy?:boolean;gate?:Promise<void>;entered?:()=>void}={}) {
   const sql:string[]=[];let releases=0,counts=0;
@@ -21,9 +21,16 @@ test('manual today coalesces sessions, preserves precision and imposes a 60s sou
   const calls=Array.from({length:20},()=>reader.refreshToday());await started;assert.equal(db.stats().counts,1);release();
   const results=await Promise.all(calls);assert(results.every(r=>r===results[0]));assert.equal(results[0]?.calls,'900719925474099312345');
   assert.equal(results[0]?.observed_at,'2026-11-10T12:00:00.000Z');assert.equal(results[0]?.observation_source,'local_records');
-  await assert.rejects(reader.refreshToday(),/REPORT_TODAY_RATE_LIMITED/);now=59999;await assert.rejects(reader.refreshToday(),/RATE_LIMITED/);
+  await assert.rejects(reader.refreshToday(),e=>e instanceof TodayRefreshRateLimited&&e.retryAfterSeconds===60);
+  now=59000;await assert.rejects(reader.refreshToday(),e=>e instanceof TodayRefreshRateLimited&&e.retryAfterSeconds===1);
   now=60000;await reader.refreshToday();assert.equal(db.stats().counts,2);assert.equal(db.sql.at(-1),'ROLLBACK');
   assert(!db.sql.some(s=>/JOIN|WITH classified|report_snapshot|corporate_outbox|olos_http.reads|raw\./.test(s)));
+});
+test('automatic snapshot reads never consume the manual admission window',async()=>{
+  let now=0;const db=fixture(),reader=new AdminReports(db.pool,'fixture',dest,()=>now);
+  await assert.rejects(reader.today(),/REPORT_SNAPSHOT_INVALID/);await reader.refreshToday();
+  now=60000;await assert.rejects(reader.today(),/REPORT_SNAPSHOT_INVALID/);await reader.refreshToday();
+  assert.equal(db.stats().counts,2);
 });
 test('manual failures, busy locks and invalid counts never become zero; failures also consume the cooldown',async()=>{
   for(const [options,code] of [[{error:'57014'},'REPORT_TODAY_TIMEOUT'],[{error:'08006'},'REPORT_TODAY_UNAVAILABLE'],[{count:'1.2'},'REPORT_TODAY_UNAVAILABLE'],[{busy:true},'REPORT_TODAY_BUSY']] as const){

@@ -7,7 +7,7 @@ import type { CredentialService } from './credentials.js';
 import type { DynamicScheduler } from '../scheduler.js';
 import type { AdminRepository, Mode } from './repository.js';
 import { interval } from './repository.js';
-import { reportCacheSeconds } from './reports.js';
+import { reportCacheSeconds, TodayRefreshRateLimited } from './reports.js';
 
 async function body(req: IncomingMessage) {
   if (!req.headers['content-type']?.startsWith('application/json')) throw new WorkerError('JSON_REQUIRED');
@@ -101,7 +101,7 @@ export function adminServer(options: {
     } catch (error) {
       const code = errorCode(error);
       const status = ['LOGIN_FAILED','AUTHENTICATION_REQUIRED'].includes(code) ? 401 : code.endsWith('FORBIDDEN') ? 403 : ['LOGIN_RATE_LIMITED','REPORT_TODAY_RATE_LIMITED','REPORT_TODAY_BUSY'].includes(code) ? 429 : code.endsWith('CONFLICT') ? 409 : (code.startsWith('REPORT_')&&code!=='REPORT_PERIOD_INVALID') ? 503 : error instanceof WorkerError ? 400 : 503;
-      if(code.startsWith('REPORT_TODAY_'))res.setHeader('Retry-After','60');
+      if(code.startsWith('REPORT_TODAY_'))res.setHeader('Retry-After',String(error instanceof TodayRefreshRateLimited?error.retryAfterSeconds:60));
       if (status === 503 && ['/api/reports','/api/today'].includes(req.url?.split('?')[0] ?? '')) res.setHeader('Retry-After', String(['REPORT_INITIALIZING','REPORT_SNAPSHOT_STALE'].includes(code)?30:reportCacheSeconds));
       if (!res.headersSent) send(res, status, { error: code, ...(code==='REPORT_INITIALIZING'?{snapshot_state:'INITIALIZING'}:{}) }); else res.end();
     }

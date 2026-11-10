@@ -11,6 +11,9 @@ export const reportReadWallTimeoutMs = 5_000;
 export const todayRefreshIntervalMs = 60_000;
 export const todayStatementTimeoutMs = 1_000;
 export const todayWallTimeoutMs = 2_000;
+export class TodayRefreshRateLimited extends WorkerError {
+  constructor(readonly retryAfterSeconds:number){super('REPORT_TODAY_RATE_LIMITED');}
+}
 export interface TodayObservation {
   date:string;calls:string;observed_at:string;timezone:string;cache_seconds:number;
   time_basis:string;identity:string;observation_source:'local_records';
@@ -52,7 +55,8 @@ export class AdminReports {
   }
   refreshToday():Promise<TodayObservation> {
     if(this.todayPending)return this.todayPending;
-    if(this.now()<this.todayNext)return Promise.reject(new WorkerError('REPORT_TODAY_RATE_LIMITED'));
+    const remaining=this.todayNext-this.now();
+    if(remaining>0)return Promise.reject(new TodayRefreshRateLimited(Math.ceil(remaining/1000)));
     // All sessions of the single source-owning Admin share this admission gate,
     // including failures. The transaction lock also excludes other processes.
     this.todayNext=this.now()+todayRefreshIntervalMs;

@@ -1,3 +1,4 @@
+import {TodayRefreshRateLimited} from '../src/admin/reports.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -121,7 +122,7 @@ test('admin API enforces session, role, CSRF, origin, stop confirmation and secr
     const manual=await request('/api/today/refresh','POST',{});assert.equal(manual.status,200);
     const observed=await manual.json() as {calls:string;observed_at:string;server_time:string};assert.equal(observed.calls,'4');assert.equal(observed.observed_at,'2026-11-01T12:00:02.000Z');assert.notEqual(observed.server_time,observed.observed_at);
     assert.equal((await request('/api/today/refresh')).status,404);
-    for(const [code,status] of [['REPORT_TODAY_RATE_LIMITED',429],['REPORT_TODAY_BUSY',429],['REPORT_TODAY_TIMEOUT',503],['REPORT_TODAY_UNAVAILABLE',503]] as const){manualFailure=new WorkerError(code);const r=await request('/api/today/refresh','POST',{});assert.equal(r.status,status);assert.equal(r.headers.get('retry-after'),'60');}manualFailure=undefined;
+    for(const [code,status] of [['REPORT_TODAY_RATE_LIMITED',429],['REPORT_TODAY_BUSY',429],['REPORT_TODAY_TIMEOUT',503],['REPORT_TODAY_UNAVAILABLE',503]] as const){manualFailure=new WorkerError(code);const r=await request('/api/today/refresh','POST',{});assert.equal(r.status,status);assert.equal(r.headers.get('retry-after'),'60');}manualFailure=new TodayRefreshRateLimited(1);const remaining=await request('/api/today/refresh','POST',{});assert.equal(remaining.status,429);assert.equal(remaining.headers.get('retry-after'),'1');manualFailure=undefined;
     const today=await request('/api/today');assert.equal(today.status,200);assert.equal((await today.json() as any).calls,'3');
     const status=await request('/api/status');assert(Number.isFinite(Date.parse((await status.json() as any).server_time)));
     const report=await request('/api/reports?from=2026-10-01&to=2026-10-31');assert.equal(report.status,200);assert.deepEqual(await report.json(),{from:'2026-10-01',to:'2026-10-31',daily:[]});

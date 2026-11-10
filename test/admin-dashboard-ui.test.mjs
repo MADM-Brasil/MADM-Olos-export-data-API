@@ -1,8 +1,22 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {ServerClock,countdownView,todayView,brasiliaDay,newerTodayObservation} from '../admin/public/dashboard.js';
+import {ServerClock,countdownView,todayView,brasiliaDay,newerTodayObservation,retryAfterMs,todayRefreshState} from '../admin/public/dashboard.js';
 const now=Date.parse('2026-11-01T12:00:00Z');
 const active={state:'RUNNING',cycle_in_progress:false,next_run_at:new Date(now+102000).toISOString()};
+test('Retry-After accepts seconds and HTTP dates without depending on browser clock accuracy',()=>{
+  assert.equal(retryAfterMs('60',null,now),60000);assert.equal(retryAfterMs('0',null,now),0);
+  assert.equal(retryAfterMs('Sun, 01 Nov 2026 12:01:00 GMT','Sun, 01 Nov 2026 12:00:00 GMT',now+86400000),60000);
+  assert.equal(retryAfterMs('Sun, 01 Nov 2026 12:01:00 GMT',null,now),60000);
+  assert.equal(retryAfterMs('Sun, 01 Nov 2026 11:59:00 GMT',null,now),0);
+  for(const invalid of [null,'','invalid','-1','1.5','999999999999999999999999'])assert.equal(retryAfterMs(invalid,null,now),60000);
+});
+test('manual cooldown expires using monotonic time and loading remains independently disabled',()=>{
+  assert.deepEqual(todayRefreshState(false,60000,0),{busy:false,seconds:60,disabled:true});
+  assert.equal(todayRefreshState(false,60000,30000).seconds,30);
+  assert.equal(todayRefreshState(false,60000,59999).seconds,1);
+  assert.deepEqual(todayRefreshState(false,60000,60000),{busy:false,seconds:0,disabled:false});
+  assert.equal(todayRefreshState(true,0,60000).disabled,true);
+});
 test('old automatic snapshots cannot overwrite a newer manual observation, even with a larger count',()=>{
   const manual={date:'2026-11-01',observed_at:'2026-11-01T12:00:00Z',calls:'20'};
   assert.equal(newerTodayObservation(manual,{...manual,observed_at:'2026-11-01T11:59:00Z',calls:'999'}),false);
