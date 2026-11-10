@@ -133,6 +133,31 @@ test('today counts first persisted source identities in Brasília, not call date
   now=30000;assert.equal((await r.today()).calls,'2');now=300000;assert.equal((await r.today()).calls,'3');
   assert.equal((await new AdminReports(pool,'no-rows',{schema:'raw',table:'olos_calls'}).today()).calls,'0');
 });
+test('skipped remains outside pending and confirmed under the existing report classification',async()=>{
+  await pool.query("UPDATE olos_http.corporate_outbox SET state='skipped' WHERE source_key=$1 AND source_id='3'",[source]);
+  try{const r=await read();assert.equal(r.period.pending,'6');assert.equal(r.period.confirmed,'1');assert.equal(r.period.inconsistent,'1');}
+  finally{await pool.query("UPDATE olos_http.corporate_outbox SET state='pending' WHERE source_key=$1 AND source_id='3'",[source]);}
+});
+test('backfill and late confirmation stay attributed to call date, not creation or receipt date',async()=>{
+  const sourceKey='late-report-fixture';
+  await pool.query("INSERT INTO raw.olos_calls(internal_id_olos,data_ligacao,nome_agente) OVERRIDING SYSTEM VALUE VALUES(200,'2026-10-02T12:00:00Z','Fixture')");
+  await pool.query("INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,created_at) VALUES($1,'200',$2,200,repeat('a',64),'7','2026-11-10T12:00:00Z')",[sourceKey,target]);
+  const r=new AdminReports(pool,sourceKey,{schema:'raw',table:'olos_calls'});
+  try{
+    const first=await r.read('2026-10-02','2026-10-02') as {period:{calls:string;confirmed:string},daily:{confirmed:string}[]};
+    assert.equal(first.period.calls,'1');assert.equal(first.period.confirmed,'0');
+    await pool.query("INSERT INTO olos_http.corporate_outbox(source_key,source_id,target_id,source_hash,payload,payload_hash,state,origin,remote_raw_id,confirmed_at) VALUES($1,'200',200,repeat('a',64),'{}',repeat('a',64),'confirmed','capture',200,'2026-11-10T15:00:00Z')",[sourceKey]);
+    assert.deepEqual(await r.read('2026-10-02','2026-10-02'),first,'cached observation remains stable');
+    const fresh=new AdminReports(pool,sourceKey,{schema:'raw',table:'olos_calls'});
+    const observed=await fresh.read('2026-10-02','2026-10-02') as typeof first;
+    assert.equal(observed.daily[0]!.confirmed,'1');assert.equal(observed.period.confirmed,'1');
+    assert.equal(((await fresh.read('2026-11-10','2026-11-10')) as typeof first).period.calls,'0');
+  }finally{
+    await pool.query('DELETE FROM olos_http.corporate_outbox WHERE source_key=$1',[sourceKey]);
+    await pool.query('DELETE FROM olos_http.records WHERE source_key=$1',[sourceKey]);
+    await pool.query('DELETE FROM raw.olos_calls WHERE internal_id_olos=200');
+  }
+});
 test('representative local history remains bounded; compare old/new and repeated range requests',async()=>{
   const size=Number(process.env.REPORT_BENCH_ROWS??200000);
   assert(Number.isInteger(size)&&size%10===0&&size>=200000&&size<=1600000,'Use 200000..1600000 synthetic rows, multiple of 10');

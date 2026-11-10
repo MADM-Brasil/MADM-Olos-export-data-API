@@ -9,7 +9,7 @@ const require=createRequire(import.meta.url);
 const {chromium}=require(process.env.ADMIN_PLAYWRIGHT_PATH||'playwright');
 const writes=[], requests=[],errors=[];
 const evidenceDir=process.env.ADMIN_EVIDENCE_DIR||'admin/evidence';
-let reportHold=null,releaseReport=null;
+let reportHold=null,releaseReport=null,reportHoldFrom=null,todayHold=null,releaseToday=null;
 let statusDelay=0,eventDelay=0,eventOffset=0,eventsActive=0,maxEventsActive=0;
 const eventTimes=[];
 let session=false,state='RUNNING',interval=120000,eventPolls=0,reportError=false,statusError=false,eventError=false,empty=false,reportDelay=0;
@@ -20,10 +20,11 @@ let nextAt=new Date(serverNow()+102000).toISOString();
 const range=defaultRange(new Date(serverNow()));
 const daily=Array.from({length:30},(_,i)=>{
   const d=new Date(range.from+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+i);
-  return {day:d.toISOString().slice(0,10),calls:String(1000+i*20),identified_calls:String(400+i*8),operators:'12',with_cpf:'200',with_email:'300',confirmed:'350',pending:'650',not_queued:'0',inconsistent:'0'};
+  return {day:d.toISOString().slice(0,10),calls:String(1000+i*20),identified_calls:String(400+i*8),operators:'12',with_cpf:'200',with_email:'300',confirmed:'350',pending:String(650+i*20),not_queued:'0',inconsistent:'0'};
 });
 const metric={calls:'60000',identified_calls:'20000',operators:'18',with_cpf:'5000',with_email:'7000',confirmed:'11259',pending:'48738',not_queued:'0',inconsistent:'3',undated:'4',missing_mapping:'2'};
-const report=()=>({from:range.from,to:range.to,summary:metric,period:metric,daily:empty?[]:daily,failed_reads:'2',observed_at:new Date().toISOString(),outbox_available:true});
+let outboxAvailable=true;
+const report=()=>({from:range.from,to:range.to,summary:{...metric},daily:empty?[]:daily.map(row=>({...row})),failed_reads:'2',observed_at:new Date(serverNow()).toISOString(),outbox_available:outboxAvailable});
 const server=createServer(async(req,res)=>{
   const path=new URL(req.url,'http://localhost').pathname;requests.push({method:req.method,path});
   const json=(value,code=200)=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
@@ -39,8 +40,12 @@ const server=createServer(async(req,res)=>{
     if(statusError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}
     json({state,desired_state:state,interval_ms:interval,cycle_in_progress:activeCycle,next_run_at:nextAt,server_time:new Date(serverNow()).toISOString(),authentication:{status:'ACCEPTED'},database:{reachable:true,schema_valid:true},ingestion:{status:'CONFIRMED',pending:[],latest:{started_at:'2026-11-04T15:00:00Z',state:'done'},last_completed:{finished_at:'2026-11-04T15:01:00Z',received_count:8,inserted:5,duplicates:3,duration_ms:240}},corporate_delivery:{ready:true,paused:true,blocked:false}});return;
   }
-  if(path==='/api/today'){if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence'});return;}
-  if(path==='/api/reports'){if(reportHold&&new URL(req.url,'http://localhost').searchParams.get('from')===daily.at(-14).day)await reportHold;if(reportDelay)await new Promise(r=>setTimeout(r,reportDelay));if(reportError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else {const r=report(),q=new URL(req.url,'http://localhost').searchParams;r.from=q.get('from')||r.from;r.to=q.get('to')||r.to;r.daily=r.daily.filter(d=>d.day>=r.from&&d.day<=r.to);json(r);}return;}
+  if(path==='/api/today'){if(todayHold)await todayHold;if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence'});return;}
+  if(path==='/api/reports'){if(reportHold&&new URL(req.url,'http://localhost').searchParams.get('from')===(reportHoldFrom||daily.at(-14).day))await reportHold;if(reportDelay)await new Promise(r=>setTimeout(r,reportDelay));if(reportError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else {const r=report(),q=new URL(req.url,'http://localhost').searchParams;r.from=q.get('from')||r.from;r.to=q.get('to')||r.to;r.daily=r.daily.filter(d=>d.day>=r.from&&d.day<=r.to);
+    r.period={operators:r.daily.length?'12':'0'};
+    for(const key of ['calls','identified_calls','with_cpf','with_email','confirmed','pending','not_queued','inconsistent'])r.period[key]=r.daily.reduce((n,d)=>n+BigInt(d[key]),0n).toString();
+    if(!outboxAvailable)for(const part of [r.summary,r.period,...r.daily])for(const key of ['confirmed','pending','not_queued','inconsistent'])part[key]=null;
+    json(r);}return;}
   if(path==='/api/events'){eventPolls++;eventTimes.push(Date.now());eventsActive++;maxEventsActive=Math.max(maxEventsActive,eventsActive);if(eventDelay)await new Promise(r=>setTimeout(r,eventDelay));eventsActive--;if(eventError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}json(Array.from({length:240},(_,i)=>({time:'2026-11-04T15:00:00.000Z',event:i+eventOffset===239?'scheduler_error':i+eventOffset===238?'poll_retry':'batch_completed',received:i+eventOffset,inserted:5,duplicates:2,request_ms:42,skipped:1,next_run_at:'2026-11-04T15:02:00.000Z',error:i+eventOffset===239?'RECOVERY_REQUIRED':undefined,email:'PRIVATE_EMAIL',payload:'PRIVATE_PAYLOAD'})));return;}
   if(path==='/api/logs'){json([{id:'fixture-read',started_at:'2026-11-04T15:00:00Z',state:'done',processed_count:5,received_count:5,request_ms:20}]);return;}
   if(path==='/api/audit'){json([{occurred_at:'2026-11-04T15:00:00Z',actor:'fixture-admin',action:'scheduler_state'}]);return;}
@@ -230,11 +235,48 @@ try{
   eventError=true;await page.evaluate(()=>window.__statusPoll());await waitText('terminal-live','SEM ATUALIZAÇÃO');
   await page.locator('#event-search').fill('scheduler_error');await waitText('terminal-live','SEM ATUALIZAÇÃO');await waitText('event-status','desatualizada');
   eventError=false;await page.locator('#event-search').fill('');await page.locator('#event-autoscroll').check();await page.evaluate(()=>window.__statusPoll());await waitText('terminal-live','AO VIVO');
-  await nav('Relatórios');await waitText('report-page','Página 1 de 3');await waitText('metric-calls','60.000');assert.equal(await page.locator('#historical-metrics > article').count(),6);assert.equal(await page.locator('#corporate-state').textContent(),'Pausado');assert.match(await page.locator('#integrity-details').textContent(),/Registros sem data de chamada4Mappings sem registro local2Recibos divergentes3/);await screenshot('admin/evidence/premium-reports.png');assert.equal(await page.locator('#report-rows tr').count(),14);
-  await nav('Próxima');await waitText('report-page','Página 2');await nav('Próxima');assert.equal(await page.locator('#report-rows tr').count(),2);
+  await nav('Relatórios');await waitText('report-page','Página 1 de 5');await waitText('metric-calls','38.700');assert.equal(await page.locator('#historical-metrics > article').count(),3);assert.equal(await page.locator('#corporate-state').textContent(),'Pausado');assert.match(await page.locator('#integrity-details').textContent(),/Registros sem data de chamada4Mappings sem registro local2Recibos divergentes3/);await screenshot('admin/evidence/premium-reports.png');assert.equal(await page.locator('#report-rows tr').count(),6);
+  assert.equal(await page.locator('[data-report-days]').count(),5);
+  for(const days of [1,7,15,30]){
+    await page.locator(`[data-report-days="${days}"]`).click();await waitText('report-window',`${days} dias corridos`);await waitText('metric-calls',expected(days).total);
+    assert.equal(await page.locator('#metric-calls').textContent(),expected(days).total);
+    assert.equal(await page.locator('#metric-identified').textContent(),expected(days).identified);
+    assert.equal(await page.locator('#metric-operators').textContent(),'12','distinct operators are not a daily sum');
+    assert.equal(await page.locator('#metric-confirmed').textContent(),BigInt(days*350).toLocaleString('pt-BR'));
+    assert.equal(await page.locator('#report-chart .confirmed-bar').count(),days);
+  }
+  await screenshot('admin/evidence/enterprise-desktop.png');await page.locator('[data-view="reports"]').screenshot({path:evidenceDir+'/enterprise-panel.png'});
+  reportHoldFrom=daily.at(-15).day;reportHold=new Promise(resolve=>{releaseReport=resolve;});
+  const lateReport=page.waitForResponse(response=>response.url().includes('/api/reports?')&&response.url().includes(reportHoldFrom));
+  await page.locator('[data-report-days="15"]').click();await page.locator('[data-report-days="7"]').click();await waitText('metric-calls',expected(7).total);
+  releaseReport();reportHold=null;await (await lateReport).finished();reportHoldFrom=null;
+  assert.equal(await page.locator('#metric-calls').textContent(),expected(7).total);
+  assert.equal(await page.locator('[data-report-days="7"]').getAttribute('aria-pressed'),'true');
+  await page.locator('#report-rows [data-report-action="view"]').first().click();await page.locator('#report-day-dialog').waitFor({state:'visible'});
+  assert.match(await page.locator('#report-day-details').textContent(),/Coletadas1\.580.*Recibos confirmados350/);
+  await page.getByRole('button',{name:'Fechar',exact:true}).click();
+  const rowDownload=page.waitForEvent('download');await page.locator('#report-rows [data-report-action="export"]').first().click();const rowFile=await rowDownload;
+  const rowCsv=await readFile(await rowFile.path(),'utf8');assert.equal(rowCsv.split('\r\n').length,2);assert.match(rowCsv,/1580/);assert.doesNotMatch(rowCsv,/PRIVATE/);
+  await page.evaluate(()=>{window.__createCsv=URL.createObjectURL;URL.createObjectURL=()=>{throw new Error('synthetic export failure');};});
+  await nav('Exportar CSV');await waitText('report-status','Não foi possível gerar o CSV');await page.evaluate(()=>{URL.createObjectURL=window.__createCsv;});
+  const beforeReportHover=chartRequests();await page.locator('#report-chart [data-day-index]').last().focus();await page.locator('#report-chart-tooltip').waitFor({state:'visible'});
+  assert.match(await page.locator('#report-chart-tooltip').textContent(),/Recibos confirmados:350/);assert.equal(chartRequests(),beforeReportHover);
+  outboxAvailable=false;await nav('Atualizar');await waitText('metric-confirmed','Indisponível');
+  assert.equal(await page.locator('#report-chart .confirmed-bar').count(),0);assert.equal(await page.locator('#report-chart .chart-bar').count(),14);
+  assert.match(await page.locator('#report-observation-state').textContent(),/parcial/);outboxAvailable=true;
+  await page.locator('[data-report-days="30"]').click();await waitText('metric-calls',expected(30).total);
+  const beforeInvalid=chartRequests();await page.locator('#report-from').fill('2026-12-31');await nav('Atualizar');
+  await waitText('report-status','menor ou igual');assert.equal(chartRequests(),beforeInvalid);assert(await page.locator('#export-report').isDisabled());
+  await page.locator('[data-report-days="30"]').click();await waitText('metric-calls',expected(30).total);
+  await page.setViewportSize({width:900,height:1024});await screenshot('admin/evidence/enterprise-tablet.png');
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.setViewportSize({width:390,height:844});await screenshot('admin/evidence/enterprise-mobile.png');
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.setViewportSize({width:1440,height:1100});
+
+  await nav('Próxima');await waitText('report-page','Página 2');await nav('Próxima');assert.equal(await page.locator('#report-rows tr').count(),6);
   const download=page.waitForEvent('download');await nav('Exportar CSV');const file=await download;assert.match(file.suggestedFilename(),/^olos-chamadas-/);const csv=await readFile(await file.path(),'utf8');assert.equal(csv.split('\r\n').length,31);assert.doesNotMatch(csv,/PRIVATE/);assert.equal(writes.length,1);
-  await page.locator('#report-from').fill(range.to);await page.locator('#report-to').fill(range.to);await nav('Aplicar período');await waitText('report-page','1 dias');assert.equal(await page.locator('#report-rows tr').count(),1);
-  await page.locator('#report-from').fill(range.from);await nav('Aplicar período');await waitText('report-page','Página 1 de 3');
+  await page.locator('#report-from').fill(range.to);await page.locator('#report-to').fill(range.to);await nav('Atualizar');await waitText('report-page','1 dias');assert.equal(await page.locator('#report-rows tr').count(),1);
+  await page.locator('#report-from').fill(range.from);await nav('Atualizar');await waitText('report-page','Página 1 de 5');
   await page.emulateMedia({reducedMotion:'reduce'});assert.equal(await page.locator('#chart-body').evaluate(e=>getComputedStyle(e).transitionDuration),'0s');await page.emulateMedia({reducedMotion:'no-preference'});
   await nav('Terminal / Logs');await waitText('log-rows','fixture-read');assert.equal(await page.locator('#logs-terminal #terminal').count(),1);
   await nav('Agendamento');await page.getByLabel('Intervalo em minutos').fill('3');await nav('Salvar intervalo');await waitText('notice','Intervalo salvo');assert.deepEqual(writes.at(-1),{method:'PATCH',path:'/api/schedule',input:{interval_ms:180000},csrf:'fixture-csrf'});
@@ -244,19 +286,22 @@ try{
   await nav('Status operacional');await waitText('audit-rows','fixture-admin');await nav('Auditoria');assert.equal(await page.locator('#audit-heading').evaluate(e=>e===document.activeElement),true);await nav('Dashboard');
   await page.setViewportSize({width:390,height:844});await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=0.5);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.locator('#chart-toggle').click();await page.waitForTimeout(250);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   await nav('Abrir navegação');await nav('Relatórios');await waitText('report-page','Página 1');assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
-  reportError=true;await nav('Aplicar período');await waitText('report-status','Relatório indisponível');assert(await page.locator('#export-report').isDisabled());assert.equal(await page.locator('#report-rows tr').count(),0);
-  reportError=false;empty=true;await nav('Aplicar período');await waitText('report-page','Nenhuma chamada');assert(await page.locator('#export-report').isDisabled());empty=false;
+  reportError=true;await nav('Atualizar');await waitText('report-status','Relatório indisponível');assert(!(await page.locator('#export-report').isDisabled()));assert.equal(await page.locator('#report-rows tr').count(),6);assert.match(await page.locator('#report-observation-state').textContent(),/desatualizada/);
+  reportError=false;empty=true;await nav('Atualizar');await waitText('report-page','Nenhuma chamada');assert(await page.locator('#export-report').isDisabled());empty=false;
   // A delayed report must not restore data after logout/session expiration.
-  reportDelay=500;await nav('Aplicar período');await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});await page.waitForTimeout(600);assert.equal(await page.locator('#report-rows tr').count(),0);assert(await page.locator('#terminal').isHidden());
+  reportDelay=500;await nav('Atualizar');await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});await page.waitForTimeout(600);assert.equal(await page.locator('#report-rows tr').count(),0);assert(await page.locator('#terminal').isHidden());
   reportDelay=0;reportError=true;todayError=true;await page.locator('#login-form input[name=username]').fill('fixture');await page.locator('#login-form input[name=password]').fill('fixture');await nav('Entrar');
   await waitText('today-updated','indisponível');assert.equal(await page.locator('#today-calls').textContent(),'—');assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'false');await page.locator('#chart-toggle').click();await waitText('chart-status','Série indisponível');assert.equal(await page.locator('#chart-total').textContent(),'—');todayError=false;await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','1.291');assert.match(await page.locator('#chart-status').textContent(),/Série indisponível/);
   await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});reportError=false;empty=true;todayError=false;
   await page.locator('#login-form input[name=username]').fill('fixture');await page.locator('#login-form input[name=password]').fill('fixture');await nav('Entrar');await page.locator('#chart-toggle').click();await waitText('calls-chart','Nenhuma chamada');
   // Calendar rollover is driven by the synchronized Brasília day, not the browser timezone.
   setServerTime(Date.parse('2026-11-02T02:59:50Z'));todayCalls='25';await page.evaluate(()=>window.__statusPoll());await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','25');
-  todayDelay=350;todayCalls='2';setServerTime(Date.parse('2026-11-02T03:00:00Z'));
+  todayHold=new Promise(resolve=>{releaseToday=resolve;});todayCalls='2';setServerTime(Date.parse('2026-11-02T03:00:00Z'));
   await page.evaluate(()=>window.__statusPoll());await waitText('today-updated','Novo dia');assert.equal(await page.locator('#today-calls').textContent(),'—');
-  await waitText('today-calls','2');todayDelay=0;
+  releaseToday();todayHold=null;await waitText('today-calls','2');todayDelay=0;
+  empty=false;await nav('Abrir navegação');await nav('Relatórios');await page.locator('[data-report-days="1"]').click();await waitText('report-window','02/11/2026 — 02/11/2026');
+  setServerTime(Date.parse('2026-11-03T03:00:00Z'));await page.evaluate(()=>window.__statusPoll());await waitText('report-window','03/11/2026 — 03/11/2026');await waitText('metric-calls',BigInt(daily.find(row=>row.day==='2026-11-03').calls).toLocaleString('pt-BR'));
+  await nav('Abrir navegação');await nav('Dashboard');
   // A delayed daily response cannot repopulate the next session or a logged-out view.
   todayDelay=500;await page.evaluate(()=>window.__reportPoll());await nav('Abrir navegação');await nav('Sair');await page.waitForTimeout(650);
   assert.equal(await page.locator('#today-calls').textContent(),'—');assert.equal(await page.locator('#countdown').textContent(),'—');

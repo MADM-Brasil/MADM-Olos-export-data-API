@@ -88,7 +88,7 @@ export function chartCompact(value) {
   }
   return count(value);
 }
-export function chartModel(rows, from, to) {
+export function chartModel(rows, from, to, corporate = false) {
   const validDay=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString().slice(0,10)===value;
   if(!validDay(from)||!validDay(to)||from>to||!Array.isArray(rows))throw new Error('CHART_DATA_INVALID');
   const byDay=new Map();
@@ -97,12 +97,14 @@ export function chartModel(rows, from, to) {
       !['calls','identified_calls'].every(key=>typeof row[key]==='string'&&/^\d+$/.test(row[key])))throw new Error('CHART_DATA_INVALID');
     const calls=BigInt(row.calls),identified=BigInt(row.identified_calls);
     if(identified>calls)throw new Error('CHART_DATA_INVALID');
-    byDay.set(row.day,{day:row.day,calls,identified});
+    const confirmed=corporate&&typeof row.confirmed==='string'&&/^\d+$/.test(row.confirmed)?BigInt(row.confirmed):null;
+    if(corporate&&(confirmed===null||confirmed>calls))throw new Error('CHART_DATA_INVALID');
+    byDay.set(row.day,{day:row.day,calls,identified,confirmed});
   }
   const series=[],cursor=new Date(`${from}T12:00:00Z`);
   while(cursor.toISOString().slice(0,10)<=to){
     if(series.length>=366)throw new Error('CHART_PERIOD_INVALID');
-    const day=cursor.toISOString().slice(0,10);series.push(byDay.get(day)||{day,calls:0n,identified:0n});cursor.setUTCDate(cursor.getUTCDate()+1);
+    const day=cursor.toISOString().slice(0,10);series.push(byDay.get(day)||{day,calls:0n,identified:0n,confirmed:corporate?0n:null});cursor.setUTCDate(cursor.getUTCDate()+1);
   }
   let total=0n,identified=0n,peak=null;
   for(const row of series){total+=row.calls;identified+=row.identified;if(row.calls>0n&&(!peak||row.calls>peak.calls))peak=row;}
@@ -115,9 +117,9 @@ export function chartModel(rows, from, to) {
 const chartRenders=new WeakMap();
 const weekDay=day=>new Intl.DateTimeFormat('pt-BR',{timeZone:zone,weekday:'short'}).format(new Date(`${day}T15:00:00Z`)).replace('.','').replace(/^./,c=>c.toUpperCase());
 export function renderChart(root, rows, from, to, options = {}) {
-  const model=options.model||chartModel(rows,from,to),today=options.today||defaultRange().to;
-  const width=Math.max(360,root.clientWidth||960,model.series.length*42+72),height=360,left=60,right=16,top=36,bottom=306;
-  const signature=JSON.stringify([rows,from,to,width,today]);
+  const model=options.model||chartModel(rows,from,to,options.corporate),today=options.today||defaultRange().to;
+  const width=Math.max(360,root.clientWidth||960,model.series.length*42+72),height=options.height||360,left=60,right=16,top=36,bottom=height-54;
+  const signature=JSON.stringify([model.series.map(row=>[row.day,String(row.calls),String(row.identified),options.corporate?String(row.confirmed):null]),from,to,width,height,today,!!options.corporate]);
   const previous=chartRenders.get(root);
   if(previous?.signature===signature&&root.querySelector('svg')){previous.observedAt=options.observedAt;return;}
   root.replaceChildren();
@@ -125,24 +127,25 @@ export function renderChart(root, rows, from, to, options = {}) {
   const state={signature,observedAt:options.observedAt};chartRenders.set(root,state);
   const scroll=document.createElement('div');scroll.className='chart-scroll';scroll.tabIndex=0;scroll.setAttribute('aria-label','Gráfico diário; use as setas para rolar quando necessário');
   const svg=svgNode('svg',{viewBox:`0 0 ${width} ${height}`,width,height,role:'group','aria-label':`Chamadas por data da ligação: ${dayLabel(from)} a ${dayLabel(to)}. Cada dia pode ser focado para consultar os valores.`});
-  svg.style.width=`${width}px`;
+  svg.style.width=`${width}px`;svg.style.height=`${height}px`;
   const ratio=value=>Number(value*1000000n/model.scale)/1000000;
   const ticks=Number(model.scale/model.step);
   for(let i=0;i<=ticks;i++){
     const value=model.step*BigInt(i),y=bottom-(bottom-top)*i/ticks;
     svg.append(svgNode('line',{x1:left,y1:y,x2:width-right,y2:y,class:'grid-line'}),svgNode('text',{x:left-12,y:y+4,'text-anchor':'end',class:'axis-label'},chartCompact(value)));
   }
-  const step=(width-left-right)/model.series.length,w=Math.min(28,step*.28),gap=Math.min(5,step*.06);
+  const step=(width-left-right)/model.series.length,w=Math.min(28,step*(options.corporate ? .22 : .28)),gap=Math.min(5,step*.06);
   model.series.forEach((row,index)=>{
     const center=left+step*(index+.5),current=row.day===today;
-    const group=svgNode('g',{'data-day-index':index,tabindex:0,role:'button','aria-describedby':'chart-tooltip','aria-label':`${dayLabel(row.day)}${current?' · Hoje, em andamento':''} · Coletadas ${count(row.calls)} · Identificadas ${count(row.identified)} (${chartPercent(row.identified,row.calls)})`,class:current?'day-group current-day':'day-group'});
+    const group=svgNode('g',{'data-day-index':index,tabindex:0,role:'button','aria-describedby':root.id==='calls-chart'?'chart-tooltip':root.id+'-tooltip','aria-label':`${dayLabel(row.day)}${current?' · Hoje, em andamento':''} · Coletadas ${count(row.calls)} · Identificadas ${count(row.identified)} (${chartPercent(row.identified,row.calls)})${options.corporate?' · Recibos confirmados '+count(row.confirmed):''}`,class:current?'day-group current-day':'day-group'});
     if(current)group.append(svgNode('rect',{x:center-step*.44,y:top,width:step*.88,height:bottom-top,class:'today-band',rx:8}));
     group.append(svgNode('rect',{x:center-step*.48,y:top,width:step*.96,height:height-top,fill:'transparent',class:'day-target'}));
-    for(const [value,css,x] of [[row.calls,'calls-bar',center-gap/2-w],[row.identified,'operators-bar',center+gap/2]]){
+    const bars=options.corporate?[[row.calls,'calls-bar',center-w*1.5-gap],[row.confirmed,'confirmed-bar',center-w/2],[row.identified,'operators-bar',center+w/2+gap]]:[[row.calls,'calls-bar',center-gap/2-w],[row.identified,'operators-bar',center+gap/2]];
+    for(const [value,css,x] of bars){
       const h=ratio(value)*(bottom-top),y=bottom-h,r=Math.min(4,w/2,h/2);
       group.append(svgNode('path',{d:`M ${x} ${bottom} V ${y+r} Q ${x} ${y} ${x+r} ${y} H ${x+w-r} Q ${x+w} ${y} ${x+w} ${y+r} V ${bottom} Z`,class:`${css} chart-bar`,'data-value':value.toString(),'transform-origin':`0 ${bottom}`}));
     }
-    group.append(svgNode('text',{x:center,y:330,'text-anchor':'middle',class:'day-date'},dayLabel(row.day).slice(0,5)),svgNode('text',{x:center,y:348,'text-anchor':'middle',class:'day-week'},current?'Hoje':weekDay(row.day)));
+    group.append(svgNode('text',{x:center,y:height-30,'text-anchor':'middle',class:'day-date'},dayLabel(row.day).slice(0,5)),svgNode('text',{x:center,y:height-12,'text-anchor':'middle',class:'day-week'},current?'Hoje':weekDay(row.day)));
     if(row===model.peak){
       const y=bottom-ratio(row.calls)*(bottom-top),labelX=Math.max(left+48,Math.min(width-right-48,center));
       group.append(svgNode('circle',{cx:center,cy:y-9,r:2.5,class:'peak-dot'}),svgNode('text',{x:labelX,y:y-18,'text-anchor':'middle',class:'peak-label'},`PICO ${chartCompact(row.calls)}`));
@@ -150,7 +153,7 @@ export function renderChart(root, rows, from, to, options = {}) {
     svg.append(group);
   });
   scroll.append(svg);root.append(scroll);
-  const tooltip=document.createElement('div');tooltip.id='chart-tooltip';tooltip.className='chart-tooltip';tooltip.setAttribute('role','tooltip');tooltip.hidden=true;root.append(tooltip);
+  const tooltip=document.createElement('div');tooltip.id=root.id==='calls-chart'?'chart-tooltip':root.id+'-tooltip';tooltip.className='chart-tooltip';tooltip.setAttribute('role','tooltip');tooltip.hidden=true;root.append(tooltip);
   let tooltipKey='';
   const hide=()=>{tooltip.hidden=true;};
   const show=(group,clientX,clientY)=>{
@@ -159,7 +162,7 @@ export function renderChart(root, rows, from, to, options = {}) {
     if(tooltipKey!==key){
     tooltipKey=key;tooltip.replaceChildren();
     const heading=document.createElement('strong');heading.textContent=`${dayLabel(row.day)} · ${current?'Hoje · em andamento':weekDay(row.day)}`;tooltip.append(heading);
-    for(const [label,value] of [['Coletadas',count(row.calls)],['Identificadas',`${count(row.identified)} (${chartPercent(row.identified,row.calls)})`]]){
+    for(const [label,value] of [['Coletadas',count(row.calls)],['Identificadas',`${count(row.identified)} (${chartPercent(row.identified,row.calls)})`],...(options.corporate?[['Recibos confirmados',count(row.confirmed)]]:[])]){
       const line=document.createElement('div'),name=document.createElement('span'),amount=document.createElement('b');name.textContent=label+':';amount.textContent=value;line.append(name,amount);tooltip.append(line);
     }
     if(Number.isFinite(Date.parse(state.observedAt))){const meta=document.createElement('small');meta.textContent=`Snapshot: ${date(state.observedAt)} · Brasília`;tooltip.append(meta);}
@@ -185,8 +188,10 @@ export function renderDashboardChart(root, snapshot, draw = renderChart, options
   try { draw(root, snapshot.daily, snapshot.from, snapshot.to, {...options,observedAt:snapshot.observed_at}); }
   catch { root.textContent = 'Não foi possível desenhar o gráfico. Os indicadores permanecem válidos; consulte a série diária em Relatórios.'; }
 }
-export function renderDashboardMetrics(element, r) {
-  for (const [id,value] of [['calls',r.summary.calls],['identified',r.summary.identified_calls],['confirmed',r.summary.confirmed],['pending',r.summary.pending],['errors',r.failed_reads]]) element('metric-'+id).textContent=count(value);
+export function renderDashboardMetrics(element, r, selected = false) {
+  const totals=selected?r.period:r.summary;
+  if(selected)element('metric-operators').textContent=count(totals.operators);
+  for (const [id,value] of [['calls',totals.calls],['identified',totals.identified_calls],['confirmed',totals.confirmed],['pending',totals.pending],['errors',r.failed_reads]]) element('metric-'+id).textContent=count(value);
   element('metrics-observed').textContent=`Snapshot local · ${date(r.observed_at)} · intervalo de atualização: ${r.cache_seconds ?? 300} s`;
   const gaps=[];
   if(r.summary.undated!=='0')gaps.push(`${count(r.summary.undated)} registros sem data de chamada; fora do gráfico`);
@@ -236,4 +241,37 @@ export function renderTerminal(root, entries, search, level, autoscroll = true) 
     root.scrollTop=retained?root.scrollTop+retained.getBoundingClientRect().top-top-offset:scroll;
   }
   return {visible:visible.length,total:entries.length};
+}
+
+export function reportWindow(from,to){
+  const valid=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString().slice(0,10)===value;
+  if(!valid(from)||!valid(to)||from>to)throw new Error('Selecione datas existentes e início menor ou igual ao fim.');
+  const days=(Date.parse(to)-Date.parse(from))/86400000+1;
+  if(days>366)throw new Error('O período máximo é de 366 dias corridos.');
+  return {from,to,days};
+}
+export function reportQuickRange(days,now=new Date()){
+  if(![1,7,15,30].includes(days))throw new Error('Período não suportado.');
+  const {to}=defaultRange(now),start=new Date(`${to}T12:00:00Z`);start.setUTCDate(start.getUTCDate()-days+1);
+  return {from:start.toISOString().slice(0,10),to};
+}
+// Verify the same daily/period universe before marking an observation valid.
+export function reportModel(snapshot){
+  reportWindow(snapshot?.from,snapshot?.to);
+  if(!Number.isFinite(Date.parse(snapshot.observed_at))||typeof snapshot.outbox_available!=='boolean')throw new Error('Snapshot inválido.');
+  const integer=value=>typeof value==='string'&&/^\d+$/.test(value);
+  const corporate=['confirmed','pending','not_queued','inconsistent'];
+  for(const part of [snapshot.summary,snapshot.period,...snapshot.daily]){
+    for(const field of ['calls','identified_calls','operators',...corporate]){
+      if(corporate.includes(field)&&!snapshot.outbox_available){if(part?.[field]!==null)throw new Error('Métrica corporativa sem fonte.');}
+      else if(!integer(part?.[field]))throw new Error('Contagem inválida.');
+    }
+    if(BigInt(part.identified_calls)>BigInt(part.calls)||BigInt(part.operators)>BigInt(part.identified_calls))throw new Error('Identificação inconsistente.');
+  }
+  if(!['undated','missing_mapping'].every(field=>integer(snapshot.summary[field]))||!integer(snapshot.failed_reads))throw new Error('Integridade indisponível.');
+  const model=chartModel(snapshot.daily,snapshot.from,snapshot.to,snapshot.outbox_available);
+  for(const field of ['calls','identified_calls',...(snapshot.outbox_available?corporate:[])]){
+    if(snapshot.daily.reduce((n,row)=>n+BigInt(row[field]),0n)!==BigInt(snapshot.period[field]))throw new Error('Período diverge da série diária.');
+  }
+  return model;
 }

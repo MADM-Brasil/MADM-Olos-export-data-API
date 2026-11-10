@@ -82,3 +82,27 @@ test('analytic scale is dynamic and counts are never inferred from malformed dat
   assert.throws(()=>chartModel([], '2026-02-30','2026-03-01'));
   const empty=chartModel([],'2026-11-01','2026-11-07');assert.equal(empty.empty,true);assert.equal(empty.total,0n);assert.equal(empty.peak,null);
 });
+
+test('report filters validate real calendars and include the 15-day preset',async()=>{
+  const {reportWindow,reportQuickRange}=await import('../admin/public/ui.js');
+  assert.deepEqual(reportQuickRange(15,new Date('2026-11-01T02:59:59Z')),{from:'2026-10-17',to:'2026-10-31'});
+  assert.equal(reportWindow('2024-01-01','2024-12-31').days,366);
+  for(const pair of [['2026-02-29','2026-03-01'],['2026-10-02','2026-10-01'],['2025-01-01','2026-01-02'],['','2026-01-01']])assert.throws(()=>reportWindow(...pair));
+});
+test('report observation uses period totals and rejects mismatched or unavailable receipt values',async()=>{
+  const {reportModel}=await import('../admin/public/ui.js');
+  const totals={calls:'9007199254740993',identified_calls:'9007199254740992',operators:'1',confirmed:'1',pending:'9007199254740992',not_queued:'0',inconsistent:'0'};
+  const r={from:'2026-11-01',to:'2026-11-01',observed_at:'2026-11-01T12:00:00Z',outbox_available:true,failed_reads:'2',period:{...totals},summary:{...totals,undated:'3',missing_mapping:'1'},daily:[{day:'2026-11-01',...totals}]};
+  assert.equal(reportModel(r).total,9007199254740993n);assert.equal(reportModel(r).series[0].confirmed,1n);
+  assert.throws(()=>reportModel({...r,period:{...totals,calls:'1'}}));assert.throws(()=>reportModel({...r,observed_at:'bad'}));
+  const noOutbox={...r,outbox_available:false,summary:{...r.summary},period:{...r.period},daily:r.daily.map(row=>({...row}))};
+  for(const part of [noOutbox.summary,noOutbox.period,...noOutbox.daily])for(const key of ['confirmed','pending','not_queued','inconsistent'])part[key]=null;
+  assert.equal(reportModel(noOutbox).series[0].confirmed,null);
+  noOutbox.period.confirmed='0';assert.throws(()=>reportModel(noOutbox));
+});
+test('CSV remains exact for empty, one-day and 366-day snapshots without sensitive fields',()=>{
+  assert.equal(reportCsv([]).split('\r\n').length,1);
+  const rows=Array.from({length:366},(_,i)=>({day:new Date(Date.UTC(2024,0,i+1)).toISOString().slice(0,10),calls:'9007199254740993',identified_calls:'1',operators:'1',confirmed:null,pending:null,not_queued:null,inconsistent:null,with_cpf:'0',with_email:'0',payload:'PRIVATE'}));
+  const csv=reportCsv(rows);assert.equal(csv.split('\r\n').length,367);assert.match(csv,/9007199254740993/);assert.match(csv,/Indisponível/);assert.doesNotMatch(csv,/PRIVATE/);
+  assert.equal(reportCsv(rows.slice(0,1)).split('\r\n').length,2);
+});

@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS olos_http.corporate_outbox (
   source_hash text NOT NULL,
   payload jsonb NOT NULL,
   payload_hash text NOT NULL CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
-  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','confirmed')),
+  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','confirmed','skipped')),
   origin text NOT NULL CHECK (origin IN ('capture','legacy_receipt','legacy_backlog')),
   remote_raw_id bigint,
   confirmed_at timestamptz,
