@@ -1,0 +1,229 @@
+[
+  {
+    "QUERY PLAN": [
+      {
+        "Plan": {
+          "Node Type": "Sort",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 1107283.07,
+          "Total Cost": 1107283.57,
+          "Plan Rows": 200,
+          "Plan Width": 388,
+          "Sort Key": [
+            "(((((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date))::text)"
+          ],
+          "Plans": [
+            {
+              "Node Type": "Aggregate",
+              "Strategy": "Sorted",
+              "Partial Mode": "Simple",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Startup Cost": 606134.13,
+              "Total Cost": 1107275.42,
+              "Plan Rows": 200,
+              "Plan Width": 388,
+              "Group Key": [
+                "(((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date)"
+              ],
+              "Plans": [
+                {
+                  "Node Type": "Nested Loop",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Join Type": "Inner",
+                  "Startup Cost": 606134.13,
+                  "Total Cost": 1017257.24,
+                  "Plan Rows": 1999993,
+                  "Plan Width": 80,
+                  "Inner Unique": false,
+                  "Plans": [
+                    {
+                      "Node Type": "Aggregate",
+                      "Strategy": "Sorted",
+                      "Partial Mode": "Finalize",
+                      "Parent Relationship": "Outer",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Startup Cost": 606134.13,
+                      "Total Cost": 947257.48,
+                      "Plan Rows": 1999993,
+                      "Plan Width": 111,
+                      "Group Key": [
+                        "(((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date)",
+                        "r.agent_id",
+                        "(btrim(d.nome_agente, '\t\n\u000b\f\r                  　﻿'::text))",
+                        "(CASE WHEN (o.source_id IS NULL) THEN 'not_queued'::text WHEN ((o.target_id <> r.target_id) OR (o.source_hash <> r.source_hash)) THEN 'inconsistent'::text WHEN ((o.state = 'confirmed'::text) AND (o.remote_raw_id IS NOT NULL) AND (o.confirmed_at IS NOT NULL)) THEN 'confirmed'::text WHEN ((o.state = 'pending'::text) AND (o.remote_raw_id IS NULL) AND (o.confirmed_at IS NULL)) THEN 'pending'::text ELSE 'inconsistent'::text END)"
+                      ],
+                      "Plans": [
+                        {
+                          "Node Type": "Gather Merge",
+                          "Parent Relationship": "Outer",
+                          "Parallel Aware": false,
+                          "Async Capable": false,
+                          "Startup Cost": 606134.13,
+                          "Total Cost": 854757.83,
+                          "Plan Rows": 1666660,
+                          "Plan Width": 111,
+                          "Workers Planned": 2,
+                          "Plans": [
+                            {
+                              "Node Type": "Aggregate",
+                              "Strategy": "Sorted",
+                              "Partial Mode": "Partial",
+                              "Parent Relationship": "Outer",
+                              "Parallel Aware": false,
+                              "Async Capable": false,
+                              "Startup Cost": 605134.11,
+                              "Total Cost": 661383.88,
+                              "Plan Rows": 833330,
+                              "Plan Width": 111,
+                              "Group Key": [
+                                "(((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date)",
+                                "r.agent_id",
+                                "(btrim(d.nome_agente, '\t\n\u000b\f\r                  　﻿'::text))",
+                                "(CASE WHEN (o.source_id IS NULL) THEN 'not_queued'::text WHEN ((o.target_id <> r.target_id) OR (o.source_hash <> r.source_hash)) THEN 'inconsistent'::text WHEN ((o.state = 'confirmed'::text) AND (o.remote_raw_id IS NOT NULL) AND (o.confirmed_at IS NOT NULL)) THEN 'confirmed'::text WHEN ((o.state = 'pending'::text) AND (o.remote_raw_id IS NULL) AND (o.confirmed_at IS NULL)) THEN 'pending'::text ELSE 'inconsistent'::text END)"
+                              ],
+                              "Plans": [
+                                {
+                                  "Node Type": "Sort",
+                                  "Parent Relationship": "Outer",
+                                  "Parallel Aware": false,
+                                  "Async Capable": false,
+                                  "Startup Cost": 605134.11,
+                                  "Total Cost": 607217.43,
+                                  "Plan Rows": 833330,
+                                  "Plan Width": 123,
+                                  "Sort Key": [
+                                    "(((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date)",
+                                    "r.agent_id",
+                                    "(btrim(d.nome_agente, '\t\n\u000b\f\r                  　﻿'::text))",
+                                    "(CASE WHEN (o.source_id IS NULL) THEN 'not_queued'::text WHEN ((o.target_id <> r.target_id) OR (o.source_hash <> r.source_hash)) THEN 'inconsistent'::text WHEN ((o.state = 'confirmed'::text) AND (o.remote_raw_id IS NOT NULL) AND (o.confirmed_at IS NOT NULL)) THEN 'confirmed'::text WHEN ((o.state = 'pending'::text) AND (o.remote_raw_id IS NULL) AND (o.confirmed_at IS NULL)) THEN 'pending'::text ELSE 'inconsistent'::text END)"
+                                  ],
+                                  "Plans": [
+                                    {
+                                      "Node Type": "Hash Join",
+                                      "Parent Relationship": "Outer",
+                                      "Parallel Aware": true,
+                                      "Async Capable": false,
+                                      "Join Type": "Left",
+                                      "Startup Cost": 264487.02,
+                                      "Total Cost": 414941.23,
+                                      "Plan Rows": 833330,
+                                      "Plan Width": 123,
+                                      "Inner Unique": true,
+                                      "Hash Cond": "(r.source_id = o.source_id)",
+                                      "Plans": [
+                                        {
+                                          "Node Type": "Hash Join",
+                                          "Parent Relationship": "Outer",
+                                          "Parallel Aware": true,
+                                          "Async Capable": false,
+                                          "Join Type": "Left",
+                                          "Startup Cost": 40343.07,
+                                          "Total Cost": 121747.51,
+                                          "Plan Rows": 833330,
+                                          "Plan Width": 166,
+                                          "Inner Unique": true,
+                                          "Hash Cond": "(r.target_id = d.internal_id_olos)",
+                                          "Plans": [
+                                            {
+                                              "Node Type": "Seq Scan",
+                                              "Parent Relationship": "Outer",
+                                              "Parallel Aware": true,
+                                              "Async Capable": false,
+                                              "Relation Name": "records",
+                                              "Alias": "r",
+                                              "Startup Cost": 0,
+                                              "Total Cost": 50961.96,
+                                              "Plan Rows": 833330,
+                                              "Plan Width": 96,
+                                              "Filter": "((source_key = 'perf'::text) AND (target_table = '\"raw\".\"olos_calls\"'::text))"
+                                            },
+                                            {
+                                              "Node Type": "Hash",
+                                              "Parent Relationship": "Inner",
+                                              "Parallel Aware": true,
+                                              "Async Capable": false,
+                                              "Startup Cost": 32405.92,
+                                              "Total Cost": 32405.92,
+                                              "Plan Rows": 327692,
+                                              "Plan Width": 70,
+                                              "Plans": [
+                                                {
+                                                  "Node Type": "Seq Scan",
+                                                  "Parent Relationship": "Outer",
+                                                  "Parallel Aware": true,
+                                                  "Async Capable": false,
+                                                  "Relation Name": "olos_calls",
+                                                  "Alias": "d",
+                                                  "Startup Cost": 0,
+                                                  "Total Cost": 32405.92,
+                                                  "Plan Rows": 327692,
+                                                  "Plan Width": 70
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "Node Type": "Hash",
+                                          "Parent Relationship": "Inner",
+                                          "Parallel Aware": true,
+                                          "Async Capable": false,
+                                          "Startup Cost": 200979.48,
+                                          "Total Cost": 200979.48,
+                                          "Plan Rows": 795958,
+                                          "Plan Width": 105,
+                                          "Plans": [
+                                            {
+                                              "Node Type": "Seq Scan",
+                                              "Parent Relationship": "Outer",
+                                              "Parallel Aware": true,
+                                              "Async Capable": false,
+                                              "Relation Name": "corporate_outbox",
+                                              "Alias": "o",
+                                              "Startup Cost": 0,
+                                              "Total Cost": 200979.48,
+                                              "Plan Rows": 795958,
+                                              "Plan Width": 105,
+                                              "Filter": "(source_key = 'perf'::text)"
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Node Type": "Result",
+                      "Parent Relationship": "Inner",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Startup Cost": 0,
+                      "Total Cost": 0.01,
+                      "Plan Rows": 1,
+                      "Plan Width": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "Settings": {
+          "jit": "off"
+        }
+      }
+    ]
+  }
+]

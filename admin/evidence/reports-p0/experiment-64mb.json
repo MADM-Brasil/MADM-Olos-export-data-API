@@ -1,0 +1,64 @@
+{
+  "synthetic": true,
+  "counts": {
+    "records": "2000000",
+    "outbox": "1910290",
+    "destination": "786460"
+  },
+  "environment": {
+    "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg12+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+    "work_mem": "4MB",
+    "shared_buffers": "128MB",
+    "parallel_workers": "2",
+    "database_bytes": "2497018903"
+  },
+  "cold_definition": "PostgreSQL restarted; host OS cache is not dropped",
+  "statement_timeout_ms": 5000,
+  "diagnostic_timeout_ms": 60000,
+  "required_margin_ms": 1000,
+  "measurements": [
+    {
+      "name": "cold-shared-buffers-1",
+      "ms": 5067,
+      "error": "REPORT_TIMEOUT"
+    },
+    {
+      "name": "warm-database-empty-app-cache-1",
+      "ms": 5063,
+      "error": "REPORT_TIMEOUT"
+    },
+    {
+      "name": "cold-shared-buffers-2",
+      "ms": 4817,
+      "error": null
+    },
+    {
+      "name": "warm-database-empty-app-cache-2",
+      "ms": 4880,
+      "error": null
+    },
+    {
+      "name": "cold-shared-buffers-3",
+      "ms": 4932,
+      "error": null
+    },
+    {
+      "name": "warm-database-empty-app-cache-3",
+      "ms": 4962,
+      "error": null
+    },
+    {
+      "name": "warm-application-cache-five-ranges",
+      "ms": 61,
+      "error": null
+    },
+    {
+      "name": "concurrent-uncommitted-receipt-write",
+      "ms": 5122,
+      "error": "REPORT_TIMEOUT"
+    }
+  ],
+  "experimental_query_work_mem": "64MB",
+  "variant": "two-level-name-projection-json",
+  "adopted": false
+}

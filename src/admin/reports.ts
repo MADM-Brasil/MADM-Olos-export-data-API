@@ -1,155 +1,107 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { DateTime } from 'luxon';
 import { WorkerError } from '../errors.js';
 import { quote } from '../schema.js';
-
-export const reportZone = 'America/Sao_Paulo';
-// Display-only policy. Keep parity with positive canonical AgentId + identified name;
-// this module neither admits delivery nor rewrites mapped values.
-export const reportWhitespace = '\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff';
-export const reportPlaceholder = '^([0-9]+|-1|null|undefined|n/a|unknown|desconhecido|sem operador|sem agente|não identificado|nao identificado)$';
-export function reportRange(from: unknown, to: unknown) {
-  const parse = (value: unknown) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
-    ? DateTime.fromISO(value, { zone: reportZone }) : DateTime.invalid('date');
-  const start = parse(from), end = parse(to);
-  if (!start.isValid || !end.isValid || end < start || end.diff(start, 'days').days >= 366) throw new WorkerError('REPORT_PERIOD_INVALID');
-  return { from: start.toISODate()!, to: end.toISODate()! };
-}
-
-// Counts stay decimal strings at the API boundary. Never round through Number.
-const countFields = ['calls', 'identified_calls', 'with_cpf', 'with_email',
-  'confirmed', 'pending', 'not_queued', 'inconsistent', 'missing_mapping'] as const;
-type CountField = typeof countFields[number];
-type Day = Record<CountField, string> & { day: string | null; operator_ids: string[] | null; collected_today: string };
-type Snapshot = { days: Day[]; failed_reads: string; observed_at: Date; outbox_available: boolean; collection_date: string };
-export const reportCacheSeconds = 300;
+import { reportCacheSeconds, reportMaxAgeSeconds, reportContractVersion, reportZone, reportPayloadLimit, reportContract,
+  totalReport, validateReportData, reportDataHash, validReportMetadata, reportValidationKey, type ReportData } from './report-snapshot.js';
+export { reportWhitespace, reportPlaceholder, reportCacheSeconds, reportZone } from './report-snapshot.js';
 export const reportStatementTimeoutMs = 5_000;
-
-// Full, read-only snapshots: late mappings, old receipts and backfilled calls can all
-// change. A created_at watermark or additive daily counter would silently miss them.
+export const reportReadCacheMs = 1_000;
+export const reportReadWallTimeoutMs = 5_000;
+export function reportRange(from:unknown,to:unknown) {
+  const parse=(value:unknown)=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)?DateTime.fromISO(value,{zone:reportZone}):DateTime.invalid('date');
+  const start=parse(from),end=parse(to);
+  if(!start.isValid||!end.isValid||end<start||end.diff(start,'days').days>=366)throw new WorkerError('REPORT_PERIOD_INVALID');
+  return {from:start.toISODate()!,to:end.toISODate()!};
+}
+interface Published {data:ReportData;id:string;published_at:string;checked_at:number;loaded_at:number;age:number;refresh_state:string;last_refresh_error:string|null;next_refresh_at:string|null;data_hash:string;validation_key:string}
+interface StoredRow {
+  id:string|null;published_id:string|null;contract_version:number|null;contract_name:string|null;timezone:string|null;data:unknown;
+  observed_at:Date|null;published_at:Date|null;collection_date:string|null;data_hash:string|null;
+  checked_at:Date;incompatible:boolean;payload_bytes:number;validation:unknown;refresh_status:string;last_error:string|null;next_attempt_at:Date|null;
+}
+// HTTP only reads a published key. It has no historical query or refresh fallback.
 export class AdminReports {
-  private cached: { at: number; value: Snapshot } | undefined;
-  private pending: Promise<Snapshot> | undefined;
-  private failure: { at: number; day: string; error: unknown } | undefined;
-  constructor(private readonly pool: Pool, private readonly source: string,
-    private readonly destination: { schema: string; table: string },
-    private readonly now: () => number = () => performance.now(),
-    private readonly calendarDay: () => string = () => DateTime.now().setZone(reportZone).toISODate()!) {}
-
-  async read(from: unknown, to: unknown): Promise<unknown> {
-    const range = reportRange(from, to);
-    const snapshot = await this.snapshot();
-    const daily = snapshot.days.filter(d => d.day !== null && d.day >= range.from && d.day <= range.to);
-    const summary = this.total(snapshot.days, snapshot.outbox_available);
-    return { summary: { ...summary,
-        undated: snapshot.days.find(d => d.day === null)?.calls ?? '0',
-        missing_mapping: this.sum(snapshot.days, 'missing_mapping') },
-      period: this.total(daily, snapshot.outbox_available),
-      daily: daily.map(d => ({ day: d.day, ...this.total([d], snapshot.outbox_available) })),
-      failed_reads: snapshot.failed_reads, observed_at: snapshot.observed_at,
-      ...range, timezone: reportZone, outbox_available: snapshot.outbox_available,
-      confirmation_source: 'local_outbox_receipts', cache_seconds: reportCacheSeconds };
+  private cached:Published|undefined;
+  private pending:Promise<Published>|undefined;
+  private failure:{at:number;error:unknown}|undefined;
+  constructor(private readonly pool:Pool,private readonly source:string,
+    private readonly destination:{schema:string;table:string},private readonly now:()=>number=()=>performance.now()) {}
+  async read(from:unknown,to:unknown):Promise<unknown> {
+    const range=reportRange(from,to),s=await this.snapshot();
+    const daily=s.data.days.filter(d=>d.day!==null&&d.day>=range.from&&d.day<=range.to);
+    return {summary:{...s.data.summary},period:totalReport(daily,s.data.outbox_available),
+      daily:daily.map(d=>({day:d.day,...totalReport([d],s.data.outbox_available)})),failed_reads:s.data.failed_reads,
+      observed_at:s.data.observed_at,...range,timezone:reportZone,outbox_available:s.data.outbox_available,
+      confirmation_source:'local_outbox_receipts',cache_seconds:reportCacheSeconds,...this.metadata(s)};
   }
   async today() {
-    const snapshot = await this.snapshot();
-    return { date: snapshot.collection_date,
-      calls: snapshot.days.reduce((n, day) => n + BigInt(day.collected_today), 0n).toString(),
-      observed_at: snapshot.observed_at, timezone: reportZone, cache_seconds: reportCacheSeconds,
-      time_basis: 'first_local_persistence', identity: 'source_key/source_id' };
+    const s=await this.snapshot();
+    if(s.data.collection_date!==this.databaseDay(s))throw new WorkerError('REPORT_SNAPSHOT_STALE');
+    return {date:s.data.collection_date,calls:s.data.today_calls,observed_at:s.data.observed_at,timezone:reportZone,
+      cache_seconds:reportCacheSeconds,time_basis:'first_local_persistence',identity:'source_key/source_id',...this.metadata(s)};
   }
-  private sum(days: Day[], field: CountField) {
-    return days.reduce((n, day) => n + BigInt(day[field]), 0n).toString();
+  private age(s:Published) {return s.age+Math.max(0,this.now()-s.loaded_at)/1000;}
+  private databaseDay(s:Published) {return DateTime.fromMillis(s.checked_at+Math.max(0,this.now()-s.loaded_at)).setZone(reportZone).toISODate();}
+  private metadata(s:Published) {
+    const age=this.age(s);
+    return {snapshot_id:s.id,snapshot_contract_version:reportContractVersion,published_at:s.published_at,
+      snapshot_state:age>reportCacheSeconds||s.data.collection_date!==this.databaseDay(s)?'STALE':'READY',snapshot_age_seconds:Math.max(0,Math.floor(age)),refresh_state:s.refresh_state,last_refresh_error:s.last_refresh_error,next_refresh_at:s.next_refresh_at};
   }
-  private total(days: Day[], outbox: boolean) {
-    const counts = Object.fromEntries(countFields.filter(f => f !== 'missing_mapping')
-      .map(f => [f, !outbox && ['confirmed', 'pending', 'not_queued', 'inconsistent'].includes(f) ? null : this.sum(days, f)]));
-    // Operators are a union, NEVER the sum of per-day distinct counts. IDs remain
-    // private to this repository snapshot and are not exposed by the HTTP API.
-    const operators = new Set<string>();
-    for (const day of days) for (const id of day.operator_ids ?? []) operators.add(id);
-    return { ...counts, operators: String(operators.size) };
+  private fresh(s:Published) {
+    if(this.age(s)>reportMaxAgeSeconds)throw new WorkerError('REPORT_SNAPSHOT_STALE');
+    return s;
   }
-  private snapshot(): Promise<Snapshot> {
-    if (this.cached && this.cached.value.collection_date === this.calendarDay() && this.now() - this.cached.at < reportCacheSeconds * 1000) return Promise.resolve(this.cached.value);
-    if (this.pending) return this.pending;
-    if (this.failure && this.failure.day === this.calendarDay() && this.now() - this.failure.at < reportCacheSeconds * 1000) return Promise.reject(this.failure.error);
-    this.pending = this.query().then(value => {
-      this.cached = { at: this.now(), value }; this.failure = undefined; return value;
-    }, error => {
-      // No stale snapshot masquerading as current, and no retry storm every 30s.
-      this.failure = { at: this.now(), day: this.calendarDay(), error }; throw error;
-    }).finally(() => { this.pending = undefined; });
-    return this.pending;
+  private async snapshot():Promise<Published> {
+    if(this.cached&&this.now()-this.cached.loaded_at<reportReadCacheMs)return this.fresh(this.cached);
+    if(this.failure&&this.now()-this.failure.at<reportReadCacheMs)throw this.failure.error;
+    if(!this.pending)this.pending=this.query().then(value=>{this.cached=value;this.failure=undefined;return value;},error=>{
+      this.failure={at:this.now(),error};throw error;
+    }).finally(()=>{this.pending=undefined;});
+    return this.fresh(await this.pending);
   }
-  private async query(): Promise<Snapshot> {
-    const db = await this.pool.connect();
+  private async query():Promise<Published> {
+    let db:PoolClient|undefined,discard=false,released=false,timedOut=false;const onError=()=>{discard=true;};
+    let watchdog:ReturnType<typeof setTimeout>|undefined;
     try {
-      await db.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      db=await this.pool.connect();db.on('error',onError);
+      watchdog=setTimeout(()=>{timedOut=true;discard=true;if(db&&!released){released=true;db.release(true);}},reportReadWallTimeoutMs);watchdog.unref();
+      await db.query('BEGIN READ ONLY');
       await db.query(`SET LOCAL statement_timeout='${reportStatementTimeoutMs}ms'`);
-      await db.query("SET LOCAL lock_timeout='1s'");
-      // Compilation/optimization of this multi-aggregate plan can consume the
-      // short reporting budget itself. Scope to this read-only transaction only.
-      await db.query('SET LOCAL jit=off');
-      const clock = (await db.query(`SELECT to_regclass('olos_http.corporate_outbox') IS NOT NULL AS present,
-        (transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date::text AS collection_date,
-        ((transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date::timestamp AT TIME ZONE 'America/Sao_Paulo') AS start_at,
-        (((transaction_timestamp() AT TIME ZONE 'America/Sao_Paulo')::date + 1)::timestamp AT TIME ZONE 'America/Sao_Paulo') AS end_at`)).rows[0];
-      const hasOutbox = clock.present === true;
-      const relation = `${quote(this.destination.schema)}.${quote(this.destination.table)}`;
-      const delivery = hasOutbox ? `CASE WHEN o.source_id IS NULL THEN 'not_queued'
-        WHEN o.target_id<>r.target_id OR o.source_hash<>r.source_hash THEN 'inconsistent'
-        WHEN o.state='confirmed' AND o.remote_raw_id IS NOT NULL AND o.confirmed_at IS NOT NULL THEN 'confirmed'
-        WHEN o.state='pending' AND o.remote_raw_id IS NULL AND o.confirmed_at IS NULL THEN 'pending'
-        ELSE 'inconsistent' END` : "'unavailable'::text";
-      // Aggregate equivalent day/ID/name/receipt groups before running regexes.
-      // Names are used only in SQL; the original identification rule is applied
-      // to every distinct identity, then unidentified identities collapse together.
-      // Delivery is classified once per row. No per-call CTE materialization or
-      // DISTINCT sort; only aggregate rows reach the process.
-      const days = (await db.query<Day>(`WITH classified AS NOT MATERIALIZED (
-        SELECT (d.data_ligacao AT TIME ZONE 'America/Sao_Paulo')::date AS day,
-          r.agent_id, btrim(d.nome_agente,$2) AS agent_name,
-          r.created_at >= $5::timestamptz AND r.created_at < $6::timestamptz AS collected_today,
-          d.internal_id_olos IS NOT NULL AS mapped,
-          coalesce(btrim(d.cpf,$2)<>'',false) AS has_cpf,
-          coalesce(btrim(d.email,$2)<>'',false) AS has_email, ${delivery} AS delivery
-        FROM olos_http.records r LEFT JOIN ${relation} d ON d.internal_id_olos=r.target_id
-        ${hasOutbox ? 'LEFT JOIN olos_http.corporate_outbox o ON o.source_key=r.source_key AND o.source_id=r.source_id' : ''}
-        WHERE r.source_key=$1 AND r.target_table=$4
-      ), per_identity AS (
-        SELECT day, agent_id, agent_name, delivery, count(*) AS calls,
-          count(*) FILTER (WHERE collected_today) AS collected_today,
-          count(*) FILTER (WHERE has_cpf) AS with_cpf,
-          count(*) FILTER (WHERE has_email) AS with_email,
-          count(*) FILTER (WHERE NOT mapped) AS missing_mapping
-        FROM classified GROUP BY day, agent_id, agent_name, delivery
-      ), per_operator AS (
-        SELECT day, CASE WHEN agent_id ~ '^[1-9][0-9]*$' AND agent_name<>''
-          AND agent_name !~* $3 THEN agent_id END AS identified_agent, sum(calls) AS calls,
-          sum(collected_today) AS collected_today,
-          sum(with_cpf) AS with_cpf, sum(with_email) AS with_email,
-          coalesce(sum(calls) FILTER (WHERE delivery='confirmed'),0) AS confirmed,
-          coalesce(sum(calls) FILTER (WHERE delivery='pending'),0) AS pending,
-          coalesce(sum(calls) FILTER (WHERE delivery='not_queued'),0) AS not_queued,
-          coalesce(sum(calls) FILTER (WHERE delivery='inconsistent'),0) AS inconsistent,
-          sum(missing_mapping) AS missing_mapping
-        FROM per_identity GROUP BY day, identified_agent
-      ) SELECT day::text,
-        sum(calls)::text AS calls, sum(collected_today)::text AS collected_today,
-        coalesce(sum(calls) FILTER (WHERE identified_agent IS NOT NULL),0)::text AS identified_calls,
-        array_agg(identified_agent) FILTER (WHERE identified_agent IS NOT NULL) AS operator_ids,
-        sum(with_cpf)::text AS with_cpf, sum(with_email)::text AS with_email,
-        sum(confirmed)::text AS confirmed, sum(pending)::text AS pending,
-        sum(not_queued)::text AS not_queued, sum(inconsistent)::text AS inconsistent,
-        sum(missing_mapping)::text AS missing_mapping
-      FROM per_operator GROUP BY day ORDER BY day`, [this.source, reportWhitespace, reportPlaceholder, relation, clock.start_at, clock.end_at])).rows;
-      const meta = (await db.query(`SELECT count(*)::text AS failed_reads,
-        transaction_timestamp() AS observed_at FROM olos_http.reads
-        WHERE source_key=$1 AND error_code IS NOT NULL`, [this.source])).rows[0];
-      return { days, ...meta, outbox_available: hasOutbox, collection_date: clock.collection_date };
-    } catch (error) {
-      if ((error as { code?: string })?.code === '57014') throw new WorkerError('REPORT_TIMEOUT');
-      throw error;
-    } finally { await db.query('ROLLBACK').catch(() => {}); db.release(); }
+      await db.query("SET LOCAL lock_timeout='250ms'");
+      // Revalidate the durable pointer each second; immutable payloads need
+      // decoding only on the first read or when a new generation is published.
+      const known=this.cached;
+      const queryStarted=this.now();
+      const row=(await db.query<StoredRow>(`SELECT s.id,k.published_id,s.contract_version,s.contract_name,s.timezone,s.validation,k.status AS refresh_status,k.last_error,
+        CASE WHEN isfinite(k.next_attempt_at) THEN k.next_attempt_at END AS next_attempt_at,
+        CASE WHEN s.id IS DISTINCT FROM $5::uuid THEN CASE WHEN octet_length(s.data::text)<=$4 THEN s.data END END AS data,
+        CASE WHEN s.id IS DISTINCT FROM $5::uuid THEN octet_length(s.data::text) ELSE 0 END AS payload_bytes,s.observed_at,s.published_at,s.collection_date::text,s.data_hash,
+        clock_timestamp() AS checked_at,
+        EXISTS(SELECT 1 FROM olos_http.report_snapshots other WHERE other.source_key=$1 AND other.target_table=$2 AND other.contract_version<>$3) AS incompatible
+        FROM (SELECT $1::text AS source_key,$2::text AS target_table,$3::int AS contract_version) wanted
+        LEFT JOIN olos_http.report_snapshot_state k USING(source_key,target_table,contract_version)
+        LEFT JOIN olos_http.report_snapshots s ON s.id=k.published_id AND s.source_key=$1 AND s.target_table=$2 AND s.contract_version=$3`,
+        [this.source,`${quote(this.destination.schema)}.${quote(this.destination.table)}`,reportContractVersion,reportPayloadLimit,known?.id??null])).rows[0];
+      if(timedOut)throw new WorkerError('REPORT_TIMEOUT');
+      if(!row)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
+      if(!row.published_id)throw new WorkerError(row.incompatible?'REPORT_SNAPSHOT_INCOMPATIBLE':'REPORT_INITIALIZING');
+      if(!row.id||row.contract_version!==reportContractVersion||row.contract_name!==reportContract||row.timezone!==reportZone||!row.observed_at||!row.published_at||row.payload_bytes>reportPayloadLimit)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
+      const same=known?.id===row.id;
+      if(same&&(row.data_hash!==known.data_hash||reportValidationKey(row.validation)!==known.validation_key||row.published_at.toISOString()!==known.published_at))throw new WorkerError('REPORT_SNAPSHOT_INVALID');
+      const data=same?known.data:validateReportData(row.data),age=(row.checked_at.getTime()-row.observed_at.getTime())/1000;
+      if((!same&&(!validReportMetadata(row.validation,data)||row.data_hash!==reportDataHash(data)))||data.observed_at!==row.observed_at.toISOString()||data.collection_date!==row.collection_date||age< -5||row.published_at<row.observed_at||row.published_at.getTime()>row.checked_at.getTime()+5000)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
+      return {data,id:row.id,published_at:row.published_at.toISOString(),age,checked_at:row.checked_at.getTime(),loaded_at:queryStarted,data_hash:row.data_hash!,validation_key:reportValidationKey(row.validation),refresh_state:row.refresh_status.toUpperCase(),last_refresh_error:row.last_error,next_refresh_at:row.next_attempt_at?.toISOString()??null};
+    } catch(error) {
+      if(timedOut)throw new WorkerError('REPORT_TIMEOUT');
+      if(error instanceof WorkerError)throw error;
+      const code=(error as {code?:string}).code;
+      if(code==='42P01'||code==='42703')throw new WorkerError('REPORT_SNAPSHOT_MIGRATION_REQUIRED');
+      if(code==='57014')throw new WorkerError('REPORT_TIMEOUT');
+      discard=true;throw new WorkerError('REPORT_UNAVAILABLE');
+    } finally {
+      if(db){if(!released)await db.query('ROLLBACK').catch(()=>{discard=true;});if(!released){released=true;db.release(discard);}db.removeListener('error',onError);}
+      if(watchdog)clearTimeout(watchdog);
+    }
   }
 }

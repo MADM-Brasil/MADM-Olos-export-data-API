@@ -1,5 +1,7 @@
 # Dashboard administrativa: consulta histórica e isolamento de renderização
 
+> Histórico de implementação e medições anteriores. A implementação autorizada de snapshots persistidos, seus orçamentos, migração e rollback estão em [persisted-reports.md](persisted-reports.md). As descrições abaixo sobre cache somente em memória e ausência de migrações não representam a arquitetura atual.
+
 Correção local de 09/11/2026. Sem acesso à VPS, bancos corporativos, commit, push ou deploy. Nenhuma migração executada. O SQL de preparação dos testes cria apenas fixtures em um PostgreSQL descartável, com porta aleatória ligada a `127.0.0.1`; o runner não lê `.env` nem `DATABASE_URL`.
 
 ## Auditoria e comportamento
@@ -122,3 +124,44 @@ Scheduler, ingestão, controle corporativo, sincronização, regras de negócio 
 - `test/fixtures/admin-reports-before.sql`: consulta anterior para equivalência e medição.
 - `test/admin.test.ts`, `test/admin-ui.test.mjs`, `test/admin-redesign.browser.mjs`: HTTP e falhas independentes de apresentação.
 - `admin/reports-performance.md`: auditoria, evidência e procedimento.
+
+## P0 de 10/11/2026 — reprodução representativa e decisão
+
+A ocorrência em produção foi informada pelo solicitante; não houve acesso à produção. A nova reprodução usa PostgreSQL 16 descartável, Node 24, 2.000.000 identidades em records, 1.910.290 recibos/outbox e 786.460 destinos, mantendo proporções próximas ao incidente. São 365 dias, mil operadores e nomes/contatos/payloads exclusivamente sintéticos; não é o perfil anterior de 200 mil linhas nem uma validação em produção.
+
+O runner opt-in é `REPORT_PERF=1 bash scripts/test-admin-reports.sh`. Ele não usa .env/DATABASE_URL, exige banco exclusivo e container com label descartável, verifica a porta loopback, reinicia somente esse container e remove o volume ao terminar. Reinício limpa shared_buffers; o cache do SO hospedeiro não é descartado. Planos e métricas são emitidos em `/tmp/olos-reports-p0`, ou REPORT_PERF_EVIDENCE. O orçamento diagnóstico de 60 s é exclusivo de equivalência/EXPLAIN para deixar a referência completar; as medições de admissão usam AdminReports e seus 5 s inalterados.
+
+A junção completa precisa ler origem/destino/recibos, e regex/classificações e agregações repetidas escalam com identidades de operador/dia/estado. Mesmo com ANALYZE e os índices atuais, os planos usam hash joins com múltiplos batches e ordenações externas. Durante carga/estatísticas incompletas houve estimativa de 29 linhas para dois milhões e nested loops com milhões de buscas; essas execuções não foram usadas como benchmark do histórico em repouso. ANALYZE evita esse erro, mas não elimina o custo do histórico completo. Não foi implementado ANALYZE automático no endpoint.
+
+A candidata SQL remove a agregação intermediária per_operator; preserva por dia a união distinta de IDs, somas textuais, GROUP NULL, trim/regex/recibos. Uma projeção lateral de uma linha, com OFFSET 0 para impedir o inline, compartilha a validação do nome entre soma e união de IDs. JSON de IDs textuais mantém string[] no driver e evita sua decodificação text[]. Não há alteração de DTO público nem conversão dos IDs para Number. Equivalência com a consulta imediatamente anterior foi adicionada, inclusive collected_today, além do oracle legado já existente.
+
+Experimentos com work_mem local de 16/32/64/128 MB reduziram temporários, mas não demonstraram margem repetível. O perfil de 64 MB chegou a eliminar spill dos joins e sorts, porém ainda produziu leituras próximas de 5 s e cancelamentos em repetições. Nenhum aumento de memória foi mantido no código. Um índice de cobertura na outbox foi criado e removido **somente na fixture**: reduziu aproximadamente 243 mil para 99 mil blocos lidos, sem resolver sozinho o limite; não há índice/migração proposto para aplicação imediata. Resultados e planos finais estão em `admin/evidence/reports-p0/`. A candidata reprovou o gate e foi retirada de src/admin/reports.ts; sua SQL permanece apenas em test/fixtures/admin-reports-candidate-p0.sql. Equivalência e cache aquecido não aprovam esse gate.
+
+### Proposta após reprovação do gate — alteração de schema ainda não autorizada
+
+O próximo passo proposto é **persistir o snapshot integral já existente**, sem contadores incrementais e sem alterar a ingestão. Não se afirma que todas as alternativas SQL possíveis foram esgotadas. Nenhuma tabela ou migração dessa proposta foi criada.
+
+- Uma tabela de cache administrativo, chave `(source_key,target_table,report_version,timezone)`, com observação/calendário, validade e snapshot agregado versionado. Nada de payloads de chamadas, telefones ou credenciais. IDs internos continuam privados.
+- Leitura HTTP consulta essa única chave e aplica os períodos sobre o mesmo snapshot. Cache em memória continua opcional/curto; PostgreSQL é a autoridade compartilhada entre instâncias e reinícios.
+- Renovação pelo próprio AdminReports, acionada sob demanda antes do vencimento. Sem serviço, worker ou scheduler novo. Advisory lock exclusivo por chave, em namespace separado dos locks OLOS; no máximo uma construção por chave. Limite de conexão/recurso explícito para o construtor.
+- Construção completa em REPEATABLE READ: captura agregados, failed_reads e observed_at na mesma fotografia; publicação atômica após conclusão. Reexecução substitui o snapshot inteiro, incorporando backfills, mappings, recibos alterados e confirmações tardias, sem watermarks incorretos.
+- Separar orçamento da consulta pequena de atendimento (5 s preservados) do orçamento do refresh completo em segundo plano (proposta: até 30 s, a medir). Isso exige aprovação explícita da mudança de arquitetura; não deve ser apresentado como simples aumento do timeout do endpoint.
+- Snapshot ausente/expirado ou refresh falho não vira zero nem observação nova. Observação antiga conserva timestamp/validade; indisponibilidade continua explícita. Primeira construção precisa de regra de readiness e Retry-After, sem prometer resposta imediata antes de existir dado válido.
+- Falha/COMMIT incerto nunca publica uma versão apenas em memória como se estivesse persistida; leitura posterior do PostgreSQL decide qual versão existe. Versões/observações não podem regredir.
+- Schema manual separado, autorização e rollback próprios. Código só poderá depender da tabela após instalação validada. Rollback de código não apaga a tabela automaticamente nem modifica records/outbox/recibos.
+
+Antes de implementar essa proposta, fechar o contrato de validade máxima, comportamento no primeiro carregamento e orçamento de refresh/memória. Testar dois processos, concorrência de renovação, falha antes/depois de publicação, COMMIT incerto, ausência da tabela, retomada após reinício e equivalência integral com o oracle.
+
+### Resultado final desta rodada
+
+| Medida local (mesmos dados, JIT desligado) | Anterior | Candidata rejeitada |
+| --- | ---: | ---: |
+| EXPLAIN ANALYZE, orçamento diagnóstico de 60 s | 6.774,294 ms | 6.392,646 ms |
+| Blocos temporários escritos, contagem inclusiva da raiz | 120.206 | 120.260 |
+| Batches dos hashes de destino/outbox | 16 / 64 | 16 / 64 |
+
+Sete leituras novas da candidata pelo AdminReports (três após reinício do PostgreSQL, três com páginas aquecidas e uma com escrita concorrente) canceladas no statement_timeout de 5 s. O tempo de parede inclui cancelamento/rollback; não é extensão do orçamento SQL. Cinco períodos no cache já construído: 47 ms. Logo o ganho da reescrita não resolve o P0 e não há margem de desempenho aprovada. O teste mantém exit 1: quatro subtestes funcionais passam, o gate de desempenho e sua agregadora falham.
+
+Validação final: 111 unitários aprovados, 14 testes PostgreSQL aprovados (fixture pequena e benchmark anterior de 200.013 registros), build aprovado. TypeScript global: os mesmos 17 diagnósticos de corporate-delivery.integration.ts, comparados por arquivo/linha/código/mensagem com o log-base já auditado, sem erro novo nos arquivos desta rodada. Na carga de dois milhões, equivalência completa inclusive today/IDs internos, janelas 1/7/15/30/366 dias, coalescência/cache e consistência MVCC durante confirmação concorrente passaram. O teste de concorrência não representa carga sustentada de ingestão.
+
+**NO-GO para homologação da correção. O HTTP 503 permanece sem correção de produção aprovada.** Os experimentos de SQL/memória foram retirados; nenhum arquivo de src/, frontend, dependência ou migração foi alterado. A proposta acima depende de decisão antes de introduzir schema/refresh persistido. Não se conclui que agregados persistidos são a única solução possível, somente que as alternativas medidas não satisfizeram este orçamento no ambiente de teste. Sem produção, commit, push ou deploy.

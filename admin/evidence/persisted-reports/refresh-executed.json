@@ -1,0 +1,519 @@
+[
+  {
+    "QUERY PLAN": [
+      {
+        "Plan": {
+          "Node Type": "Sort",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 1257713.66,
+          "Total Cost": 1257714.16,
+          "Plan Rows": 200,
+          "Plan Width": 388,
+          "Actual Rows": 366,
+          "Actual Loops": 1,
+          "Sort Key": [
+            "((per_identity.day)::text)"
+          ],
+          "Sort Method": "quicksort",
+          "Sort Space Used": 2771,
+          "Sort Space Type": "Memory",
+          "Shared Hit Blocks": 7308,
+          "Shared Read Blocks": 251848,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 112676,
+          "Temp Written Blocks": 112782,
+          "Plans": [
+            {
+              "Node Type": "Aggregate",
+              "Strategy": "Sorted",
+              "Partial Mode": "Simple",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Startup Cost": 679906.73,
+              "Total Cost": 1257706.01,
+              "Plan Rows": 200,
+              "Plan Width": 388,
+              "Actual Rows": 366,
+              "Actual Loops": 1,
+              "Group Key": [
+                "per_identity.day"
+              ],
+              "Shared Hit Blocks": 7308,
+              "Shared Read Blocks": 251848,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 112676,
+              "Temp Written Blocks": 112782,
+              "Plans": [
+                {
+                  "Node Type": "Aggregate",
+                  "Strategy": "Sorted",
+                  "Partial Mode": "Simple",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Startup Cost": 679906.73,
+                  "Total Cost": 1249647.19,
+                  "Plan Rows": 201008,
+                  "Plan Width": 324,
+                  "Actual Rows": 346825,
+                  "Actual Loops": 1,
+                  "Group Key": [
+                    "per_identity.day",
+                    "(CASE WHEN ((per_identity.agent_id ~ '^[1-9][0-9]*$'::text) AND (per_identity.agent_name <> ''::text) AND (per_identity.agent_name !~* '^([0-9]+|-1|null|undefined|n/a|unknown|desconhecido|sem operador|sem agente|não identificado|nao identificado)$'::text)) THEN per_identity.agent_id ELSE NULL::text END)"
+                  ],
+                  "Shared Hit Blocks": 7308,
+                  "Shared Read Blocks": 251848,
+                  "Shared Dirtied Blocks": 0,
+                  "Shared Written Blocks": 0,
+                  "Local Hit Blocks": 0,
+                  "Local Read Blocks": 0,
+                  "Local Dirtied Blocks": 0,
+                  "Local Written Blocks": 0,
+                  "Temp Read Blocks": 112676,
+                  "Temp Written Blocks": 112782,
+                  "Plans": [
+                    {
+                      "Node Type": "Incremental Sort",
+                      "Parent Relationship": "Outer",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Startup Cost": 679906.73,
+                      "Total Cost": 1166228.84,
+                      "Plan Rows": 2010081,
+                      "Plan Width": 108,
+                      "Actual Rows": 649145,
+                      "Actual Loops": 1,
+                      "Sort Key": [
+                        "per_identity.day",
+                        "(CASE WHEN ((per_identity.agent_id ~ '^[1-9][0-9]*$'::text) AND (per_identity.agent_name <> ''::text) AND (per_identity.agent_name !~* '^([0-9]+|-1|null|undefined|n/a|unknown|desconhecido|sem operador|sem agente|não identificado|nao identificado)$'::text)) THEN per_identity.agent_id ELSE NULL::text END)"
+                      ],
+                      "Presorted Key": [
+                        "per_identity.day"
+                      ],
+                      "Full-sort Groups": {
+                        "Group Count": 366,
+                        "Sort Methods Used": [
+                          "quicksort"
+                        ],
+                        "Sort Space Memory": {
+                          "Average Sort Space Used": 30,
+                          "Peak Sort Space Used": 30
+                        }
+                      },
+                      "Pre-sorted Groups": {
+                        "Group Count": 366,
+                        "Sort Methods Used": [
+                          "quicksort"
+                        ],
+                        "Sort Space Memory": {
+                          "Average Sort Space Used": 193,
+                          "Peak Sort Space Used": 342
+                        }
+                      },
+                      "Shared Hit Blocks": 7308,
+                      "Shared Read Blocks": 251848,
+                      "Shared Dirtied Blocks": 0,
+                      "Shared Written Blocks": 0,
+                      "Local Hit Blocks": 0,
+                      "Local Read Blocks": 0,
+                      "Local Dirtied Blocks": 0,
+                      "Local Written Blocks": 0,
+                      "Temp Read Blocks": 112676,
+                      "Temp Written Blocks": 112782,
+                      "Plans": [
+                        {
+                          "Node Type": "Subquery Scan",
+                          "Parent Relationship": "Outer",
+                          "Parallel Aware": false,
+                          "Async Capable": false,
+                          "Alias": "per_identity",
+                          "Startup Cost": 677589.18,
+                          "Total Cost": 1007479.03,
+                          "Plan Rows": 2010081,
+                          "Plan Width": 108,
+                          "Actual Rows": 649145,
+                          "Actual Loops": 1,
+                          "Shared Hit Blocks": 7308,
+                          "Shared Read Blocks": 251848,
+                          "Shared Dirtied Blocks": 0,
+                          "Shared Written Blocks": 0,
+                          "Local Hit Blocks": 0,
+                          "Local Read Blocks": 0,
+                          "Local Dirtied Blocks": 0,
+                          "Local Written Blocks": 0,
+                          "Temp Read Blocks": 112676,
+                          "Temp Written Blocks": 112782,
+                          "Plans": [
+                            {
+                              "Node Type": "Aggregate",
+                              "Strategy": "Sorted",
+                              "Partial Mode": "Finalize",
+                              "Parent Relationship": "Subquery",
+                              "Parallel Aware": false,
+                              "Async Capable": false,
+                              "Startup Cost": 677589.18,
+                              "Total Cost": 972302.61,
+                              "Plan Rows": 2010081,
+                              "Plan Width": 111,
+                              "Actual Rows": 649145,
+                              "Actual Loops": 1,
+                              "Group Key": [
+                                "(((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date)",
+                                "r.agent_id",
+                                "(btrim(d.nome_agente, '\t\n\u000b\f\r                  　﻿'::text))",
+                                "(CASE WHEN (o.source_id IS NULL) THEN 'not_queued'::text WHEN ((o.target_id <> r.target_id) OR (o.source_hash <> r.source_hash)) THEN 'inconsistent'::text WHEN ((o.state = 'confirmed'::text) AND (o.remote_raw_id IS NOT NULL) AND (o.confirmed_at IS NOT NULL)) THEN 'confirmed'::text WHEN ((o.state = 'pending'::text) AND (o.remote_raw_id IS NULL) AND (o.confirmed_at IS NULL)) THEN 'pending'::text ELSE 'inconsistent'::text END)"
+                              ],
+                              "Shared Hit Blocks": 7308,
+                              "Shared Read Blocks": 251848,
+                              "Shared Dirtied Blocks": 0,
+                              "Shared Written Blocks": 0,
+                              "Local Hit Blocks": 0,
+                              "Local Read Blocks": 0,
+                              "Local Dirtied Blocks": 0,
+                              "Local Written Blocks": 0,
+                              "Temp Read Blocks": 112676,
+                              "Temp Written Blocks": 112782,
+                              "Plans": [
+                                {
+                                  "Node Type": "Gather Merge",
+                                  "Parent Relationship": "Outer",
+                                  "Parallel Aware": false,
+                                  "Async Capable": false,
+                                  "Startup Cost": 677589.18,
+                                  "Total Cost": 890421.36,
+                                  "Plan Rows": 1182401,
+                                  "Plan Width": 111,
+                                  "Actual Rows": 722637,
+                                  "Actual Loops": 1,
+                                  "Workers Planned": 1,
+                                  "Workers Launched": 1,
+                                  "Shared Hit Blocks": 7308,
+                                  "Shared Read Blocks": 251848,
+                                  "Shared Dirtied Blocks": 0,
+                                  "Shared Written Blocks": 0,
+                                  "Local Hit Blocks": 0,
+                                  "Local Read Blocks": 0,
+                                  "Local Dirtied Blocks": 0,
+                                  "Local Written Blocks": 0,
+                                  "Temp Read Blocks": 112676,
+                                  "Temp Written Blocks": 112782,
+                                  "Plans": [
+                                    {
+                                      "Node Type": "Aggregate",
+                                      "Strategy": "Sorted",
+                                      "Partial Mode": "Partial",
+                                      "Parent Relationship": "Outer",
+                                      "Parallel Aware": false,
+                                      "Async Capable": false,
+                                      "Startup Cost": 676589.17,
+                                      "Total Cost": 756401.24,
+                                      "Plan Rows": 1182401,
+                                      "Plan Width": 111,
+                                      "Actual Rows": 361318,
+                                      "Actual Loops": 2,
+                                      "Group Key": [
+                                        "(((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date)",
+                                        "r.agent_id",
+                                        "(btrim(d.nome_agente, '\t\n\u000b\f\r                  　﻿'::text))",
+                                        "(CASE WHEN (o.source_id IS NULL) THEN 'not_queued'::text WHEN ((o.target_id <> r.target_id) OR (o.source_hash <> r.source_hash)) THEN 'inconsistent'::text WHEN ((o.state = 'confirmed'::text) AND (o.remote_raw_id IS NOT NULL) AND (o.confirmed_at IS NOT NULL)) THEN 'confirmed'::text WHEN ((o.state = 'pending'::text) AND (o.remote_raw_id IS NULL) AND (o.confirmed_at IS NULL)) THEN 'pending'::text ELSE 'inconsistent'::text END)"
+                                      ],
+                                      "Shared Hit Blocks": 7308,
+                                      "Shared Read Blocks": 251848,
+                                      "Shared Dirtied Blocks": 0,
+                                      "Shared Written Blocks": 0,
+                                      "Local Hit Blocks": 0,
+                                      "Local Read Blocks": 0,
+                                      "Local Dirtied Blocks": 0,
+                                      "Local Written Blocks": 0,
+                                      "Temp Read Blocks": 112676,
+                                      "Temp Written Blocks": 112782,
+                                      "Workers": [],
+                                      "Plans": [
+                                        {
+                                          "Node Type": "Sort",
+                                          "Parent Relationship": "Outer",
+                                          "Parallel Aware": false,
+                                          "Async Capable": false,
+                                          "Startup Cost": 676589.17,
+                                          "Total Cost": 679545.18,
+                                          "Plan Rows": 1182401,
+                                          "Plan Width": 123,
+                                          "Actual Rows": 1001000,
+                                          "Actual Loops": 2,
+                                          "Sort Key": [
+                                            "(((d.data_ligacao AT TIME ZONE 'America/Sao_Paulo'::text))::date)",
+                                            "r.agent_id",
+                                            "(btrim(d.nome_agente, '\t\n\u000b\f\r                  　﻿'::text))",
+                                            "(CASE WHEN (o.source_id IS NULL) THEN 'not_queued'::text WHEN ((o.target_id <> r.target_id) OR (o.source_hash <> r.source_hash)) THEN 'inconsistent'::text WHEN ((o.state = 'confirmed'::text) AND (o.remote_raw_id IS NOT NULL) AND (o.confirmed_at IS NOT NULL)) THEN 'confirmed'::text WHEN ((o.state = 'pending'::text) AND (o.remote_raw_id IS NULL) AND (o.confirmed_at IS NULL)) THEN 'pending'::text ELSE 'inconsistent'::text END)"
+                                          ],
+                                          "Sort Method": "external merge",
+                                          "Sort Space Used": 50008,
+                                          "Sort Space Type": "Disk",
+                                          "Shared Hit Blocks": 7308,
+                                          "Shared Read Blocks": 251848,
+                                          "Shared Dirtied Blocks": 0,
+                                          "Shared Written Blocks": 0,
+                                          "Local Hit Blocks": 0,
+                                          "Local Read Blocks": 0,
+                                          "Local Dirtied Blocks": 0,
+                                          "Local Written Blocks": 0,
+                                          "Temp Read Blocks": 112676,
+                                          "Temp Written Blocks": 112782,
+                                          "Workers": [
+                                            {
+                                              "Worker Number": 0,
+                                              "Sort Method": "external merge",
+                                              "Sort Space Used": 49704,
+                                              "Sort Space Type": "Disk"
+                                            }
+                                          ],
+                                          "Plans": [
+                                            {
+                                              "Node Type": "Hash Join",
+                                              "Parent Relationship": "Outer",
+                                              "Parallel Aware": true,
+                                              "Async Capable": false,
+                                              "Join Type": "Left",
+                                              "Startup Cost": 283070.94,
+                                              "Total Cost": 480534.6,
+                                              "Plan Rows": 1182401,
+                                              "Plan Width": 123,
+                                              "Actual Rows": 1001000,
+                                              "Actual Loops": 2,
+                                              "Inner Unique": true,
+                                              "Hash Cond": "(r.source_id = o.source_id)",
+                                              "Shared Hit Blocks": 7263,
+                                              "Shared Read Blocks": 251848,
+                                              "Shared Dirtied Blocks": 0,
+                                              "Shared Written Blocks": 0,
+                                              "Local Hit Blocks": 0,
+                                              "Local Read Blocks": 0,
+                                              "Local Dirtied Blocks": 0,
+                                              "Local Written Blocks": 0,
+                                              "Temp Read Blocks": 100212,
+                                              "Temp Written Blocks": 100308,
+                                              "Workers": [],
+                                              "Plans": [
+                                                {
+                                                  "Node Type": "Hash Join",
+                                                  "Parent Relationship": "Outer",
+                                                  "Parallel Aware": true,
+                                                  "Async Capable": false,
+                                                  "Join Type": "Left",
+                                                  "Startup Cost": 44960.04,
+                                                  "Total Cost": 144519.86,
+                                                  "Plan Rows": 1182401,
+                                                  "Plan Width": 166,
+                                                  "Actual Rows": 1001000,
+                                                  "Actual Loops": 2,
+                                                  "Inner Unique": true,
+                                                  "Hash Cond": "(r.target_id = d.internal_id_olos)",
+                                                  "Shared Hit Blocks": 6801,
+                                                  "Shared Read Blocks": 60999,
+                                                  "Shared Dirtied Blocks": 0,
+                                                  "Shared Written Blocks": 0,
+                                                  "Local Hit Blocks": 0,
+                                                  "Local Read Blocks": 0,
+                                                  "Local Dirtied Blocks": 0,
+                                                  "Local Written Blocks": 0,
+                                                  "Temp Read Blocks": 36377,
+                                                  "Temp Written Blocks": 36396,
+                                                  "Workers": [],
+                                                  "Plans": [
+                                                    {
+                                                      "Node Type": "Seq Scan",
+                                                      "Parent Relationship": "Outer",
+                                                      "Parallel Aware": true,
+                                                      "Async Capable": false,
+                                                      "Relation Name": "records",
+                                                      "Alias": "r",
+                                                      "Startup Cost": 0,
+                                                      "Total Cost": 56392.01,
+                                                      "Plan Rows": 1182401,
+                                                      "Plan Width": 96,
+                                                      "Actual Rows": 1001000,
+                                                      "Actual Loops": 2,
+                                                      "Filter": "((source_key = 'perf'::text) AND (target_table = '\"raw\".\"olos_calls\"'::text))",
+                                                      "Rows Removed by Filter": 1000,
+                                                      "Shared Hit Blocks": 395,
+                                                      "Shared Read Blocks": 38261,
+                                                      "Shared Dirtied Blocks": 0,
+                                                      "Shared Written Blocks": 0,
+                                                      "Local Hit Blocks": 0,
+                                                      "Local Read Blocks": 0,
+                                                      "Local Dirtied Blocks": 0,
+                                                      "Local Written Blocks": 0,
+                                                      "Temp Read Blocks": 0,
+                                                      "Temp Written Blocks": 0,
+                                                      "Workers": []
+                                                    },
+                                                    {
+                                                      "Node Type": "Hash",
+                                                      "Parent Relationship": "Inner",
+                                                      "Parallel Aware": true,
+                                                      "Async Capable": false,
+                                                      "Startup Cost": 33755.24,
+                                                      "Total Cost": 33755.24,
+                                                      "Plan Rows": 462624,
+                                                      "Plan Width": 70,
+                                                      "Actual Rows": 395230,
+                                                      "Actual Loops": 2,
+                                                      "Hash Buckets": 524288,
+                                                      "Original Hash Buckets": 524288,
+                                                      "Hash Batches": 4,
+                                                      "Original Hash Batches": 4,
+                                                      "Peak Memory Usage": 19424,
+                                                      "Shared Hit Blocks": 6391,
+                                                      "Shared Read Blocks": 22738,
+                                                      "Shared Dirtied Blocks": 0,
+                                                      "Shared Written Blocks": 0,
+                                                      "Local Hit Blocks": 0,
+                                                      "Local Read Blocks": 0,
+                                                      "Local Dirtied Blocks": 0,
+                                                      "Local Written Blocks": 0,
+                                                      "Temp Read Blocks": 0,
+                                                      "Temp Written Blocks": 4868,
+                                                      "Workers": [],
+                                                      "Plans": [
+                                                        {
+                                                          "Node Type": "Seq Scan",
+                                                          "Parent Relationship": "Outer",
+                                                          "Parallel Aware": true,
+                                                          "Async Capable": false,
+                                                          "Relation Name": "olos_calls",
+                                                          "Alias": "d",
+                                                          "Startup Cost": 0,
+                                                          "Total Cost": 33755.24,
+                                                          "Plan Rows": 462624,
+                                                          "Plan Width": 70,
+                                                          "Actual Rows": 395230,
+                                                          "Actual Loops": 2,
+                                                          "Shared Hit Blocks": 6391,
+                                                          "Shared Read Blocks": 22738,
+                                                          "Shared Dirtied Blocks": 0,
+                                                          "Shared Written Blocks": 0,
+                                                          "Local Hit Blocks": 0,
+                                                          "Local Read Blocks": 0,
+                                                          "Local Dirtied Blocks": 0,
+                                                          "Local Written Blocks": 0,
+                                                          "Temp Read Blocks": 0,
+                                                          "Temp Written Blocks": 0,
+                                                          "Workers": []
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "Node Type": "Hash",
+                                                  "Parent Relationship": "Inner",
+                                                  "Parallel Aware": true,
+                                                  "Async Capable": false,
+                                                  "Startup Cost": 205362.96,
+                                                  "Total Cost": 205362.96,
+                                                  "Plan Rows": 1125276,
+                                                  "Plan Width": 105,
+                                                  "Actual Rows": 956145,
+                                                  "Actual Loops": 2,
+                                                  "Hash Buckets": 262144,
+                                                  "Original Hash Buckets": 262144,
+                                                  "Hash Batches": 16,
+                                                  "Original Hash Batches": 16,
+                                                  "Peak Memory Usage": 17728,
+                                                  "Shared Hit Blocks": 448,
+                                                  "Shared Read Blocks": 190849,
+                                                  "Shared Dirtied Blocks": 0,
+                                                  "Shared Written Blocks": 0,
+                                                  "Local Hit Blocks": 0,
+                                                  "Local Read Blocks": 0,
+                                                  "Local Dirtied Blocks": 0,
+                                                  "Local Written Blocks": 0,
+                                                  "Temp Read Blocks": 0,
+                                                  "Temp Written Blocks": 25556,
+                                                  "Workers": [],
+                                                  "Plans": [
+                                                    {
+                                                      "Node Type": "Seq Scan",
+                                                      "Parent Relationship": "Outer",
+                                                      "Parallel Aware": true,
+                                                      "Async Capable": false,
+                                                      "Relation Name": "corporate_outbox",
+                                                      "Alias": "o",
+                                                      "Startup Cost": 0,
+                                                      "Total Cost": 205362.96,
+                                                      "Plan Rows": 1125276,
+                                                      "Plan Width": 105,
+                                                      "Actual Rows": 956145,
+                                                      "Actual Loops": 2,
+                                                      "Filter": "(source_key = 'perf'::text)",
+                                                      "Rows Removed by Filter": 1000,
+                                                      "Shared Hit Blocks": 448,
+                                                      "Shared Read Blocks": 190849,
+                                                      "Shared Dirtied Blocks": 0,
+                                                      "Shared Written Blocks": 0,
+                                                      "Local Hit Blocks": 0,
+                                                      "Local Read Blocks": 0,
+                                                      "Local Dirtied Blocks": 0,
+                                                      "Local Written Blocks": 0,
+                                                      "Temp Read Blocks": 0,
+                                                      "Temp Written Blocks": 0,
+                                                      "Workers": []
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "Settings": {
+          "jit": "off",
+          "work_mem": "16MB",
+          "max_parallel_workers_per_gather": "1"
+        },
+        "Planning": {
+          "Shared Hit Blocks": 10,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.352,
+        "Triggers": [],
+        "Execution Time": 6025.092
+      }
+    ]
+  }
+]

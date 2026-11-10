@@ -1,3 +1,5 @@
+import pg from 'pg';
+import { ReportUpdater } from './report-updater.js';
 import { resolve } from 'node:path';
 import { once } from 'node:events';
 import { type Config } from '../config.js';
@@ -16,7 +18,12 @@ export async function runManaged(cfg: Config, web: boolean, env = process.env) {
   let scheduler: DynamicScheduler | undefined;
   const events = new OperationalEvents();
   const unsubscribe = web ? observeLogs(entry => events.record(entry)) : () => {};
-  const stop = () => scheduler?.shutdown();
+  let reportUpdater: ReportUpdater | undefined;
+  let reportPool: pg.Pool | undefined;
+  const stop = () => {
+    scheduler?.shutdown();
+    void reportUpdater?.stop().catch(()=>log('report_snapshot_failed',{error:'REPORT_UPDATE_STOPPED'}));
+  };
   try {
     // Validate web security configuration before acquiring resources or starting any consumer.
     const key = env.ADMIN_ENCRYPTION_KEY ? encryptionKey(env.ADMIN_ENCRYPTION_KEY) : undefined;
@@ -39,6 +46,10 @@ export async function runManaged(cfg: Config, web: boolean, env = process.env) {
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new WorkerError('ADMIN_PORT_INVALID');
       server.listen(port, env.ADMIN_BIND ?? '127.0.0.1'); await once(server, 'listening');
       log('admin_listening', { port });
+      reportPool=new pg.Pool({connectionString:cfg.databaseUrl,max:1,connectionTimeoutMillis:1000,statement_timeout:5000,application_name:'olos-report-updater'});
+      reportPool.on('error',()=>log('report_snapshot_failed',{error:'REPORT_UNAVAILABLE'}));
+      reportUpdater=new ReportUpdater(reportPool,cfg.sourceKey,{schema:cfg.schema,table:cfg.table});
+      reportUpdater.start();
     }
     process.once('SIGTERM', stop); process.once('SIGINT', stop);
     await scheduler.run();
@@ -46,6 +57,8 @@ export async function runManaged(cfg: Config, web: boolean, env = process.env) {
     unsubscribe();
     process.removeListener('SIGTERM', stop); process.removeListener('SIGINT', stop);
     if (server) { server.closeIdleConnections(); await new Promise<void>(done => server!.close(() => done())); }
+    await reportUpdater?.stop();
+    await reportPool?.end();
     await repo.close();
   }
 }

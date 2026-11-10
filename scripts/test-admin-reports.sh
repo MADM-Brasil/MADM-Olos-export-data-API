@@ -14,4 +14,15 @@ done
 if [ "$ready" != true ]; then exit 1; fi
 port=$(docker port "$container" 5432/tcp | sed 's/.*://')
 export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/olos_admin_reports_test"
-node --import tsx --test test/admin-reports.database.ts
+if [ "${REPORT_SNAPSHOT_PERF:-0}" = 1 ]; then
+  export REPORT_PERF_CONTAINER="$container"
+  node --import tsx --test test/admin-report-snapshots.performance.ts
+elif [ "${REPORT_PERF:-0}" = 1 ]; then
+  export REPORT_PERF_CONTAINER="$container"
+  node --import tsx --test test/admin-reports.performance.ts
+elif [ "${REPORT_SNAPSHOTS:-0}" = 1 ]; then
+  node --import tsx --test test/admin-report-snapshots.database.ts
+else
+  node --import tsx --test test/admin-reports.database.ts
+  node --import tsx --test test/admin-report-snapshots.database.ts
+fi

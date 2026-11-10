@@ -96,7 +96,7 @@ test('admin API enforces session, role, CSRF, origin, stop confirmation and secr
   const server=adminServer({origin:'https://panel.example.com',publicDir:resolve('admin/public'),auth:new AdminAuth(users,async(_username,password)=>{if(password!=='admin-fixture-password')throw new Error('denied');},async()=>{}),credentials:service,
     scheduler:{async request(actor,patch){actions.push({actor,patch});},status:()=>({state:'STOPPED',cycle_in_progress:false,next_run_at:null,error:null,enabled:false,interval_ms:120000,desired_state:'STOPPED',updated_at:null,updated_by:null})},
     events:()=>[{time:'2026-10-28T18:00:00.000Z',event:'batch_completed',received:5,inserted:4,duplicates:1}],
-    repository:{async today(){return {date:'2026-11-01',calls:'3',observed_at:new Date('2026-11-01T12:00:00Z'),timezone:'America/Sao_Paulo',cache_seconds:300,time_basis:'first_local_persistence',identity:'source_key/source_id'};},async reports(from,to){if(reportFailure)throw reportFailure;return {from,to,daily:[]};},async logs(){return[];},async auditLog(){return[];},async observation(){return {database:{reachable:true,schema_valid:false,error:'DESTINATION_ID_GENERATOR_REQUIRED'},ingestion:{status:'NOT_OBSERVED',latest:null,last_completed:null,pending:[],last_error:null}};}}});
+    repository:{async today(){return {date:'2026-11-01',calls:'3',observed_at:'2026-11-01T12:00:00.000Z',timezone:'America/Sao_Paulo',cache_seconds:300,time_basis:'first_local_persistence',identity:'source_key/source_id',snapshot_id:'11111111-1111-4111-8111-111111111111',snapshot_contract_version:1,published_at:'2026-11-01T12:00:01.000Z',snapshot_state:'READY',snapshot_age_seconds:1,refresh_state:'READY',last_refresh_error:null,next_refresh_at:null};},async reports(from,to){if(reportFailure)throw reportFailure;return {from,to,daily:[]};},async logs(){return[];},async auditLog(){return[];},async observation(){return {database:{reachable:true,schema_valid:false,error:'DESTINATION_ID_GENERATOR_REQUIRED'},ingestion:{status:'NOT_OBSERVED',latest:null,last_completed:null,pending:[],last_error:null}};}}});
   server.listen(0,'127.0.0.1');await once(server,'listening');const addr=server.address();assert(addr&&typeof addr!=='string');const url=`http://127.0.0.1:${addr.port}`;
   let cookie='',csrf='';
   const request=(path:string,method='GET',value?:unknown,extra:Record<string,string>={})=>fetch(url+path,{method,headers:{Origin:'https://panel.example.com','Content-Type':'application/json',Cookie:cookie,'X-CSRF-Token':csrf,...extra},...(value===undefined?{}:{body:JSON.stringify(value)})});
@@ -121,6 +121,10 @@ test('admin API enforces session, role, CSRF, origin, stop confirmation and secr
       reportFailure=error;const failure=await request('/api/reports?from=2026-10-01&to=2026-10-31');
       assert.equal(failure.status,503);assert.equal(failure.headers.get('retry-after'),'300');
       assert.equal(failure.headers.get('cache-control'),'no-store');assert.doesNotMatch(await failure.text(),/private SQL/);
+    }
+    for(const code of ['REPORT_INITIALIZING','REPORT_SNAPSHOT_STALE','REPORT_SNAPSHOT_INVALID','REPORT_SNAPSHOT_INCOMPATIBLE','REPORT_SNAPSHOT_MIGRATION_REQUIRED']){
+      reportFailure=new WorkerError(code);const failure=await request('/api/reports?from=2026-10-01&to=2026-10-31');assert.equal(failure.status,503);
+      assert.equal(failure.headers.get('retry-after'),['REPORT_INITIALIZING','REPORT_SNAPSHOT_STALE'].includes(code)?'30':'300');assert.equal((await failure.json() as {error:string}).error,code);
     }
     reportFailure=new WorkerError('REPORT_PERIOD_INVALID');assert.equal((await request('/api/reports?from=bad&to=bad')).status,400);
     reportFailure=undefined;

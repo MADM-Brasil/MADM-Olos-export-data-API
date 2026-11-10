@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import pg from 'pg';
-import { AdminReports, reportPlaceholder, reportWhitespace, reportStatementTimeoutMs } from '../src/admin/reports.js';
+import { LegacyAdminReports as AdminReports, reportPlaceholder, reportWhitespace, reportStatementTimeoutMs } from './fixtures/admin-reports-legacy.js';
 const url=process.env.TEST_DATABASE_URL;
 if(!url)throw new Error('Use scripts/test-admin-reports.sh');
 const parsed=new URL(url);
@@ -38,7 +38,7 @@ test('read-only database role can produce reports; cached snapshot is explicit a
   await pool.query('CREATE ROLE admin_report_reader LOGIN; GRANT USAGE ON SCHEMA raw,olos_http TO admin_report_reader; GRANT SELECT ON ALL TABLES IN SCHEMA raw,olos_http TO admin_report_reader');
   const safeURL=new URL(url!);safeURL.username='admin_report_reader';const safePool=new pg.Pool({connectionString:safeURL.toString()});
   try{
-    const settings="SELECT current_setting('jit') AS jit,current_setting('statement_timeout') AS timeout,current_setting('lock_timeout') AS lock_timeout";
+    const settings="SELECT current_setting('jit') AS jit,current_setting('statement_timeout') AS timeout,current_setting('lock_timeout') AS lock_timeout,current_setting('work_mem') AS work_mem,current_setting('hash_mem_multiplier') AS hash_mem_multiplier,current_setting('max_parallel_workers_per_gather') AS parallel_workers";
     const before=(await safePool.query(settings)).rows;
     const r=new AdminReports(safePool,source,{schema:'raw',table:'olos_calls'}),first=await read(r);
     assert.deepEqual((await safePool.query(settings)).rows,before,'report settings must not leak to the shared pool');assert.equal(first.summary.calls,'12');assert.deepEqual(await read(r),first);await assert.rejects(safePool.query('UPDATE raw.olos_calls SET nome_agente=NULL'),/permission denied/);}finally{await safePool.end();}
@@ -67,6 +67,23 @@ test('all report fields match the frozen legacy query for multiple ranges and em
   }
   const empty=await new AdminReports(pool,'empty-source',{schema:'raw',table:'olos_calls'}).read('2026-10-01','2026-10-31') as any;
   assert.equal(empty.summary.calls,'0');assert.equal(empty.summary.operators,'0');assert.equal(empty.summary.undated,'0');assert.deepEqual(empty.daily,[]);
+});
+test('rejected P0 candidate remains exactly equivalent to the immediately preceding snapshot query, including collection date',async()=>{
+  const oracle=await readFile('test/fixtures/admin-reports-pre-p0.sql','utf8');
+  const candidate=await readFile('test/fixtures/admin-reports-candidate-p0.sql','utf8');
+  const normalize=(rows:pg.QueryResultRow[])=>rows.map(row=>({...row,
+    operator_ids:row.operator_ids===null?null:[...row.operator_ids as string[]].sort()}));
+  let compared=false;
+  const wrapped={async connect(){const db=await pool.connect();return {async query(sql:string,values?:unknown[]){
+    const actual=await db.query(sql.startsWith('WITH classified')?candidate:sql,values);
+    if(sql.startsWith('WITH classified')){
+      const before=await db.query(oracle,values);
+      assert.deepEqual(normalize(actual.rows),normalize(before.rows));compared=true;
+    }
+    return actual;
+  },release(){db.release();}};}} as unknown as pg.Pool;
+  const report=new AdminReports(wrapped,source,{schema:'raw',table:'olos_calls'});
+  await report.read('2026-01-01','2026-12-31');await report.today();assert(compared);
 });
 test('receipt classification keeps partial receipts and target divergence inconsistent',async()=>{
   const cases=["remote_raw_id=123", "confirmed_at=now()", "target_id=999999", "source_hash='divergent'"];

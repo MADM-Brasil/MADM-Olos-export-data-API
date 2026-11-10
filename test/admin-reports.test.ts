@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reportRange, reportPlaceholder, reportWhitespace, AdminReports } from '../src/admin/reports.js';
+import { reportRange, reportPlaceholder, reportWhitespace, LegacyAdminReports as AdminReports } from './fixtures/admin-reports-legacy.js';
 import type { Pool } from 'pg';
 
 test('report period is a real inclusive calendar range, at most 366 days', () => {

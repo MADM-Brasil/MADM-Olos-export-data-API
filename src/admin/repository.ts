@@ -1,6 +1,6 @@
 import pg from 'pg';
 import { AdminReports } from './reports.js';
-import { WorkerError, errorCode } from '../errors.js';
+import { WorkerError, errorCode, log } from '../errors.js';
 import { assertSchema } from '../schema.js';
 import type { CycleReport } from '../worker.js';
 
@@ -22,7 +22,7 @@ export class AdminRepository implements SchedulerRepository {
   readonly pool: pg.Pool;
   private owner: pg.PoolClient | undefined;
   private alive = false;
-  constructor(url: string, readonly source: string, private readonly destination = { schema: 'raw', table: 'olos_calls' }) {
+  constructor(private readonly url: string, readonly source: string, private readonly destination = { schema: 'raw', table: 'olos_calls' }) {
     this.pool = new pg.Pool({ connectionString: url, max: 4, connectionTimeoutMillis: 10000, statement_timeout: 10000 });
     this.pool.on('error', () => { this.alive = false; });
   }
@@ -184,15 +184,21 @@ export class AdminRepository implements SchedulerRepository {
     } finally { db?.release(); }
   }
   private reportReader: AdminReports | undefined;
+  private reportPool: pg.Pool | undefined;
+  private reportsReader() {
+    if(!this.reportReader){
+      this.reportPool=new pg.Pool({connectionString:this.url,max:1,connectionTimeoutMillis:1000,statement_timeout:5000,application_name:'olos-report-reader'});
+      this.reportPool.on('error',()=>log('report_reader_connection_lost',{error:'REPORT_UNAVAILABLE'}));
+      this.reportReader=new AdminReports(this.reportPool,this.source,this.destination);
+    }
+    return this.reportReader;
+  }
   reports(from: unknown, to: unknown) {
-    this.check();
-    this.reportReader ??= new AdminReports(this.pool, this.source, this.destination);
-    return this.reportReader.read(from, to);
+    // Persisted analytics reads require no cursor/scheduler ownership.
+    return this.reportsReader().read(from,to);
   }
   today() {
-    this.check();
-    this.reportReader ??= new AdminReports(this.pool, this.source, this.destination);
-    return this.reportReader.today();
+    return this.reportsReader().today();
   }
   async logs() {
     this.check();
@@ -202,5 +208,5 @@ export class AdminRepository implements SchedulerRepository {
   async auditLog() {
     this.check(); return (await this.pool.query('SELECT id,actor,action,occurred_at,metadata FROM olos_http.admin_audit WHERE source_key=$1 ORDER BY id DESC LIMIT 100', [this.source])).rows;
   }
-  async close() { this.alive = false; this.owner?.release(true); this.owner = undefined; await this.pool.end(); }
+  async close() { this.alive = false; this.owner?.release(true); this.owner = undefined; await this.reportPool?.end(); await this.pool.end(); }
 }
