@@ -6,6 +6,7 @@ import { log, retryable, SyncError } from './errors.js';
 import { columns, compare, digest, identityColumns, mapRow, projection, quote, type Row, type Shape } from './mapping.js';
 import { schema } from './schema.js';
 import { assertNoDirectOwnership } from './ownership.js';
+import { campaignAdmissionSql, assertCampaignAllowed } from './campaign-policy.js';
 
 function stopped(signal: AbortSignal): void {
   if (signal.aborted) throw new SyncError('STOP_REQUESTED');
@@ -23,10 +24,11 @@ async function assertBinding(db: Client, cfg: Config): Promise<void> {
 }
 async function selectBatch(db: Client, shape: Shape, cfg: Config, controls: boolean): Promise<Row[]> {
   const p = projection(shape, 's', true, cfg);
+  const campaign=campaignAdmissionSql('s.nome_campanha_olos',p.parameters.length+2);
   const result = await db.query(`SELECT ${p.sql} FROM raw.olos_calls s
     ${controls ? 'LEFT JOIN corporate_sync.receipts r ON r.internal_id_olos=s.internal_id_olos' : ''}
-    ${controls ? 'WHERE r.internal_id_olos IS NULL' : ''}
-    ORDER BY s.internal_id_olos LIMIT $${p.parameters.length + 1}`, [...p.parameters, cfg.batchSize]);
+    WHERE ${controls ? 'r.internal_id_olos IS NULL AND' : ''} ${campaign.sql}
+    ORDER BY s.internal_id_olos LIMIT $${p.parameters.length + 1}`, [...p.parameters, cfg.batchSize,...campaign.parameters]);
   return result.rows.map(row => mapRow(row, shape, cfg));
 }
 function pendingRows(value: unknown, shape: Shape, cfg: Config): Row[] {
@@ -36,6 +38,7 @@ function pendingRows(value: unknown, shape: Shape, cfg: Config): Row[] {
     return mapRow(raw as Record<string, unknown>, shape, cfg);
   });
   if (new Set(rows.map(row => row.internal_id_olos)).size !== rows.length) throw new SyncError('PENDING_BATCH_INVALID');
+  for(const row of rows)assertCampaignAllowed(row.nome_campanha_olos);
   return rows;
 }
 
@@ -63,6 +66,7 @@ export async function deliver(db: Client, rows: Row[], shape: Shape, cfg: Config
   assertWriteAuthorized(cfg);
   stopped(signal);
   // Reject duplicates within the source batch as well as pre-existing destination calls.
+  for(const row of rows)assertCampaignAllowed(row.nome_campanha_olos);
   const identities = rows.map(row => JSON.stringify(identityColumns.map(name => row[name])));
   if (new Set(identities).size !== identities.length) throw new SyncError('DUPLICATE_LOGICAL_IDENTITY');
   await destinationMatches(db, rows, shape, cfg);
@@ -87,6 +91,7 @@ export interface Hooks {
   beforeLocalCommit?: () => Promise<void>;
 }
 async function remoteBatch(rows: Row[], cfg: Config, signal: AbortSignal, hooks: Hooks): Promise<{ inserted: number; existing: number }> {
+  for(const row of rows)assertCampaignAllowed(row.nome_campanha_olos);
   for (let attempt = 0; ; attempt++) {
     stopped(signal);
     let remote: Client | undefined;

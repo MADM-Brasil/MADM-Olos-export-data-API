@@ -9,6 +9,7 @@ import { corporateSchema, freeze, matches, uniqueIdentities } from './contract.j
 import { eligibleOperator } from './operator-eligibility.js';
 import { reconcileLegacy } from './reconcile.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
+import { campaignPolicyCode, campaignAdmissionSql, assertCampaignAllowed, isCampaignPolicyError } from '../corporate-sync/campaign-policy.js';
 
 // Match JavaScript trim semantics for operator admission.
 const operatorNameWhitespace =
@@ -38,6 +39,8 @@ export class CorporateDelivery {
     if (!(await local.query('SELECT pg_try_advisory_lock(17320914,1) AS ok')).rows[0].ok) throw new SyncError('CORPORATE_SYNC_STILL_RUNNING');
     await local.query('SELECT binding FROM olos_http.corporate_control LIMIT 0');
     await local.query('SELECT source_id,state,payload FROM olos_http.corporate_outbox LIMIT 0');
+    try { await local.query('SELECT delivery_policy_code FROM olos_http.corporate_outbox LIMIT 0'); }
+    catch(error){if((error as {code?:string}).code==='42703')throw new SyncError('CORPORATE_CAMPAIGN_POLICY_MIGRATION_REQUIRED');throw error;}
     const state = (await local.query('SELECT source_key,target_table,binding FROM olos_http.corporate_control WHERE singleton')).rows[0];
     if (state && (state.source_key !== this.source || state.target_table !== this.target || state.binding !== this.cfg.binding)) throw new SyncError('CORPORATE_BINDING_CHANGED');
   }
@@ -142,14 +145,16 @@ export class CorporateDelivery {
       }
       const id = integerValue((await local.query('SELECT nextval($1::regclass)::text AS id', [sequence])).rows[0].id, 32);
       const payload = (await freeze(local, [{ ...record, internal_id_olos: id }], shape, this.cfg))[0]!;
-      const deliveryState = eligibleOperator(
+      const campaignCode=campaignPolicyCode(payload.nome_campanha_olos);
+      const deliveryState = campaignCode!=='MANUAL_CAMPAIGN_EXCLUDED'&&eligibleOperator(
         record.agent_id,
         payload.nome_agente
       ) ? 'pending' : 'skipped';
       await local.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,campaign_id,disposition_id)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [this.source, record.source_id, this.target, id, record.source_hash, record.agent_id, record.campaign_id, record.disposition_id]);
-      await local.query(`INSERT INTO olos_http.corporate_outbox(source_key,source_id,target_id,source_hash,payload,payload_hash,origin,state)
-        VALUES($1,$2,$3,$4,$5,$6,'capture',$7)`, [this.source, record.source_id, id, record.source_hash, JSON.stringify(payload), digest(payload), deliveryState]);
+      const policyCode=campaignCode==='MANUAL_CAMPAIGN_EXCLUDED'||deliveryState==='pending'?campaignCode:null;
+      await local.query(`INSERT INTO olos_http.corporate_outbox(source_key,source_id,target_id,source_hash,payload,payload_hash,origin,state,delivery_policy_code)
+        VALUES($1,$2,$3,$4,$5,$6,'capture',$7,$8)`, [this.source, record.source_id, id, record.source_hash, JSON.stringify(payload), digest(payload), deliveryState,policyCode]);
       if (deliveryState === 'pending') queued++;
       else skipped++;
     }
@@ -186,6 +191,7 @@ export class CorporateDelivery {
       } else if (state.paused || state.blocked || state.retry_wait) { await local.query('COMMIT'); return empty; }
       // Homologation retains its existing selection contract.
       // Automatic delivery admits only calls with identified operators.
+      const campaign=campaignAdmissionSql("o.payload->>'nome_campanha_olos'",5);
       const entries = homologation
         ? (await local.query(`SELECT source_id,target_id::text,payload,payload_hash
             FROM olos_http.corporate_outbox
@@ -202,15 +208,21 @@ export class CorporateDelivery {
               AND jsonb_typeof(o.payload->'nome_agente')='string'
               AND btrim(o.payload->>'nome_agente',$3)<>''
               AND btrim(o.payload->>'nome_agente',$3) !~* $4
+              AND jsonb_typeof(o.payload->'nome_campanha_olos')='string'
+              AND ${campaign.sql}
             ORDER BY o.target_id LIMIT $2
             FOR UPDATE OF o,r`,
             [
               this.source,
               this.cfg.connection.batchSize,
               operatorNameWhitespace,
-              operatorNamePlaceholderPattern
+              operatorNamePlaceholderPattern,
+              ...campaign.parameters
             ])).rows;
       if (!entries.length) { await local.query('COMMIT'); return empty; }
+      // Validate the complete selected set, including the one-shot/manual path.
+      // Never silently remove entries from a previously selected/frozen batch.
+      for(const entry of entries)assertCampaignAllowed(entry.payload?.nome_campanha_olos);
       let found: Map<string, string>;
       let inserted = 0;
       let commitIssued = false;
@@ -230,6 +242,7 @@ export class CorporateDelivery {
         found = await matches(remote, rows, shape, this.cfg);
         for (const row of rows) {
           beforeRemoteEffect();
+          assertCampaignAllowed(row.nome_campanha_olos);
           // Exact existing rows are never INSERTed again; even their corporate trigger is not invoked.
           if (found.has(row.internal_id_olos!)) continue;
           const insertion = await remote.query(`INSERT INTO raw.olos_calls (${columns.map(quote).join(',')})
@@ -278,7 +291,7 @@ export class CorporateDelivery {
     } catch (error) {
       await rollback(local);
       // A local/fencing failure cannot be hidden as a corporate outage: stop the owning consumer.
-      if (!remoteFailure) this.localFailure();
+      if (!remoteFailure&&!(homologation&&isCampaignPolicyError(error))) this.localFailure();
       throw error;
     } finally {
       if (remote) await remote.end().catch(() => {});

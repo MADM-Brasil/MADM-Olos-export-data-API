@@ -18,7 +18,7 @@ export function shape(): Shape {
 }
 export function row(id = '1'): Row {
   return { internal_id_olos: id, olos_call_id: 'reused-call-id', data_ligacao: '2026-01-01T12:00:00.123456Z',
-    telefone: 'synthetic-phone', nome_agente: 'Synthetic Agent', id_campanha_olos: '7', nome_campanha_olos: null,
+    telefone: 'synthetic-phone', nome_agente: 'Synthetic Agent', id_campanha_olos: '7', nome_campanha_olos: 'Synthetic Campaign',
     id_tabulacao_olos: '3', nome_tabulacao_olos: null, cpf: null, lead_id_origem: null, tma_origem: '10',
     razao_desligamento: null, email: null };
 }
