@@ -27,11 +27,7 @@ export class AdminRepository implements SchedulerRepository {
     this.pool.on('error', () => { this.alive = false; });
   }
   async open(fallback: number, initial: Mode) {
-    this.owner = await this.pool.connect();
-    this.owner.on('error', () => { this.alive = false; });
-    const lock = await this.owner.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired', [`olos-admin:${this.source}`]);
-    if (!lock.rows[0].acquired) throw new WorkerError('SCHEDULER_ALREADY_ACTIVE');
-    this.alive = true;
+    await this.acquire();
     const existing = await this.pool.query('SELECT 1 FROM olos_http.worker_settings WHERE source_key=$1', [this.source]);
     if (!existing.rowCount) {
       await this.pool.query(`INSERT INTO olos_http.worker_settings(source_key,enabled,interval_ms,desired_state,updated_by)
@@ -41,18 +37,42 @@ export class AdminRepository implements SchedulerRepository {
     const saved = await this.settings();
     if (['RUNNING','PAUSING','STOPPING'].includes(saved.runtime_state)) await this.state('ERROR', 'UNCLEAN_SCHEDULER_EXIT');
   }
+  private acquiring: Promise<void> | undefined;
+  private async acquire(): Promise<void> {
+    if (this.alive) return;
+    if (this.acquiring) return this.acquiring;
+    this.acquiring = (async () => {
+      this.owner?.release(true); this.owner = undefined;
+      const owner = await this.pool.connect();
+      owner.on('error', () => { if (this.owner === owner) this.alive = false; });
+      try {
+        const lock = await owner.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired', [`olos-admin:${this.source}`]);
+        if (!lock.rows[0].acquired) throw new WorkerError('SCHEDULER_ALREADY_ACTIVE');
+        this.owner = owner; this.alive = true;
+      } catch (error) { owner.release(true); throw error; }
+    })();
+    try { await this.acquiring; } finally { this.acquiring = undefined; }
+  }
   private check() { if (!this.alive) throw new WorkerError('ADMIN_DATABASE_SESSION_LOST'); }
   async settings(): Promise<Settings> {
-    this.check();
+    await this.acquire();
     const row = (await this.pool.query('SELECT enabled,interval_ms,desired_state,runtime_state,last_error,updated_at,updated_by FROM olos_http.worker_settings WHERE source_key=$1', [this.source])).rows[0];
     if (!row) throw new WorkerError('SCHEDULER_CONFIGURATION_MISSING');
     interval(row.interval_ms); return row;
   }
   async transaction<T>(fn: (db: pg.PoolClient) => Promise<T>) {
     this.check(); const db = await this.pool.connect();
-    try { await db.query('BEGIN'); const result = await fn(db); this.check(); await db.query('COMMIT'); return result; }
-    catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
-    finally { db.release(); }
+    let commitIssued = false, discard = false;
+    try {
+      await db.query('BEGIN'); const result = await fn(db); this.check();
+      commitIssued = true; await db.query('COMMIT'); return result;
+    } catch (error) {
+      await db.query('ROLLBACK').catch(() => {});
+      // A connection failure during COMMIT may have no driver code. Re-read durable state;
+      // never replay the administrative mutation to infer its outcome.
+      if (commitIssued) { discard = true; throw new WorkerError('ADMIN_COMMIT_UNKNOWN', true); }
+      throw error;
+    } finally { db.release(discard); }
   }
   async audit(db: pg.PoolClient, actor: string, action: string, metadata: Record<string, unknown> = {}) {
     await db.query('INSERT INTO olos_http.admin_audit(source_key,actor,action,metadata) VALUES($1,$2,$3,$4)', [this.source, actor, action, JSON.stringify(metadata)]);

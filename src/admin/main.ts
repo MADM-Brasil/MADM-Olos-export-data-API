@@ -30,7 +30,7 @@ export async function runManaged(cfg: Config, web: boolean, env = process.env) {
       if (service) return service.snapshot();
       if (await repo.credentials()) throw new WorkerError('ADMIN_ENCRYPTION_KEY_REQUIRED');
       return { revision: 0, credentials: { baseUrl: cfg.baseUrl, username: cfg.username, password: cfg.password, clientId: cfg.clientId, clientSecret: cfg.clientSecret } };
-    }, report => repo.cycleCompleted(report)), cfg.maxFailures, web);
+    }, report => repo.cycleCompleted(report)), cfg.maxFailures, true);
     if (web) {
       server = adminServer({ origin: env.ADMIN_ORIGIN!, publicDir: resolve('admin/public'), auth: new AdminAuth(users!,
         (username, password) => service!.authenticateUser(username, password), (actor, result) => repo.authEvent(actor, result)),

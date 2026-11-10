@@ -26,3 +26,16 @@ export function log(event: string, fields: Record<string, string | number | bool
   for (const observer of observers) { try { observer(entry); } catch { /* best-effort display only */ } }
 }
 import { SyncError } from './corporate-sync/errors.js';
+
+// Only connectivity/transaction failures are eligible for bounded local revalidation.
+export function recoverableFailure(error: unknown): boolean {
+  if (error instanceof AuthUnavailable) return error.retryable;
+  if (error instanceof WorkerError) return error.retryable || [
+    'RECOVERY_REQUIRED', 'UNCLEAN_SCHEDULER_EXIT', 'DATABASE_SESSION_LOST', 'ADMIN_DATABASE_SESSION_LOST',
+    'DATABASE_RECOVERY_REQUIRED', 'ADMIN_COMMIT_UNKNOWN', 'AUTH_UNAVAILABLE', 'NETWORK_OR_RESPONSE_FAILURE',
+  ].includes(error.code);
+  const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+  return typeof code === 'string' && (code.startsWith('08') || [
+    '57P01', '57P02', '57P03', '40001', '40P01', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE',
+  ].includes(code));
+}

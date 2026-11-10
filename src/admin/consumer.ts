@@ -5,7 +5,7 @@ import { OlosAuthManager } from '../auth.js';
 import { OlosApi } from '../api.js';
 import { StaticCache } from '../cache.js';
 import { Worker, type CycleReport } from '../worker.js';
-import { WorkerError } from '../errors.js';
+import { WorkerError, log } from '../errors.js';
 import type { ScheduledConsumer } from '../scheduler.js';
 import type { Credentials } from './credentials.js';
 
@@ -21,32 +21,60 @@ export async function createScheduledConsumer(cfg: Config,
   try {
     await store.open();
     await store.captureReady();
-    if ((await store.unresolved()).length) throw new WorkerError('RECOVERY_REQUIRED');
+    await assertRecoverable(store);
     const initial = await snapshot();
     if (!Object.values(initial.credentials).every(Boolean)) throw new WorkerError('OLOS_CONFIG_REQUIRED');
   } catch (error) { await store.close(); throw error; }
+  const prepare = async () => {
+    await store.ping();
+    await assertRecoverable(store);
+    const current = await snapshot();
+    if (revision !== current.revision) {
+      if (!Object.values(current.credentials).every(Boolean)) throw new WorkerError('OLOS_CONFIG_REQUIRED');
+      await http?.close();
+      http = new HttpTransport(current.credentials.baseUrl, cfg.timeoutMs, cfg.maxResponseBytes, abort.signal, cfg.tlsVerify);
+      const auth = new OlosAuthManager(http.request, current.credentials);
+      const api = new OlosApi(http.request, auth);
+      worker = new Worker(store, api, new StaticCache(api, cfg.cacheTtlMs));
+      revision = current.revision;
+    }
+  };
+  try {
+    await prepare();
+    if ((await store.unresolved()).length) {
+      await worker!.initialize();
+      log('local_recovery_completed', await store.drain(worker!.cache.value));
+      if ((await store.unresolved()).length) throw new WorkerError('RECONCILIATION_REQUIRED');
+    }
+  } catch (error) {
+    const disconnected = abort.signal.aborted;
+    abort.abort();
+    try { await http?.close(); } finally { await store.close(); }
+    throw disconnected ? new WorkerError('DATABASE_SESSION_LOST') : error;
+  }
   return {
     async cycle() {
-      await store.ping();
-      // Do not let the panel implicitly normalize a pending capture during start/resume.
-      if ((await store.unresolved()).length) throw new WorkerError('RECOVERY_REQUIRED');
-      const current = await snapshot();
-      if (revision !== current.revision) {
-        if (!Object.values(current.credentials).every(Boolean)) throw new WorkerError('OLOS_CONFIG_REQUIRED');
-        await http?.close();
-        http = new HttpTransport(current.credentials.baseUrl, cfg.timeoutMs, cfg.maxResponseBytes, abort.signal, cfg.tlsVerify);
-        const auth = new OlosAuthManager(http.request, current.credentials);
-        const api = new OlosApi(http.request, auth);
-        worker = new Worker(store, api, new StaticCache(api, cfg.cacheTtlMs));
-        revision = current.revision;
+      try {
+        await prepare();
+        const report = await worker!.cycle();
+        // A failed audit must never replay this read; durable state gates later admission.
+        if (completed) await completed(report);
+      } catch (error) {
+        if (abort.signal.aborted) throw new WorkerError('DATABASE_SESSION_LOST');
+        throw error;
       }
-      const report = await worker!.cycle();
-      // Telemetry failure must not replay a committed remote read; caller stops on this local failure.
-      if (completed) await completed(report);
     },
     suspendDelivery() { store.delivery?.suspend(); },
     resumeDelivery() { store.delivery?.allow(); },
     async settleDelivery() { await store.delivery?.settle(); },
-    async close() { await http?.close(); await store.close(); },
+    async close() { abort.abort(); try { await http?.close(); } finally { await store.close(); } },
   };
+}
+
+// Durable responses use the existing drain path; uncertainty is never resolved here.
+async function assertRecoverable(store: Store): Promise<void> {
+  const pending = await store.unresolved();
+  if (pending.some(read => read.state === 'reading')) {
+    throw new WorkerError('RECONCILIATION_REQUIRED');
+  }
 }

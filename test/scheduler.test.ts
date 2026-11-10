@@ -23,9 +23,9 @@ function repository(mode:Mode='RUNNING',ms=120000) {
   const audit:{actor:string;mode?:Mode;interval_ms?:number;state?:State}[]=[];
   let fail=false;
   const repo:SchedulerRepository={
-    async settings(){if(fail)throw new Error('database unavailable');return {...saved};},
-    async change(actor,patch){if(fail)throw new Error('database unavailable');if(patch.interval_ms!==undefined)saved.interval_ms=interval(patch.interval_ms);if(patch.mode){saved.desired_state=patch.mode;saved.enabled=patch.mode==='RUNNING';}saved.updated_by=actor;audit.push({actor,...patch});},
-    async state(state,error){if(fail)throw new Error('database unavailable');saved.runtime_state=state;saved.last_error=error??null;audit.push({actor:'system:scheduler',state});},
+    async settings(){if(fail)throw new WorkerError('ADMIN_DATABASE_SESSION_LOST');return {...saved};},
+    async change(actor,patch){if(fail)throw new WorkerError('ADMIN_DATABASE_SESSION_LOST');if(patch.interval_ms!==undefined)saved.interval_ms=interval(patch.interval_ms);if(patch.mode){saved.desired_state=patch.mode;saved.enabled=patch.mode==='RUNNING';}saved.updated_by=actor;audit.push({actor,...patch});},
+    async state(state,error){if(fail)throw new WorkerError('ADMIN_DATABASE_SESSION_LOST');saved.runtime_state=state;saved.last_error=error??null;audit.push({actor:'system:scheduler',state});},
   };
   return {saved,audit,repo,outage:()=>{fail=true;},restore:()=>{fail=false;}};
 }
@@ -84,9 +84,9 @@ test('parallel run is rejected and competing consumer lock failure enters ERROR'
   assert.equal(blocked.scheduler.status().state,'ERROR');assert.equal(blocked.cycles(),0);
 });
 test('ambiguous pending read never automatically retries or resumes',async t=>{
-  const f=await setup(t,{cycle:async()=>{throw new WorkerError('RECOVERY_REQUIRED');}});
+  const f=await setup(t,{cycle:async()=>{throw new WorkerError('RECONCILIATION_REQUIRED');}});
   assert.equal(f.scheduler.status().state,'ERROR');await f.c.advance(3600000);assert.equal(f.cycles(),1);
-  assert.equal(f.scheduler.status().error,'RECOVERY_REQUIRED');
+  assert.equal(f.scheduler.status().error,'RECONCILIATION_REQUIRED');
 });
 test('backoff preserves Retry-After even when operator shortens interval',async t=>{
   let calls=0;const f=await setup(t,{cycle:async()=>{if(++calls===1)throw new AuthUnavailable(new HttpError(429,300000));}});
@@ -99,11 +99,11 @@ test('bounded auth failure retries and DB outage never cause aggressive reads',a
   await f.c.advance(120000);assert.equal(f.cycles(),2);assert.equal(f.scheduler.status().state,'ERROR');
   const db=await setup(t);db.r.outage();await db.c.advance(120000);assert.equal(db.cycles(),1);assert.equal(db.scheduler.status().state,'ERROR');db.r.restore();
 });
-test('stop requested while source preflight awaits prevents first consuming cycle',async t=>{
+for (const mode of ['STOPPED','PAUSED'] as const) test(`${mode} requested while source preflight awaits prevents first consuming cycle`,async t=>{
   const ready=gate();let cycles=0;
   const f=await setup(t,{factory:async()=>{await ready.promise;return {async cycle(){cycles++;},async close(){}};}});
-  await f.scheduler.request('admin:ana',{mode:'STOPPED'});ready.resolve();await flush();
-  assert.equal(cycles,0);assert.equal(f.scheduler.status().state,'STOPPED');
+  await f.scheduler.request('admin:ana',{mode});ready.resolve();await flush();
+  assert.equal(cycles,0);assert.equal(f.scheduler.status().state,mode);
 });
 test('explicit start re-arms ERROR only through consumer preflight',async t=>{
   let create=0,cycles=0;
@@ -114,4 +114,81 @@ test('explicit start re-arms ERROR only through consumer preflight',async t=>{
 test('interval rejects values outside 1–60 minutes and accepts boundaries',()=>{
   for(const value of [0,59999,3600001,NaN,60000.1,'60000',null,undefined])assert.throws(()=>interval(value),/SCHEDULER_INTERVAL_INVALID/);
   assert.equal(interval(60000),60000);assert.equal(interval(3600000),3600000);
+});
+
+test('safe recovery reopens consumer with bounded delay and resumes automatically', async t => {
+  let created = 0, calls = 0;
+  const f = await setup(t, {factory: async () => {
+    created++;
+    return {async cycle() { if (++calls === 1) throw new WorkerError('RECOVERY_REQUIRED'); }, async close() {}};
+  }});
+  assert.equal(created, 1);
+  await flush(); assert.equal(created, 1);
+  await f.c.advance(120000); assert.equal(created, 2); assert.equal(calls, 2);
+  assert.equal(f.scheduler.status().state, 'RUNNING');
+});
+for (const mode of ['PAUSED','STOPPED'] as const) test(`recovery respects ${mode} and shutdown preserves intent`, async t => {
+  let created = 0;
+  const f = await setup(t, {factory: async () => { created++; throw new WorkerError('RECOVERY_REQUIRED'); }});
+  await f.scheduler.request('operator', {mode}); await flush();
+  await f.c.advance(3600000); assert.equal(created, 1); assert.equal(f.scheduler.status().state, mode);
+  f.scheduler.shutdown(); await f.running; assert.equal(f.r.saved.desired_state, mode);
+});
+test('repeated recovery failures exhaust a finite attempt budget', async t => {
+  let created = 0;
+  const f = await setup(t, {maxFailures: 3, factory: async () => { created++; throw new WorkerError('RECOVERY_REQUIRED'); }});
+  for (let i=0;i<5;i++) await f.c.advance(120000);
+  assert.equal(created,3); assert.equal(f.scheduler.status().state,'ERROR');
+});
+test('database settings failure recovers after bounded wait', async t => {
+  const f = await setup(t); f.r.outage(); await f.c.advance(120000);
+  f.r.restore();
+  await f.c.advance(120000);
+  assert.equal(f.scheduler.status().state,'RUNNING');
+});
+
+for (const last_error of ['UNCLEAN_SCHEDULER_EXIT','RECOVERY_REQUIRED']) test(`restart revalidates ${last_error} before resuming`,async()=>{
+  const r=repository();r.saved.runtime_state='ERROR';r.saved.last_error=last_error;
+  const c=clock();let cycles=0;
+  const scheduler=new DynamicScheduler(r.repo,async()=>({async cycle(){cycles++;},async close(){}}),5,true,c,()=>{});
+  const running=scheduler.run();await flush();assert.equal(cycles,1);
+  scheduler.shutdown();await running;assert.equal(r.saved.desired_state,'RUNNING');
+});
+
+test('permanent authentication rejection never schedules automatic recovery',async t=>{
+  const f=await setup(t,{cycle:async()=>{throw new AuthUnavailable(new HttpError(403));}});
+  await f.c.advance(120000);await f.c.advance(120000);
+  assert.equal(f.cycles(),1);assert.equal(f.scheduler.status().state,'ERROR');
+});
+for(const mode of ['PAUSED','STOPPED'] as const)test(`committed ${mode} with lost acknowledgement is observed from terminal ERROR`,async t=>{
+  const f=await setup(t,{cycle:async()=>{throw new WorkerError('RECONCILIATION_REQUIRED');}});
+  const change=f.r.repo.change.bind(f.r.repo);
+  t.mock.method(f.r.repo,'change',async(actor:string,patch:{interval_ms?:number;mode?:Mode})=>{
+    await change(actor,patch);throw new Error('lost commit acknowledgement');
+  });
+  await assert.rejects(f.scheduler.request('operator',{mode}));await flush();
+  assert.equal(f.r.saved.desired_state,mode);assert.equal(f.scheduler.status().state,mode);
+  await f.c.advance(3600000);assert.equal(f.cycles(),1);
+});
+
+test('lost acknowledgement of RUNNING state COMMIT revalidates consumer before first read',async t=>{
+  let created=0,cycles=0;
+  const f=await setup(t,{mode:'PAUSED',factory:async()=>{
+    created++;return {async cycle(){cycles++;},async close(){}};
+  }});
+  const state=f.r.repo.state.bind(f.r.repo);let injected=false;
+  t.mock.method(f.r.repo,'state',async(value:State,error?:string)=>{
+    await state(value,error);
+    if(value==='RUNNING'&&!injected){injected=true;throw new WorkerError('ADMIN_COMMIT_UNKNOWN',true);}
+  });
+  await f.scheduler.request('operator',{mode:'RUNNING'});await flush();
+  assert.equal(cycles,0);assert.equal(created,1);assert.equal(f.scheduler.status().state,'ERROR');
+  await f.c.advance(120000);assert.equal(created,2);assert.equal(cycles,1);
+});
+test('failed administrative mutation before COMMIT cannot rearm a terminal ERROR',async t=>{
+  const f=await setup(t,{cycle:async()=>{throw new WorkerError('RECONCILIATION_REQUIRED');}});
+  t.mock.method(f.r.repo,'change',async()=>{throw new Error('before commit');});
+  await assert.rejects(f.scheduler.request('operator',{mode:'PAUSED'}));await flush();
+  assert.equal(f.r.saved.desired_state,'RUNNING');assert.equal(f.scheduler.status().state,'ERROR');
+  await f.c.advance(3600000);assert.equal(f.cycles(),1);
 });

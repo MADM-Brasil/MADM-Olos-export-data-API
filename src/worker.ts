@@ -137,7 +137,7 @@ export class Worker {
         log('batch_completed', report);
         return report; // Evidence only, returned after the existing persistence path has completed.
       } catch (error) {
-        if (error instanceof AuthUnavailable || error instanceof HttpError && [400,401,403,429].includes(error.status)) {
+        if (error instanceof AuthUnavailable) {
           await this.store.rejected(id, errorCode(error));
           throw error;
         }

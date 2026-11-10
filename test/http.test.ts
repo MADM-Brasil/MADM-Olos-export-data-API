@@ -33,15 +33,15 @@ test('HTTP multipart auth/current-day and 200 array empty/non-empty through real
     assert.deepEqual(rows(await api.read({kind:'current'})),[]);assert.equal(sockets.size,1);
   } finally {await h.close();await s.close();}
 });
-test('429 Retry-After, bounded safe retries, network ambiguity never repeats consuming read',async()=>{
+test('bounded safe retries apply only to non-consuming operations',async()=>{
   let count=0;const waits:number[]=[];
   const request:Transport=async()=>{if(++count<3)throw new HttpError(429,7000);return '[]';};
-  assert.equal(await new OlosApi(request,auth(),async ms=>{waits.push(ms);}).read({kind:'current'}),'[]');
+  assert.equal(await new OlosApi(request,auth(),async ms=>{waits.push(ms);}).call('/api/export-data/available-tables'),'[]');
   assert.deepEqual(waits,[7000,7000]);
-  for(const error of [new HttpError(500),new WorkerError('NETWORK_OR_RESPONSE_FAILURE',true)]) {
+  for(const error of [new HttpError(400),new HttpError(401),new HttpError(403),new HttpError(429),new HttpError(500),new WorkerError('NETWORK_OR_RESPONSE_FAILURE',true)]) {
     count=0;const api=new OlosApi(async()=>{count++;throw error;},auth(),async()=>{});
     await assert.rejects(api.read({kind:'current'}));assert.equal(count,1);
-    count=0;await assert.rejects(api.call('/api/export-data/available-tables'));assert.equal(count,3);
+    count=0;await assert.rejects(api.call('/api/export-data/available-tables'));assert.equal(count,error instanceof HttpError && [400,403].includes(error.status)?1:error instanceof HttpError && error.status===401?2:3);
   }
   assert.equal(retryAfter('2'),2000);assert.equal(retryAfter('Thu, 01 Jan 1970 00:00:03 GMT',1000),2000);
 });

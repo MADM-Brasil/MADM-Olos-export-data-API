@@ -58,17 +58,17 @@ test('refresh outage does not use password fallback; inflight clears for later r
   assert.equal(calls,2);outage=false;await auth.getToken();assert.equal(calls,3);
 });
 
-test('401 refreshes and retries exactly once; stale 401 does not invalidate newer token', async()=>{
+test('reference 401 refreshes once; stale 401 does not invalidate newer token', async()=>{
   let authCalls=0, readCalls=0;
   const request:Transport=async(path)=>{
     if(path==='/api/auth') return token(`a${++authCalls}`);
     if(++readCalls===1)throw new HttpError(401);return '[]';
   };
   const auth=new OlosAuthManager(request,credentials); const api=new OlosApi(request,auth);
-  assert.equal(await api.read({kind:'current'}),'[]'); assert.equal(authCalls,2); assert.equal(readCalls,2);
+  assert.equal(await api.call('/api/export-data/available-tables'),'[]'); assert.equal(authCalls,2); assert.equal(readCalls,2);
   auth.invalidate('a1');assert.equal(await auth.getToken(),'a2');assert.equal(authCalls,2);
   const failing=new OlosApi(async()=>{readCalls++;throw new HttpError(401);},auth);
-  const before=readCalls;await assert.rejects(failing.read({kind:'current'}),/HTTP_401/);assert.equal(readCalls-before,2);
+  const before=readCalls;await assert.rejects(failing.call('/api/export-data/available-tables'),/HTTP_401/);assert.equal(readCalls-before,2);
 });
 
 test('initial auth outage and malformed expiry never dispatch data requests', async()=>{

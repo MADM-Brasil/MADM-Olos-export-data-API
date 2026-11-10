@@ -134,7 +134,7 @@ export class Store {
     await this.db().query('UPDATE olos_http.reads SET error_code=$2 WHERE id=$1 AND source_key=$3', [id, code, this.cfg.sourceKey]);
   }
   async rejected(id: string, code: string) {
-    await this.db().query("UPDATE olos_http.reads SET state='resolved',finished_at=clock_timestamp(),error_code=$2,resolution='HTTP explicit rejection; no successful response' WHERE id=$1 AND source_key=$3 AND state='reading'", [id, code, this.cfg.sourceKey]);
+    await this.db().query("UPDATE olos_http.reads SET state='resolved',finished_at=clock_timestamp(),error_code=$2,resolution='Authentication failed before consuming transport invocation' WHERE id=$1 AND source_key=$3 AND state='reading'", [id, code, this.cfg.sourceKey]);
   }
   async drain(cache: Cache) {
     const total: { received: number; inserted: number; updated: number; duplicates: number; queued?: number; skipped?: number } =

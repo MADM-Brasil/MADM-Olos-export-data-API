@@ -9,6 +9,7 @@ import { OlosApi } from '../src/api.js';
 import { OlosAuthManager } from '../src/auth.js';
 import { StaticCache } from '../src/cache.js';
 import { Worker } from '../src/worker.js';
+import { createScheduledConsumer } from '../src/admin/consumer.js';
 import { WorkerError, HttpError } from '../src/errors.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -146,10 +147,10 @@ test('worker ambiguous network/500 creates persistent block, never automatic rec
   await assert.rejects(worker.cycle(),/RECOVERY_REQUIRED/);await assert.rejects(worker.cycle(),/RECOVERY_REQUIRED/);
   assert.equal(mock.count(),1);assert.equal((await s.unresolved())[0]!.state,'reading');
 });
-test('worker 403 stops explicitly without unresolved successful read',async()=>{
+test('worker 403 preserves uncertain read without a documented no-consumption guarantee',async()=>{
   const s=await store();const mock=fakeApi(async()=>{throw new HttpError(403);});
   const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
-  await assert.rejects(worker.cycle(),/HTTP_403/);assert.equal(mock.count(),1);assert.equal((await s.unresolved()).length,0);
+  await assert.rejects(worker.cycle(),/RECOVERY_REQUIRED/);assert.equal(mock.count(),1);assert.equal((await s.unresolved())[0]!.state,'reading');
 });
 test('worker concurrent cycle is rejected',async()=>{
   const s=await store();let release!:()=>void;
@@ -320,4 +321,73 @@ test('baseline com lote totalmente antigo avança checkpoint', async () => {
 
   assert.equal(progress.rows[0].processed_count, 2);
   assert.equal(progress.rows[0].state, 'done');
+});
+
+// Exercise the production consumer with real local HTTP and durable recovery state.
+async function simulatedOlos() {
+  let consuming = 0;
+  const catalog = [
+    {TableName:'AttemptsRawData',Columns:['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId']},
+    {TableName:'Users',Columns:['AgentId','UserName']}, {TableName:'Campaign',Columns:['CampaignId','Description']},
+    {TableName:'Disposition',Columns:['DispositionId','Description']},
+  ];
+  const server = createServer(async (req,res) => {
+    for await (const _ of req) { /* consume multipart */ }
+    if (req.url === '/api/auth') res.end(JSON.stringify({access_token:'fixture',token_type:'bearer',expires_in:3600}));
+    else if (req.url?.endsWith('/available-tables')) res.end(JSON.stringify(catalog));
+    else if (req.url?.endsWith('/read-data')) res.end('[]');
+    else { consuming++; res.end('[]'); }
+  });
+  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  const address = server.address(); assert(address && typeof address !== 'string');
+  return {count:()=>consuming, snapshot:async()=>({revision:0,credentials:{baseUrl:`http://127.0.0.1:${address.port}`,username:'u',password:'p',clientId:'i',clientSecret:'s'}}),
+    close:()=>new Promise<void>(resolve=>server.close(()=>resolve()))};
+}
+const managedConfig = () => ({...cfg,ingestionBaseline:'2026-10-01T00:00:00Z',sourceTimeZone:'UTC'});
+for (const [emptyResponse,kind] of [[false,'current'],[true,'current'],[false,'previous']] as const) test(`scheduler consumer recovers durable received ${kind} (${emptyResponse ? 'empty' : 'rows'}) before admitting any POST`, async () => {
+  const s=await store(); await stage(s,emptyResponse ? [] : [row('1'),row('2'),row('3')],kind);
+  await s.close(); stores.splice(stores.indexOf(s),1);
+  const mock=await simulatedOlos();
+  try {
+    const consumer=await createScheduledConsumer(managedConfig(),mock.snapshot);
+    try {
+      assert.equal(mock.count(),0);
+      assert.equal((await pool.query("SELECT count(*)::int n FROM olos_http.reads WHERE state='received'")).rows[0].n,0);
+      assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,emptyResponse?0:3);
+      await consumer.cycle(); assert.equal(mock.count(),1);
+    } finally {await consumer.close();}
+    const again=await createScheduledConsumer(managedConfig(),mock.snapshot); await again.close();
+    assert.equal(mock.count(),1);
+  } finally {await mock.close();}
+});
+test('response received but stage never committed remains blocked across restart', async()=>{
+  const s=await store(); const mock=fakeApi(async()=>JSON.stringify([row('1')]));
+  s.stage=async()=>{throw new WorkerError('DATABASE_SESSION_LOST');};
+  await assert.rejects(new Worker(s,mock.api,new StaticCache(mock.api,3600000)).cycle(),/RECOVERY_REQUIRED/);
+  await s.close(); stores.splice(stores.indexOf(s),1);
+  let snapshots=0;
+  await assert.rejects(createScheduledConsumer(managedConfig(),async()=>{snapshots++; throw new Error('must not load');}),/RECONCILIATION_REQUIRED/);
+  assert.equal(snapshots,0); assert.equal(mock.count(),1);
+  assert.equal((await pool.query('SELECT state FROM olos_http.reads')).rows[0].state,'reading');
+});
+test('stage committed but acknowledgement lost recovers automatically without reconsumption', async()=>{
+  const s=await store(); const mock=fakeApi(async()=>JSON.stringify([row('1')])); const stageOriginal=s.stage.bind(s);
+  s.stage=async(...args)=>{await stageOriginal(...args);throw new Error('lost stage acknowledgement');};
+  await assert.rejects(new Worker(s,mock.api,new StaticCache(mock.api,3600000)).cycle(),/RECOVERY_REQUIRED/);
+  await s.close(); stores.splice(stores.indexOf(s),1);
+  const http=await simulatedOlos();
+  try {const consumer=await createScheduledConsumer(managedConfig(),http.snapshot);await consumer.close();assert.equal(http.count(),0);}
+  finally {await http.close();}
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,1);
+  assert.equal((await pool.query('SELECT state FROM olos_http.reads')).rows[0].state,'done');
+});
+
+test('pre-intent authentication timeout leaves no journal intent and permits a later safe cycle',async()=>{
+  const s=await store();const mock=fakeApi(async()=>'[]');
+  const getToken=mock.api.auth.getToken.bind(mock.api.auth);
+  mock.api.auth.getToken=async()=>{throw new WorkerError('NETWORK_OR_RESPONSE_FAILURE',true);};
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await assert.rejects(worker.cycle(),/AUTH_UNAVAILABLE/);
+  assert.equal((await s.unresolved()).length,0);assert.equal(mock.count(),0);
+  mock.api.auth.getToken=getToken;await worker.cycle();assert.equal(mock.count(),1);
 });

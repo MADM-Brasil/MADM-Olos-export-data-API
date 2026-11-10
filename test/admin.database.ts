@@ -72,10 +72,10 @@ test('database constraints reject intervals outside range and incoherent enabled
   await repo();await assert.rejects(pool.query("UPDATE olos_http.worker_settings SET interval_ms=59999 WHERE source_key='olos-admin-homolog'"));
   await assert.rejects(pool.query("UPDATE olos_http.worker_settings SET enabled=true WHERE source_key='olos-admin-homolog'"));
 });
-test('real Store rejects pending captured response before opening HTTP',async()=>{
+test('real Store rejects uncertain read before opening HTTP',async()=>{
   await pool.query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec,response_body,state) VALUES
-    ('00000000-0000-0000-0000-000000000001','olos-admin-homolog','"raw"."olos_calls"','{"kind":"current"}','[]','received')`);
-  let loaded=0;await assert.rejects(createScheduledConsumer(cfg,async()=>{loaded++;return snapshot();}),/RECOVERY_REQUIRED/);assert.equal(loaded,0);
+    ('00000000-0000-0000-0000-000000000001','olos-admin-homolog','"raw"."olos_calls"','{"kind":"current"}',NULL,'reading')`);
+  let loaded=0;await assert.rejects(createScheduledConsumer(cfg,async()=>{loaded++;return snapshot();}),/RECONCILIATION_REQUIRED/);assert.equal(loaded,0);
   assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,0);
   assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,0);
 });
@@ -101,4 +101,37 @@ test('dashboard does not claim valid schema when destination is missing and stil
   const r=await repo();await pool.query('ALTER TABLE raw.olos_calls RENAME TO missing_fixture');
   try{const view=await r.observation();assert.equal(view.database.reachable,true);assert.equal(view.database.schema_valid,false);assert.equal(view.ingestion.status,'NOT_OBSERVED');}
   finally{await pool.query('ALTER TABLE raw.missing_fixture RENAME TO olos_calls');}
+});
+
+test('lost administrative session reacquires ownership without changing operator intent',async()=>{
+  const r=await repo('RUNNING');
+  const owner=(r as unknown as {owner:pg.PoolClient}).owner;
+  const pid=(await owner.query('SELECT pg_backend_pid() pid')).rows[0].pid;
+  const lost=new Promise<void>(resolve=>owner.once('error',()=>resolve()));
+  await pool.query('SELECT pg_terminate_backend($1)',[pid]); await lost;
+  const saved=await r.settings();assert.equal(saved.desired_state,'RUNNING');
+  const second=new AdminRepository(url!,'olos-admin-homolog');
+  try {await assert.rejects(second.open(120000,'RUNNING'),/SCHEDULER_ALREADY_ACTIVE/);} finally {await second.close();}
+});
+test('former administrative owner cannot recover ownership taken by another instance',async()=>{
+  const r=await repo('RUNNING');
+  const owner=(r as unknown as {owner:pg.PoolClient}).owner;
+  const pid=(await owner.query('SELECT pg_backend_pid() pid')).rows[0].pid;
+  const lost=new Promise<void>(resolve=>owner.once('error',()=>resolve()));
+  await pool.query('SELECT pg_terminate_backend($1)',[pid]); await lost;
+  await repo('RUNNING'); await assert.rejects(r.settings(),/SCHEDULER_ALREADY_ACTIVE/);
+});
+
+test('administrative COMMIT acknowledgement loss is classified and durable intent is preserved',async()=>{
+  const r=await repo('RUNNING');
+  await assert.rejects(r.transaction(async db=>{
+    await db.query("UPDATE olos_http.worker_settings SET desired_state='PAUSED',enabled=false WHERE source_key=$1",[cfg.sourceKey]);
+    const original=db.query.bind(db);
+    db.query=(async(...args:unknown[])=>{
+      const result=await (original as (...args:unknown[])=>Promise<unknown>)(...args);
+      if(args[0]==='COMMIT'){db.query=original;throw new Error('synthetic lost acknowledgement');}
+      return result;
+    }) as pg.PoolClient['query'];
+  }),{message:'ADMIN_COMMIT_UNKNOWN'});
+  assert.equal((await r.settings()).desired_state,'PAUSED');
 });

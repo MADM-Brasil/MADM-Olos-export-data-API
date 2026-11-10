@@ -28,10 +28,12 @@ export class OlosApi {
       try { token = await this.auth.getToken(); } catch (error) { throw new AuthUnavailable(error); }
       try { return await this.request(path, fields, token); }
       catch (error) {
+        // A status alone does not prove that a cursor-consuming POST had no effect.
+        if (consuming) throw error;
         if (error instanceof HttpError && error.status === 401 && !authRetried) {
           authRetried = true; this.auth.invalidate(token); continue;
         }
-        // 429 is an explicit rejection. A network failure/500 on consuming reads is ambiguous.
+        // Retries below are restricted to reference/catalog operations.
         const retryable = error instanceof HttpError ? error.status === 429 || (!consuming && error.status >= 500) : !consuming && error instanceof WorkerError && error.retryable;
         if (!retryable || attempt >= 2) throw error;
         await this.wait(Math.max(error instanceof HttpError ? error.retryAfterMs : 0, 1000 * 2 ** attempt));

@@ -85,8 +85,8 @@ test('runtime credentials change between cycles, never interrupt active HTTP',as
   finally{release();await consumer.close();await new Promise<void>(r=>server.close(()=>r()));}
 });
 test('consumer startup rejects pending captures before any HTTP or cycle',async t=>{
-  t.mock.method(Store.prototype,'open',async()=>{});t.mock.method(Store.prototype,'unresolved',async()=>[{id:'fixture',state:'received'}]);
-  let loaded=0;await assert.rejects(createScheduledConsumer(cfg,async()=>{loaded++;return{revision:0,credentials};}),/RECOVERY_REQUIRED/);assert.equal(loaded,0);
+  t.mock.method(Store.prototype,'open',async()=>{});t.mock.method(Store.prototype,'unresolved',async()=>[{id:'fixture',state:'reading',spec:{kind:'current'}}]);
+  let loaded=0;await assert.rejects(createScheduledConsumer(cfg,async()=>{loaded++;return{revision:0,credentials};}),/RECONCILIATION_REQUIRED/);assert.equal(loaded,0);
 });
 
 test('admin API enforces session, role, CSRF, origin, stop confirmation and secret redaction',async()=>{
