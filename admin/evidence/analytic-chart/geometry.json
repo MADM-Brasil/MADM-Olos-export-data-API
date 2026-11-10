@@ -1,0 +1,41 @@
+{
+  "viewport": {
+    "width": 1600,
+    "height": 1365
+  },
+  "sidebar": {
+    "x": 0,
+    "y": 0,
+    "width": 320,
+    "height": 1365
+  },
+  "cards": [
+    {
+      "x": 360,
+      "y": 309.390625,
+      "width": 588,
+      "height": 300
+    },
+    {
+      "x": 972,
+      "y": 309.390625,
+      "width": 588,
+      "height": 300
+    }
+  ],
+  "terminal": {
+    "x": 360,
+    "y": 637.390625,
+    "width": 1200,
+    "height": 566
+  },
+  "chart": {
+    "x": 360,
+    "y": 1231.390625,
+    "width": 1200,
+    "height": 112
+  },
+  "canvas": "rgb(238, 253, 244)",
+  "terminalSurface": "rgb(13, 30, 23)",
+  "cardRadius": "14px"
+}

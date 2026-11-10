@@ -68,36 +68,121 @@ function svgNode(tag, attrs = {}, text = '') {
   for (const [key,value] of Object.entries(attrs)) node.setAttribute(key,String(value));
   if (text) node.textContent = text; return node;
 }
-export function renderChart(root, rows, from, to) {
+// Exact integer arithmetic for report counts; only bounded ratios become SVG numbers.
+export function chartRange(days = 7, now = new Date()) {
+  if (![1,7,14,30].includes(days)) throw new Error('CHART_PERIOD_INVALID');
+  const {to}=defaultRange(now), start=new Date(`${to}T12:00:00Z`);
+  start.setUTCDate(start.getUTCDate()-days+1);
+  return {from:start.toISOString().slice(0,10),to};
+}
+export function chartPercent(part, total) {
+  if(total===0n)return '—';
+  const tenths=(part*1000n+total/2n)/total;
+  return `${tenths/10n},${tenths%10n}%`;
+}
+export function chartCompact(value) {
+  /** @type {[bigint,string][]} */
+  const units=[[1000000000000n,'tri'],[1000000000n,'bi'],[1000000n,'mi'],[1000n,'mil']];
+  for(const [unit,label] of units){
+    if(value>=unit){const tenths=(value*10n+unit/2n)/unit;return `${count(tenths/10n)}${tenths%10n?','+tenths%10n:''} ${label}`;}
+  }
+  return count(value);
+}
+export function chartModel(rows, from, to) {
+  const validDay=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString().slice(0,10)===value;
+  if(!validDay(from)||!validDay(to)||from>to||!Array.isArray(rows))throw new Error('CHART_DATA_INVALID');
+  const byDay=new Map();
+  for(const row of rows){
+    if(!validDay(row.day)||row.day<from||row.day>to||byDay.has(row.day)||
+      !['calls','identified_calls'].every(key=>typeof row[key]==='string'&&/^\d+$/.test(row[key])))throw new Error('CHART_DATA_INVALID');
+    const calls=BigInt(row.calls),identified=BigInt(row.identified_calls);
+    if(identified>calls)throw new Error('CHART_DATA_INVALID');
+    byDay.set(row.day,{day:row.day,calls,identified});
+  }
+  const series=[],cursor=new Date(`${from}T12:00:00Z`);
+  while(cursor.toISOString().slice(0,10)<=to){
+    if(series.length>=366)throw new Error('CHART_PERIOD_INVALID');
+    const day=cursor.toISOString().slice(0,10);series.push(byDay.get(day)||{day,calls:0n,identified:0n});cursor.setUTCDate(cursor.getUTCDate()+1);
+  }
+  let total=0n,identified=0n,peak=null;
+  for(const row of series){total+=row.calls;identified+=row.identified;if(row.calls>0n&&(!peak||row.calls>peak.calls))peak=row;}
+  const denominator=BigInt(series.length),averageTenths=(total*10n+denominator/2n)/denominator;
+  const maximum=peak?.calls||0n,raw=(maximum+4n)/5n;
+  let magnitude=1n;while(magnitude*10n<=raw)magnitude*=10n;
+  const step=[1n,2n,5n,10n].map(n=>n*magnitude).find(n=>n>=raw)||1n;
+  return {series,total,identified,peak,denominator,average:`${count(averageTenths/10n)}${averageTenths%10n?','+averageTenths%10n:''}`,percent:chartPercent(identified,total),step,scale:maximum?((maximum+step-1n)/step)*step:5n,empty:total===0n};
+}
+const chartRenders=new WeakMap();
+const weekDay=day=>new Intl.DateTimeFormat('pt-BR',{timeZone:zone,weekday:'short'}).format(new Date(`${day}T15:00:00Z`)).replace('.','').replace(/^./,c=>c.toUpperCase());
+export function renderChart(root, rows, from, to, options = {}) {
+  const model=options.model||chartModel(rows,from,to),today=options.today||defaultRange().to;
+  const width=Math.max(360,root.clientWidth||960,model.series.length*42+72),height=360,left=60,right=16,top=36,bottom=306;
+  const signature=JSON.stringify([rows,from,to,width,today]);
+  const previous=chartRenders.get(root);
+  if(previous?.signature===signature&&root.querySelector('svg')){previous.observedAt=options.observedAt;return;}
   root.replaceChildren();
-  if (!rows.length) { root.textContent = 'Nenhuma chamada encontrada neste período.'; return; }
-  const byDay = new Map(rows.map(r => [r.day,r]));
-  const series = [], cursor = new Date(`${from}T12:00:00Z`), end = new Date(`${to}T12:00:00Z`);
-  while (cursor <= end && series.length < 366) {
-    const key = cursor.toISOString().slice(0,10);
-    series.push(byDay.get(key) || { day:key,calls:'0',identified_calls:'0' }); cursor.setUTCDate(cursor.getUTCDate()+1);
+  if(model.empty){root.textContent='Nenhuma chamada encontrada neste período.';chartRenders.delete(root);return;}
+  const state={signature,observedAt:options.observedAt};chartRenders.set(root,state);
+  const scroll=document.createElement('div');scroll.className='chart-scroll';scroll.tabIndex=0;scroll.setAttribute('aria-label','Gráfico diário; use as setas para rolar quando necessário');
+  const svg=svgNode('svg',{viewBox:`0 0 ${width} ${height}`,width,height,role:'group','aria-label':`Chamadas por data da ligação: ${dayLabel(from)} a ${dayLabel(to)}. Cada dia pode ser focado para consultar os valores.`});
+  svg.style.width=`${width}px`;
+  const ratio=value=>Number(value*1000000n/model.scale)/1000000;
+  const ticks=Number(model.scale/model.step);
+  for(let i=0;i<=ticks;i++){
+    const value=model.step*BigInt(i),y=bottom-(bottom-top)*i/ticks;
+    svg.append(svgNode('line',{x1:left,y1:y,x2:width-right,y2:y,class:'grid-line'}),svgNode('text',{x:left-12,y:y+4,'text-anchor':'end',class:'axis-label'},chartCompact(value)));
   }
-  const max = Math.max(1,...series.map(r => Number(r.calls))), width = Math.max(300,root.clientWidth || 960), height = 260, left = 62, bottom = 225, top = 22;
-  const svg = svgNode('svg',{viewBox:`0 0 ${width} ${height}`,role:'img','aria-label':`Chamadas diárias de ${dayLabel(from)} a ${dayLabel(to)}. Barras verdes: chamadas únicas e com operador. Consulte Relatórios para valores tabulados.`});
-  for (let i=0;i<=4;i++) {
-    const y=bottom-(bottom-top)*i/4;
-    svg.append(svgNode('line',{x1:left,y1:y,x2:width-10,y2:y,class:'grid-line'}),svgNode('text',{x:left-10,y:y+4,'text-anchor':'end'},new Intl.NumberFormat('pt-BR',{notation:'compact',maximumFractionDigits:1}).format(max*i/4)));
-  }
-  const step=(width-left-10)/series.length;
-  series.forEach((r,i) => {
-    const x=left+i*step+step*.17,w=Math.max(1,step*.55);
-    for (const [field,css,factor] of [['calls','calls-bar',1],['identified_calls','operators-bar',.4]]) {
-      const h=Number(r[field])/max*(bottom-top);
-      const bar=svgNode('rect',{x,y:bottom-h,width:w*Number(factor),height:h,rx:2,class:css});
-      bar.append(svgNode('title',{},`${dayLabel(r.day)} · ${count(r.calls)} chamadas · ${count(r.identified_calls)} com operador`));svg.append(bar);
+  const step=(width-left-right)/model.series.length,w=Math.min(28,step*.28),gap=Math.min(5,step*.06);
+  model.series.forEach((row,index)=>{
+    const center=left+step*(index+.5),current=row.day===today;
+    const group=svgNode('g',{'data-day-index':index,tabindex:0,role:'button','aria-describedby':'chart-tooltip','aria-label':`${dayLabel(row.day)}${current?' · Hoje, em andamento':''} · Coletadas ${count(row.calls)} · Identificadas ${count(row.identified)} (${chartPercent(row.identified,row.calls)})`,class:current?'day-group current-day':'day-group'});
+    if(current)group.append(svgNode('rect',{x:center-step*.44,y:top,width:step*.88,height:bottom-top,class:'today-band',rx:8}));
+    group.append(svgNode('rect',{x:center-step*.48,y:top,width:step*.96,height:height-top,fill:'transparent',class:'day-target'}));
+    for(const [value,css,x] of [[row.calls,'calls-bar',center-gap/2-w],[row.identified,'operators-bar',center+gap/2]]){
+      const h=ratio(value)*(bottom-top),y=bottom-h,r=Math.min(4,w/2,h/2);
+      group.append(svgNode('path',{d:`M ${x} ${bottom} V ${y+r} Q ${x} ${y} ${x+r} ${y} H ${x+w-r} Q ${x+w} ${y} ${x+w} ${y+r} V ${bottom} Z`,class:`${css} chart-bar`,'data-value':value.toString(),'transform-origin':`0 ${bottom}`}));
     }
-    if(i%Math.max(1,Math.ceil(series.length/(width<500?4:7)))===0)svg.append(svgNode('text',{x:x+w/2,y:248,'text-anchor':'middle'},dayLabel(r.day).slice(0,5)));
-  });root.append(svg);
+    group.append(svgNode('text',{x:center,y:330,'text-anchor':'middle',class:'day-date'},dayLabel(row.day).slice(0,5)),svgNode('text',{x:center,y:348,'text-anchor':'middle',class:'day-week'},current?'Hoje':weekDay(row.day)));
+    if(row===model.peak){
+      const y=bottom-ratio(row.calls)*(bottom-top),labelX=Math.max(left+48,Math.min(width-right-48,center));
+      group.append(svgNode('circle',{cx:center,cy:y-9,r:2.5,class:'peak-dot'}),svgNode('text',{x:labelX,y:y-18,'text-anchor':'middle',class:'peak-label'},`PICO ${chartCompact(row.calls)}`));
+    }
+    svg.append(group);
+  });
+  scroll.append(svg);root.append(scroll);
+  const tooltip=document.createElement('div');tooltip.id='chart-tooltip';tooltip.className='chart-tooltip';tooltip.setAttribute('role','tooltip');tooltip.hidden=true;root.append(tooltip);
+  let tooltipKey='';
+  const hide=()=>{tooltip.hidden=true;};
+  const show=(group,clientX,clientY)=>{
+    const row=model.series[Number(group.getAttribute('data-day-index'))],current=row.day===today;
+    const key=row.day+'/'+state.observedAt;
+    if(tooltipKey!==key){
+    tooltipKey=key;tooltip.replaceChildren();
+    const heading=document.createElement('strong');heading.textContent=`${dayLabel(row.day)} · ${current?'Hoje · em andamento':weekDay(row.day)}`;tooltip.append(heading);
+    for(const [label,value] of [['Coletadas',count(row.calls)],['Identificadas',`${count(row.identified)} (${chartPercent(row.identified,row.calls)})`]]){
+      const line=document.createElement('div'),name=document.createElement('span'),amount=document.createElement('b');name.textContent=label+':';amount.textContent=value;line.append(name,amount);tooltip.append(line);
+    }
+    if(Number.isFinite(Date.parse(state.observedAt))){const meta=document.createElement('small');meta.textContent=`Snapshot: ${date(state.observedAt)} · Brasília`;tooltip.append(meta);}
+    }
+    tooltip.hidden=false;
+    const bounds=root.getBoundingClientRect(),target=group.getBoundingClientRect();
+    const x=clientX??target.left+target.width/2,y=clientY??target.top+target.height/2;
+    tooltip.style.left=`${Math.max(8,Math.min(bounds.width-tooltip.offsetWidth-8,x-bounds.left+14))}px`;
+    tooltip.style.top=`${Math.max(8,Math.min(bounds.height-tooltip.offsetHeight-8,y-bounds.top-tooltip.offsetHeight-16))}px`;
+  };
+  const target=event=>event.target instanceof Element?event.target.closest('[data-day-index]'):null;
+  svg.addEventListener('pointermove',event=>{const group=target(event);if(group)show(group,event.clientX,event.clientY);});
+  svg.addEventListener('pointerleave',()=>{if(!svg.contains(document.activeElement))hide();});
+  svg.addEventListener('focusin',event=>{const group=target(event);if(group)show(group);});
+  svg.addEventListener('focusout',event=>{if(!svg.contains(event.relatedTarget))hide();});
+  svg.addEventListener('click',event=>{const group=target(event);if(group)show(group,event.clientX,event.clientY);});
+  svg.addEventListener('keydown',event=>{if(event.key==='Escape')hide();if(['Enter',' '].includes(event.key)){const group=target(event);if(group){event.preventDefault();show(group);}}});
+  scroll.addEventListener('scroll',hide,{passive:true});
 }
 
 // A chart failure must never invalidate a successfully fetched count snapshot.
-export function renderDashboardChart(root, snapshot, draw = renderChart) {
-  try { draw(root, snapshot.daily, snapshot.from, snapshot.to); }
+export function renderDashboardChart(root, snapshot, draw = renderChart, options = {}) {
+  try { draw(root, snapshot.daily, snapshot.from, snapshot.to, {...options,observedAt:snapshot.observed_at}); }
   catch { root.textContent = 'Não foi possível desenhar o gráfico. Os indicadores permanecem válidos; consulte a série diária em Relatórios.'; }
 }
 export function renderDashboardMetrics(element, r) {
@@ -108,7 +193,6 @@ export function renderDashboardMetrics(element, r) {
   if(r.summary.missing_mapping!=='0')gaps.push(`${count(r.summary.missing_mapping)} mappings sem registro local`);
   if(r.summary.inconsistent&&r.summary.inconsistent!=='0')gaps.push(`${count(r.summary.inconsistent)} recibos divergentes`);
   element('metrics-error').textContent=gaps.join(' · ');
-  element('chart-period').textContent=`${dayLabel(r.from)} — ${dayLabel(r.to)} · Brasília`;
 }
 
 const terminalHistory = new WeakMap();

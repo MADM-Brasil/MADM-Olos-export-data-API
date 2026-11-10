@@ -1,4 +1,4 @@
-import {date,count,dayLabel,defaultRange,reportFields,reportCsv,safeEvents,eventLines,renderDashboardChart,renderDashboardMetrics,renderTerminal} from './ui.js';
+import {date,count,dayLabel,defaultRange,reportFields,reportCsv,safeEvents,eventLines,renderDashboardChart,renderDashboardMetrics,renderTerminal,chartRange,chartModel,chartCompact} from './ui.js';
 import {ServerClock,brasiliaDay,statusLabels,renderToday,renderCountdown} from './dashboard.js';
 /** @returns {any} */
 const $=id=>document.getElementById(id);
@@ -14,9 +14,9 @@ async function api(path,method='GET',body){
 }
 let sessionEpoch=0;
 const clock=new ServerClock();
-let schedulerSnapshot=null,statusAt=0,statusFailed=false,todaySnapshot=null,todayFailed=false,todayFlight=null,chartFlight=null;
-let activeDay=brasiliaDay(clock.now()),chartOpen=false,chartReceivedAt=0;
-function resetOperational(){$('state').textContent='Carregando';$('state').dataset.state='UNKNOWN';$('state').classList.remove('error');$('corporate-state').textContent='—';$('corporate-detail').textContent='Aguardando estado do controle local.';schedulerSnapshot=null;statusAt=0;statusFailed=false;todaySnapshot=null;todayFailed=false;todayFlight=null;chartFlight=null;clock.anchor=null;activeDay=brasiliaDay(clock.now());renderToday($,null,clock.now());renderClock();}
+let schedulerSnapshot=null,statusAt=0,statusFailed=false,todaySnapshot=null,todayFailed=false,todayFlight=null;
+let activeDay=brasiliaDay(clock.now()),chartOpen=false;
+function resetOperational(){$('state').textContent='Carregando';$('state').dataset.state='UNKNOWN';$('state').classList.remove('error');$('corporate-state').textContent='—';$('corporate-detail').textContent='Aguardando estado do controle local.';schedulerSnapshot=null;statusAt=0;statusFailed=false;todaySnapshot=null;todayFailed=false;todayFlight=null;clock.anchor=null;activeDay=brasiliaDay(clock.now());renderToday($,null,clock.now());renderClock();}
 function renderClock(){
   const stale=statusFailed||!!schedulerSnapshot&&performance.now()-statusAt>10000;
   renderCountdown($,schedulerSnapshot,clock.now(),stale);
@@ -128,34 +128,86 @@ $('event-pause').addEventListener('click',()=>{eventPaused=!eventPaused;renderEv
 $('event-copy').addEventListener('click',()=>action(async()=>{await navigator.clipboard.writeText(eventLines(eventEntries,$('event-search').value,$('event-level').value).join('\n'));$('event-status').textContent='Logs sanitizados copiados.';},$('event-copy')));
 function syncMenu(){const open=document.body.classList.contains('menu-open');$('menu-toggle').setAttribute('aria-expanded',String(open));$('sidebar').inert=matchMedia('(max-width:760px)').matches&&!open;}
 $('menu-toggle').addEventListener('click',()=>{document.body.classList.toggle('menu-open');syncMenu();});
-window.addEventListener('resize',()=>{syncMenu();if(chartSnapshot&&chartOpen&&currentPage==='dashboard')renderDashboardChart($('calls-chart'),chartSnapshot);});syncMenu();
+window.addEventListener('resize',()=>{syncMenu();if(chartSnapshot&&chartOpen&&currentPage==='dashboard')paintChart();});syncMenu();
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){document.body.classList.remove('menu-open');syncMenu();}});
 const initialRange=defaultRange();$('report-from').value=initialRange.from;$('report-to').value=initialRange.to;
 function reportUrl(from,to){return '/reports?'+new URLSearchParams({from,to});}
-function clearMetrics(){chartSnapshot=null;chartReceivedAt=0;$('metrics-error').textContent='';$('chart-period').textContent='';for(const id of ['calls','identified','confirmed','pending','errors'])$('metric-'+id).textContent='—';$('metrics-observed').textContent='Indicadores indisponíveis';$('calls-chart').textContent='Série diária indisponível.';}
-function resetReports(){chartOpen=false;$('chart-toggle').setAttribute('aria-expanded','false');$('chart-panel').classList.remove('is-open');$('chart-body').inert=true;$('chart-body').setAttribute('aria-hidden','true');$('chart-status').textContent='';$('integrity-details').replaceChildren();reportData=null;reportPage=0;table('report-rows',[]);$('report-summary').replaceChildren();$('report-page').textContent='Sem dados';$('report-prev').disabled=true;$('report-next').disabled=true;$('report-status').textContent='Selecione um período.';$('export-report').disabled=true;clearMetrics();}
+let chartDays=7;
+const chartCache=new Map(),chartFlights=new Map(),chartModels=new WeakMap();
+const selectedChartRange=()=>chartRange(chartDays,new Date(clock.now()));
+const chartKey=range=>`${range.from}/${range.to}`;
+function rememberChart(snapshot){
+  const model=chartModel(snapshot.daily,snapshot.from,snapshot.to);
+  chartModels.set(snapshot,model);
+  const age=Number.isFinite(Date.parse(snapshot.observed_at))?Math.max(0,clock.now()-Date.parse(snapshot.observed_at)):0;
+  chartCache.set(chartKey(snapshot),{snapshot,at:performance.now()-age});
+  if(chartCache.size>8)chartCache.delete(chartCache.keys().next().value);
+}
+function clearChart(){
+  for(const name of ['total','identified','average','peak'])$('chart-'+name).textContent='—';
+  for(const name of ['percent','denominator','peak-date'])$('chart-'+name).textContent='Indisponível';
+  $('chart-scale').textContent='';$('chart-summary').textContent='';
+  $('calls-chart').textContent='Série diária indisponível.';
+}
+function clearMetrics(){chartSnapshot=null;chartCache.clear();$('metrics-error').textContent='';$('chart-period').textContent='';for(const id of ['calls','identified','confirmed','pending','errors'])$('metric-'+id).textContent='—';$('metrics-observed').textContent='Indicadores indisponíveis';clearChart();}
+function resetReports(){chartDays=7;chartFlights.clear();chartOpen=false;$('chart-toggle').setAttribute('aria-expanded','false');$('chart-panel').classList.remove('is-open');$('chart-body').inert=true;$('chart-body').setAttribute('aria-hidden','true');$('chart-status').textContent='';$('integrity-details').replaceChildren();reportData=null;reportPage=0;table('report-rows',[]);$('report-summary').replaceChildren();$('report-page').textContent='Sem dados';$('report-prev').disabled=true;$('report-next').disabled=true;$('report-status').textContent='Selecione um período.';$('export-report').disabled=true;clearMetrics();syncChartFilters();}
+function syncChartFilters(){
+  document.querySelectorAll('[data-chart-days]').forEach(button=>button.setAttribute('aria-pressed',String(Number(button.getAttribute('data-chart-days'))===chartDays)));
+  $('chart-range-badge').textContent=chartDays===1?'Hoje':`Histórico ${chartDays}D`;
+}
 function paintChart(){
   if(!chartSnapshot||!chartOpen)return;
-  renderDashboardChart($('calls-chart'),chartSnapshot);
+  const model=chartModels.get(chartSnapshot)||chartModel(chartSnapshot.daily,chartSnapshot.from,chartSnapshot.to),today=brasiliaDay(clock.now());
+  chartModels.set(chartSnapshot,model);
+  $('chart-total').textContent=count(model.total);$('chart-identified').textContent=count(model.identified);
+  $('chart-average').textContent=model.average;$('chart-peak').textContent=model.peak?count(model.peak.calls):'—';
+  $('chart-percent').textContent=model.total?`${model.percent} das chamadas do período`:'Sem chamadas no período';
+  $('chart-denominator').textContent=`${model.denominator} ${model.denominator===1n?'dia':'dias'} corridos${chartSnapshot.to===today?' · hoje parcial':''}`;
+  $('chart-peak-date').textContent=model.peak?`${dayLabel(model.peak.day)} · primeiro dia em caso de empate`:'Sem pico no período';
+  $('chart-scale').textContent=model.empty?'Sem volume no período':`Escala: 0 — ${chartCompact(model.scale)} chamadas/dia`;
+  $('chart-summary').textContent=`Total ${chartDays}D: ${count(model.total)}`;
+  renderDashboardChart($('calls-chart'),chartSnapshot,undefined,{model,today});
   $('chart-period').textContent=`${dayLabel(chartSnapshot.from)} — ${dayLabel(chartSnapshot.to)} · Brasília`;
 }
 async function dashboardReport(){
-  if(!logged||!chartOpen||chartFlight)return;
-  const range=defaultRange(new Date(clock.now()));
-  if(chartSnapshot&&chartSnapshot.from===range.from&&chartSnapshot.to===range.to&&performance.now()-chartReceivedAt<(chartSnapshot.cache_seconds??300)*1000){paintChart();return;}
-  const flight={epoch:sessionEpoch};chartFlight=flight;
+  if(!logged||!chartOpen)return;
+  const range=selectedChartRange(),key=chartKey(range),cached=chartCache.get(key);
+  syncChartFilters();
+  if(cached&&performance.now()-cached.at<(cached.snapshot.cache_seconds??300)*1000){chartSnapshot=cached.snapshot;$('chart-status').textContent=`Snapshot ${date(chartSnapshot.observed_at)}`;paintChart();return;}
+  if(chartFlights.has(key))return chartFlights.get(key);
+  if(!chartSnapshot||chartKey(chartSnapshot)!==key){chartSnapshot=null;clearChart();}
   $('chart-status').textContent='Consultando série…';
-  try{const r=await api(reportUrl(range.from,range.to));if(!logged||flight.epoch!==sessionEpoch)return;
-    chartSnapshot=r;chartReceivedAt=performance.now()-Math.max(0,clock.now()-Date.parse(r.observed_at));$('chart-status').textContent=`Snapshot ${date(r.observed_at)}`;paintChart();
-  }catch{if(logged&&flight.epoch===sessionEpoch){$('chart-status').textContent=chartSnapshot?'Série desatualizada · última observação preservada.':'Série indisponível. Tente novamente ao expandir.';if(!chartSnapshot)$('calls-chart').textContent='Não foi possível consultar a série diária.';}}
-  finally{if(chartFlight===flight)chartFlight=null;}
+  const epoch=sessionEpoch;
+  const flight=(async()=>{
+    try{
+      const snapshot=await api(reportUrl(range.from,range.to));if(!logged||epoch!==sessionEpoch)return;
+      if(snapshot.from!==range.from||snapshot.to!==range.to)throw new Error('CHART_RANGE_MISMATCH');
+      rememberChart(snapshot);
+      if(key!==chartKey(selectedChartRange())||!chartOpen)return;
+      chartSnapshot=snapshot;$('chart-status').textContent=`Snapshot ${date(snapshot.observed_at)}`;paintChart();
+    }catch{
+      if(logged&&epoch===sessionEpoch&&key===chartKey(selectedChartRange())){
+        $('chart-status').textContent=chartSnapshot?'Série desatualizada · última observação preservada.':'Série indisponível. Tente novamente ao expandir.';
+        if(!chartSnapshot)clearChart();
+      }
+    }finally{if(chartFlights.get(key)===flight)chartFlights.delete(key);}
+  })();
+  chartFlights.set(key,flight);return flight;
 }
+document.querySelectorAll('[data-chart-days]').forEach(button=>button.addEventListener('click',()=>{
+  const days=Number(button.getAttribute('data-chart-days'));if(days===chartDays)return;
+  chartDays=days;syncChartFilters();void dashboardReport();
+}));
 $('chart-toggle').addEventListener('click',()=>{
   chartOpen=!chartOpen;$('chart-toggle').setAttribute('aria-expanded',String(chartOpen));$('chart-panel').classList.toggle('is-open',chartOpen);
   $('chart-body').inert=!chartOpen;$('chart-body').setAttribute('aria-hidden',String(!chartOpen));
   if(chartOpen)void dashboardReport();
 });
-$('chart-body').addEventListener('transitionend',()=>{if(chartOpen)paintChart();});
+$('chart-body').addEventListener('transitionend',event=>{if(event.target===$('chart-body')&&chartOpen)paintChart();});
+$('chart-report-link').addEventListener('click',()=>{
+  const range=selectedChartRange();$('report-from').value=range.from;$('report-to').value=range.to;
+  const button=document.querySelector('[data-page="reports"]');if(button instanceof HTMLButtonElement)button.click();
+});
 
 function renderReport(){
   if(!reportData)return;const rows=reportData.daily,total=rows.length,maxPage=Math.max(0,Math.ceil(total/pageSize)-1);reportPage=Math.min(reportPage,maxPage);
@@ -168,7 +220,7 @@ async function loadReport(){
   $('apply-report').disabled=true;$('export-report').disabled=true;reportData=null;table('report-rows',[]);$('report-summary').replaceChildren();$('report-prev').disabled=true;$('report-next').disabled=true;$('report-page').textContent='—';$('report-status').textContent='Consultando dados locais…';
   try{const r=await api(reportUrl(from,to));if(!logged||epoch!==sessionEpoch)return;reportData=r;reportPage=0;renderDashboardMetrics($,r);
     describe('integrity-details',[['Registros sem data de chamada',count(r.summary.undated)],['Mappings sem registro local',count(r.summary.missing_mapping)],['Recibos divergentes',count(r.summary.inconsistent)],['Registros sem outbox',count(r.summary.not_queued)],['Operadores distintos no histórico',count(r.summary.operators)],['Com CPF preenchido',count(r.summary.with_cpf)],['Com e-mail preenchido',count(r.summary.with_email)]]);
-    const range=defaultRange(new Date(clock.now()));if(r.from===range.from&&r.to===range.to){chartSnapshot=r;chartReceivedAt=performance.now()-Math.max(0,clock.now()-Date.parse(r.observed_at));}
+    const range=selectedChartRange();if(r.from===range.from&&r.to===range.to){rememberChart(r);chartSnapshot=r;}
 
     $('report-status').textContent=`${dayLabel(r.from)} a ${dayLabel(r.to)} · Snapshot ${date(r.observed_at)} · intervalo de atualização: ${r.cache_seconds ?? 300} s · Brasília${r.outbox_available?'':' · Outbox indisponível'}. ${count(r.summary.undated)} registros sem data ficam fora do período.`;
     for(const [label,value]of [['Chamadas únicas',r.period.calls],['Com operador',r.period.identified_calls],['Operadores distintos no período',r.period.operators],['Confirmações MADM (recibos)',r.period.confirmed]]){const span=document.createElement('span');span.textContent=`${label}: ${count(value)}`;$('report-summary').append(span);}

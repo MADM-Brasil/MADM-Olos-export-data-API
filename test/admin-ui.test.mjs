@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { date,count,defaultRange,safeEvents,eventLines,terminalRows,reportCsv,renderDashboardMetrics,renderDashboardChart } from '../admin/public/ui.js';
+import { date,count,defaultRange,safeEvents,eventLines,terminalRows,reportCsv,renderDashboardMetrics,renderDashboardChart,chartModel,chartRange,chartPercent,chartCompact } from '../admin/public/ui.js';
 test('Brasília dates and exact counts never replace unavailable data with zero',()=>{
   assert.match(date('2026-11-01T02:59:00Z'),/31\/10\/2026.*23:59/);
   assert.equal(date('invalid'),'—');assert.equal(count(null),'Indisponível');assert.equal(count('0'),'0');
@@ -53,4 +53,32 @@ test('full retained buffer, stable chronological order and copy share one projec
   const duplicates=terminalRows([safe[0],safe[0]]);assert.equal(duplicates.length,2);assert.notEqual(duplicates[0].key,duplicates[1].key);
   assert.equal(terminalRows(safe.slice(1))[0].key,terminalRows(safe)[1].key);
   assert.deepEqual(eventLines([]),[]);assert.deepEqual(eventLines(safe,'','ERROR'),[]);
+});
+
+
+test('analytic range uses inclusive Brasília calendar boundaries',()=>{
+  const now=new Date('2026-11-01T02:59:00Z');
+  assert.deepEqual(chartRange(7,now),{from:'2026-10-25',to:'2026-10-31'});
+  assert.deepEqual(chartRange(1,now),{from:'2026-10-31',to:'2026-10-31'});
+  for(const days of [14,30])assert.equal(chartModel([],chartRange(days,now).from,chartRange(days,now).to).series.length,days);
+  assert.throws(()=>chartRange(2,now));
+});
+test('analytic KPIs include absent days and choose earliest peak on ties',()=>{
+  const model=chartModel([{day:'2026-11-01',calls:'9',identified_calls:'3'},{day:'2026-11-03',calls:'9',identified_calls:'6'}],'2026-11-01','2026-11-03');
+  assert.equal(model.total,18n);assert.equal(model.identified,9n);assert.equal(model.percent,'50,0%');
+  assert.equal(model.average,'6');assert.equal(model.denominator,3n);assert.equal(model.series[1].calls,0n);assert.equal(model.peak.day,'2026-11-01');
+  assert.equal(chartPercent(2n,3n),'66,7%');assert.equal(chartPercent(0n,0n),'—');
+});
+test('analytic counts and averages remain exact above Number.MAX_SAFE_INTEGER',()=>{
+  const model=chartModel([{day:'2026-11-01',calls:'9007199254740993',identified_calls:'9007199254740992'}],'2026-11-01','2026-11-02');
+  assert.equal(model.total,9007199254740993n);assert.equal(model.identified,9007199254740992n);
+  assert.equal(model.average,'4.503.599.627.370.496,5');assert(model.scale>=model.peak.calls);
+});
+test('analytic scale is dynamic and counts are never inferred from malformed data',()=>{
+  const model=chartModel([{day:'2026-11-01',calls:'48910',identified_calls:'47000'}],'2026-11-01','2026-11-07');
+  assert.equal(model.step,10000n);assert.equal(model.scale,50000n);assert.equal(chartCompact(model.scale),'50 mil');
+  const row={day:'2026-11-01',calls:'2',identified_calls:'1'};
+  for(const rows of [[{...row,calls:2}],[{...row,calls:null}],[{...row,identified_calls:'3'}],[row,row],[{...row,day:'2026-02-30'}]])assert.throws(()=>chartModel(rows,'2026-11-01','2026-11-07'));
+  assert.throws(()=>chartModel([], '2026-02-30','2026-03-01'));
+  const empty=chartModel([],'2026-11-01','2026-11-07');assert.equal(empty.empty,true);assert.equal(empty.total,0n);assert.equal(empty.peak,null);
 });

@@ -9,6 +9,7 @@ const require=createRequire(import.meta.url);
 const {chromium}=require(process.env.ADMIN_PLAYWRIGHT_PATH||'playwright');
 const writes=[], requests=[],errors=[];
 const evidenceDir=process.env.ADMIN_EVIDENCE_DIR||'admin/evidence';
+let reportHold=null,releaseReport=null;
 let statusDelay=0,eventDelay=0,eventOffset=0,eventsActive=0,maxEventsActive=0;
 const eventTimes=[];
 let session=false,state='RUNNING',interval=120000,eventPolls=0,reportError=false,statusError=false,eventError=false,empty=false,reportDelay=0;
@@ -39,7 +40,7 @@ const server=createServer(async(req,res)=>{
     json({state,desired_state:state,interval_ms:interval,cycle_in_progress:activeCycle,next_run_at:nextAt,server_time:new Date(serverNow()).toISOString(),authentication:{status:'ACCEPTED'},database:{reachable:true,schema_valid:true},ingestion:{status:'CONFIRMED',pending:[],latest:{started_at:'2026-11-04T15:00:00Z',state:'done'},last_completed:{finished_at:'2026-11-04T15:01:00Z',received_count:8,inserted:5,duplicates:3,duration_ms:240}},corporate_delivery:{ready:true,paused:true,blocked:false}});return;
   }
   if(path==='/api/today'){if(todayDelay)await new Promise(r=>setTimeout(r,todayDelay));if(todayError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else json({date:defaultRange(new Date(serverNow())).to,calls:todayCalls,observed_at:new Date(serverNow()).toISOString(),cache_seconds:300,server_time:new Date(serverNow()).toISOString(),time_basis:'first_local_persistence'});return;}
-  if(path==='/api/reports'){if(reportDelay)await new Promise(r=>setTimeout(r,reportDelay));if(reportError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else {const r=report(),q=new URL(req.url,'http://localhost').searchParams;r.from=q.get('from')||r.from;r.to=q.get('to')||r.to;r.daily=r.daily.filter(d=>d.day>=r.from&&d.day<=r.to);json(r);}return;}
+  if(path==='/api/reports'){if(reportHold&&new URL(req.url,'http://localhost').searchParams.get('from')===daily.at(-14).day)await reportHold;if(reportDelay)await new Promise(r=>setTimeout(r,reportDelay));if(reportError)json({error:'LOCAL_OR_DATABASE_FAILURE'},503);else {const r=report(),q=new URL(req.url,'http://localhost').searchParams;r.from=q.get('from')||r.from;r.to=q.get('to')||r.to;r.daily=r.daily.filter(d=>d.day>=r.from&&d.day<=r.to);json(r);}return;}
   if(path==='/api/events'){eventPolls++;eventTimes.push(Date.now());eventsActive++;maxEventsActive=Math.max(maxEventsActive,eventsActive);if(eventDelay)await new Promise(r=>setTimeout(r,eventDelay));eventsActive--;if(eventError){json({error:'LOCAL_OR_DATABASE_FAILURE'},503);return;}json(Array.from({length:240},(_,i)=>({time:'2026-11-04T15:00:00.000Z',event:i+eventOffset===239?'scheduler_error':i+eventOffset===238?'poll_retry':'batch_completed',received:i+eventOffset,inserted:5,duplicates:2,request_ms:42,skipped:1,next_run_at:'2026-11-04T15:02:00.000Z',error:i+eventOffset===239?'RECOVERY_REQUIRED':undefined,email:'PRIVATE_EMAIL',payload:'PRIVATE_PAYLOAD'})));return;}
   if(path==='/api/logs'){json([{id:'fixture-read',started_at:'2026-11-04T15:00:00Z',state:'done',processed_count:5,received_count:5,request_ms:20}]);return;}
   if(path==='/api/audit'){json([{occurred_at:'2026-11-04T15:00:00Z',actor:'fixture-admin',action:'scheduler_state'}]);return;}
@@ -52,7 +53,7 @@ const server=createServer(async(req,res)=>{
 server.listen(0,'127.0.0.1');await once(server,'listening');
 const origin=`http://127.0.0.1:${server.address().port}`;
 const browser=await chromium.launch({headless:true,...(process.env.ADMIN_CHROMIUM_PATH?{executablePath:process.env.ADMIN_CHROMIUM_PATH}:{})});
-const context=await browser.newContext({viewport:{width:1600,height:1365},permissions:['clipboard-read','clipboard-write']});
+const context=await browser.newContext({viewport:{width:1600,height:1365},hasTouch:true,permissions:['clipboard-read','clipboard-write']});
 const watchdog=setTimeout(()=>void browser.close(),90000);
 const page=await context.newPage();
 await page.addInitScript(()=>{const original=window.setInterval.bind(window);window.setInterval=(fn,ms,...args)=>{if(ms===30000)window.__reportPoll=fn;if(ms===1000)window.__clockTick=fn;if(ms===2000)window.__statusPoll=fn;return original(fn,ms,...args);};});
@@ -63,6 +64,8 @@ page.on('request',r=>assert(r.url().startsWith(origin+'/')||r.url().startsWith('
 const waitText=(id,value)=>page.waitForFunction(([id,value])=>document.getElementById(id).textContent.includes(value),[id,value]);
 const nav=async name=>{console.log('UI:',name);await page.getByRole('button',{name,exact:true}).click();};
 const screenshot=async(file)=>{
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.locator('#chart-panel').evaluate(e=>Promise.all(e.getAnimations({subtree:true}).map(a=>a.finished.catch(()=>{}))));
   await page.evaluate(()=>{const p=document.createElement('p');p.id='fixture-label';p.style.cssText='position:fixed;bottom:4px;right:8px;z-index:20;margin:0;padding:3px 8px;background:white;border:1px solid #bec9c2;font-size:10px;color:#3f4944';p.textContent='HOMOLOGAÇÃO LOCAL · DADOS SINTÉTICOS DE TESTE';document.querySelector('main').prepend(p);});
   if((await page.viewportSize()).width<760)await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=0.5);
   await page.screenshot({path:file.replace('admin/evidence',evidenceDir),fullPage:true});await page.locator('#fixture-label').evaluate(e=>e.remove());
@@ -118,12 +121,75 @@ try{
   await page.locator('#chart-toggle').focus();await page.keyboard.press('Enter');
   await page.locator('#calls-chart svg').waitFor();assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'true');
   await screenshot('admin/evidence/premium-expanded.png');
+  assert.equal(await page.locator('[data-chart-days]').count(),4);
+  assert.equal(await page.locator('[data-chart-days="7"]').getAttribute('aria-pressed'),'true');
+  const expected=days=>{const data=daily.slice(-days);return {total:data.reduce((n,r)=>n+BigInt(r.calls),0n).toLocaleString('pt-BR'),identified:data.reduce((n,r)=>n+BigInt(r.identified_calls),0n).toLocaleString('pt-BR')};};
+  reportHold=new Promise(resolve=>{releaseReport=resolve;});
+  const delayedResponse=page.waitForResponse(response=>response.url().includes('/api/reports?')&&response.url().includes(daily.at(-14).day));
+  await page.evaluate(()=>{window.__chartValues=[];new MutationObserver(()=>window.__chartValues.push(document.getElementById('chart-total').textContent)).observe(document.getElementById('chart-total'),{childList:true});});
+  await page.locator('[data-chart-days="14"]').click();await page.locator('[data-chart-days="30"]').click();
+  await waitText('chart-total',expected(30).total);releaseReport();reportHold=null;await (await delayedResponse).finished();
+  assert(!(await page.evaluate(()=>window.__chartValues)).includes(expected(14).total),'late response cannot replace selected dataset');
+  for(const days of [7,14,30,1,7]){
+    await page.locator(`[data-chart-days="${days}"]`).click();
+    await waitText('chart-total',expected(days).total);
+    assert.equal(await page.locator('#chart-identified').textContent(),expected(days).identified);
+    assert.equal(await page.locator('#calls-chart [data-day-index]').count(),days);
+    assert.equal(await page.locator('#calls-chart .chart-bar').count(),days*2);
+    assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'true');
+    if(days!==1){await screenshot(`admin/evidence/analytic-${days}d.png`);await page.locator('#chart-panel').screenshot({path:`${evidenceDir}/panel-${days}d.png`});}
+  }
+  await waitText('chart-total','10.640');await waitText('chart-average','1.520');await waitText('chart-percent','40,0%');
+  assert.match(await page.locator('#chart-denominator').textContent(),/7 dias corridos · hoje parcial/);
+  assert.equal(await page.locator('#chart-peak').textContent(),'1.580');
+  assert.equal(await page.locator('#calls-chart .peak-label').count(),1);
+  const chartRequests=()=>requests.filter(r=>r.path==='/api/reports').length;
+  const beforeTooltip=chartRequests();
+  const dayGroup=page.locator('#calls-chart [data-day-index]').last();
+  await dayGroup.focus();await page.locator('#chart-tooltip').waitFor({state:'visible'});
+  assert.match(await page.locator('#chart-tooltip').textContent(),/Hoje · em andamento.*Coletadas:1\.580.*Identificadas:632 \(40,0%\).*Snapshot:/);
+  await screenshot('admin/evidence/analytic-tooltip.png');
+  await page.keyboard.press('Escape');assert(await page.locator('#chart-tooltip').isHidden());
+  await dayGroup.hover();await page.locator('#chart-tooltip').waitFor({state:'visible'});
+  assert.equal(chartRequests(),beforeTooltip,'tooltip never requests a snapshot');
+  const positions=await dayGroup.evaluate(g=>{const a=g.querySelector('.calls-bar').getBBox(),b=g.querySelector('.operators-bar').getBBox();return {aRight:a.x+a.width,bLeft:b.x,aBottom:a.y+a.height,bBottom:b.y+b.height};});
+  assert(positions.bLeft>positions.aRight);assert(Math.abs(positions.aBottom-positions.bBottom)<.1);
+  await page.evaluate(()=>{window.__analyticSvg=document.querySelector('#calls-chart svg');});
+  await page.evaluate(()=>window.__reportPoll());
+  assert(await page.evaluate(()=>window.__analyticSvg===document.querySelector('#calls-chart svg')),'cached polling does not replace SVG or animate bars');
+  assert.equal(chartRequests(),beforeTooltip);
+  await page.locator('#chart-report-link').click();await waitText('report-page','7 dias');
+  assert.equal(await page.locator('#report-from').inputValue(),daily.at(-7).day);
+  await nav('Dashboard');
+  await page.setViewportSize({width:900,height:1024});await screenshot('admin/evidence/analytic-tablet.png');
+  await page.setViewportSize({width:390,height:844});
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.locator('#calls-chart [data-day-index]').first().tap();await page.locator('#chart-tooltip').waitFor({state:'visible'});
+  const tooltipBounds=await page.locator('#chart-tooltip').boundingBox();assert(tooltipBounds.x>=0&&tooltipBounds.x+tooltipBounds.width<=390);
+  await screenshot('admin/evidence/analytic-mobile.png');
+  await page.setViewportSize({width:1440,height:500});
+  assert.equal(await page.locator('#sidebar').evaluate(e=>getComputedStyle(e).scrollbarWidth),'none');
+  assert.equal(await page.locator('#event-output').evaluate(e=>getComputedStyle(e).scrollbarWidth),'none');
+  assert.equal(await page.locator('nav button').first().evaluate(e=>getComputedStyle(e).fontWeight),'600');
+  await page.locator('#sidebar').hover();await page.mouse.wheel(0,800);await page.waitForFunction(()=>document.getElementById('sidebar').scrollTop>0);
+  await page.getByRole('button',{name:'Sair',exact:true}).focus();
+  assert(await page.locator('#sidebar').evaluate(e=>e.scrollTop>0&&getComputedStyle(e).overflowY==='auto'));
+  await screenshot('admin/evidence/sidebar-scrolled.png');
+  await page.setViewportSize({width:1440,height:1100});
+  await page.locator('#sidebar').evaluate(e=>{e.scrollTop=0;});
+  await page.locator('#event-output').evaluate(e=>{e.scrollTop=0;});
+  await page.locator('#event-output').hover();await page.mouse.wheel(0,200);await page.waitForFunction(()=>document.getElementById('event-output').scrollTop>0);
+  await page.locator('#event-output').evaluate(e=>{e.scrollTop=0;});await page.locator('#event-output').focus();await page.keyboard.press('PageDown');
+  await page.waitForFunction(()=>document.getElementById('event-output').scrollTop>0);
+  // Reports keep their own default 30-day filter after the chart-link check.
+  await page.evaluate(([from,to])=>{document.getElementById('report-from').value=from;document.getElementById('report-to').value=to;},[range.from,range.to]);
+
   const historyRequests=requests.filter(r=>r.path==='/api/reports').length;
   await page.locator('#chart-toggle').focus();await page.keyboard.press('Space');assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'false');
   await page.keyboard.press('Enter');await page.waitForTimeout(250);assert.equal(requests.filter(r=>r.path==='/api/reports').length,historyRequests);
-  await page.evaluate(()=>{const original=document.createElementNS.bind(document);document.createElementNS=()=>{throw new Error('synthetic SVG failure');};window.dispatchEvent(new Event('resize'));document.createElementNS=original;});
+  await page.evaluate(()=>{document.getElementById('calls-chart').style.width='95%';const original=document.createElementNS.bind(document);document.createElementNS=()=>{throw new Error('synthetic SVG failure');};window.dispatchEvent(new Event('resize'));document.createElementNS=original;});
   await waitText('calls-chart','indicadores permanecem válidos');assert.equal(await page.locator('#today-calls').textContent(),'1.280');
-  await page.evaluate(()=>window.dispatchEvent(new Event('resize')));assert.equal(await page.locator('#calls-chart svg').count(),1);
+  await page.evaluate(()=>{document.getElementById('calls-chart').style.width='';window.dispatchEvent(new Event('resize'));});assert.equal(await page.locator('#calls-chart svg').count(),1);
   todayError=true;await page.evaluate(()=>window.__reportPoll());await waitText('today-updated','Desatualizado');
   assert.equal(await page.locator('#today-calls').textContent(),'1.280');assert.equal(await page.locator('#calls-chart svg').count(),1);
   todayError=false;todayCalls='1291';await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','1.291');
@@ -153,6 +219,7 @@ try{
   assert(Math.abs(anchorAfter-anchor.offset)<1,'manual scroll survives buffer rotation even with Autoscroll checked');
   await page.locator('#event-output').evaluate(e=>{e.scrollTop=e.scrollHeight;});eventOffset=2;await page.evaluate(()=>window.__statusPoll());await waitText('event-output','received=241');
   assert(await page.locator('#event-output').evaluate(e=>Math.abs(e.scrollHeight-e.clientHeight-e.scrollTop)<2));
+  await screenshot('admin/evidence/terminal-scrolled.png');
   await page.locator('#event-autoscroll').uncheck();
   await page.locator('#event-output').evaluate(e=>{e.scrollTop=40;});
   await page.evaluate(()=>window.__statusPoll());await page.waitForTimeout(100);
@@ -182,7 +249,7 @@ try{
   // A delayed report must not restore data after logout/session expiration.
   reportDelay=500;await nav('Aplicar período');await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});await page.waitForTimeout(600);assert.equal(await page.locator('#report-rows tr').count(),0);assert(await page.locator('#terminal').isHidden());
   reportDelay=0;reportError=true;todayError=true;await page.locator('#login-form input[name=username]').fill('fixture');await page.locator('#login-form input[name=password]').fill('fixture');await nav('Entrar');
-  await waitText('today-updated','indisponível');assert.equal(await page.locator('#today-calls').textContent(),'—');assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'false');await page.locator('#chart-toggle').click();await waitText('chart-status','Série indisponível');todayError=false;await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','1.291');assert.match(await page.locator('#chart-status').textContent(),/Série indisponível/);
+  await waitText('today-updated','indisponível');assert.equal(await page.locator('#today-calls').textContent(),'—');assert.equal(await page.locator('#chart-toggle').getAttribute('aria-expanded'),'false');await page.locator('#chart-toggle').click();await waitText('chart-status','Série indisponível');assert.equal(await page.locator('#chart-total').textContent(),'—');todayError=false;await page.evaluate(()=>window.__reportPoll());await waitText('today-calls','1.291');assert.match(await page.locator('#chart-status').textContent(),/Série indisponível/);
   await nav('Abrir navegação');await nav('Sair');await page.locator('#login').waitFor({state:'visible'});reportError=false;empty=true;todayError=false;
   await page.locator('#login-form input[name=username]').fill('fixture');await page.locator('#login-form input[name=password]').fill('fixture');await nav('Entrar');await page.locator('#chart-toggle').click();await waitText('calls-chart','Nenhuma chamada');
   // Calendar rollover is driven by the synchronized Brasília day, not the browser timezone.
