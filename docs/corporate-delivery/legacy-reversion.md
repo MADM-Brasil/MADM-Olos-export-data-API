@@ -20,6 +20,37 @@ Ao esvaziar a fila e conferir o manifesto inicial, passa para `legacy`, com `una
 
 **Limite deliberado:** voltar ao fluxo legado restaura o uso da sequência local, cuja faixa pode colidir com MADM. Esta operação não promete exclusividade global. As colisões continuam sendo diagnosticadas, bloqueadas e isoladas pelo procedimento seletivo, sem sobrescrever o destino. Não há `setval`, offset, alteração manual de sequência ou tentativa de corrigir IDs existentes. Rollbacks podem consumir números de sequência e deixar lacunas normais, sem duplicar registros confirmados.
 
+## Prova da sequência local sem usar o maior ID histórico
+
+A validação anterior comparava `last_value` com `MAX(records.target_id)`. Essa comparação foi removida da reversão: `records` não contém uma coluna que certifique qual gerador atribuiu cada ID. `source_id`, a contagem de linhas e `outbox.origin` tampouco provam essa origem. Nenhum registro é classificado como externo apenas por ser alto, nem ignorado com base nessa suposição.
+
+A prova agora separa o **cursor real da sequência** da **ocupação histórica**:
+
+- Lê a sequência vinculada à coluna pelo catálogo, `is_called`, incremento, limites, cache e ciclo. Exige incremento positivo, ausência de ciclo e `cache=1`, para demonstrar a faixa ainda necessária. Outra configuração mantém o bloqueio, sem alteração automática da sequência.
+- Conta somente admissões não materializadas que ainda não têm mapeamento em `records`. Calcula a progressão a partir do próximo valor real; não usa MAX, contagem de registros históricos, offset ou renumeração.
+- Exige unicidade imediata válida em `records(target_table,target_id)`, outbox e PK da tabela local, com dados visíveis sem RLS. Estabiliza as tabelas locais por transação, inclusive recibos antigos quando presentes. A exclusão de escritores usa `SHARE ROW EXCLUSIVE`; os privilégios necessários são os definidos pelo [PostgreSQL 16 para LOCK](https://www.postgresql.org/docs/16/sql-lock.html). Não há GRANT automático.
+- Procura qualquer ID dessa progressão já ocupado em `records` para a tabela vinculada, outbox, destino local ou recibos antigos. Um ID acima da faixa não interfere na prova atual; um ID dentro dela impede a reversão antes de materializar.
+- Em cada alocação legada, confere também o valor **efetivamente retornado por `nextval()`**, sob os locks e constraints. Isso protege contra divergências de uma previsão anterior e também vale para novas capturas após a reversão. Não pula IDs ocupados nem reescreve seus titulares.
+
+Na evidência informada, `last_value=2.117.157`, `is_called=true` e incremento 1 dariam a faixa **2.117.158–2.129.427** para 12.270 novos mapeamentos, se todos ainda precisarem de ID. A presença de 11.618 IDs históricos acima da sequência e do máximo 47.561.749, isoladamente, não informa se essa faixa está livre. O comando verifica a ocupação real antes de autorizar sua utilização. Novas admissões entre lotes são incluídas nas verificações seguintes.
+
+`corporate_legacy_sequence_verified` registra limites/quantidade necessária. `corporate_legacy_sequence_unsafe` informa a condição impeditiva, sem payloads ou dados pessoais:
+
+| `reason` | Condição que conserva o bloqueio |
+| --- | --- |
+| `LOCAL_TARGET_ID_OCCUPIED` | Candidato ocupado; log inclui `target_id`, `scope` e, no preflight, limites da faixa. |
+| `LOCAL_ID_UNIQUENESS_NOT_PROVEN` | Constraint/index de unicidade ausente, inválido ou diferível. |
+| `LOCAL_ID_SPACE_NOT_VISIBLE` | Relação inesperada ou RLS impede a prova integral de ocupação. |
+| `LOCAL_ID_LOCK_PRIVILEGE_REQUIRED` | A conexão não pode excluir os escritores locais durante a prova. |
+| `LEGACY_RECEIPTS_MISSING` | Controle conserva confirmações legadas, mas sua tabela de recibos está ausente. |
+| `SEQUENCE_METADATA_UNSUPPORTED` | Metadados ausentes, incremento não positivo ou ciclo habilitado. |
+| `SEQUENCE_CACHE_NOT_ONE` | Cache diferente de 1 impede usar `last_value` como previsão segura para esta rotina. |
+| `SEQUENCE_CAPACITY_NOT_PROVEN` | Próximos candidatos fora dos limites do gerador ou do inteiro positivo de 32 bits. |
+
+O erro de saída permanece `ALLOCATOR_LEGACY_SEQUENCE_UNSAFE`. No preflight, falha não consome IDs nem altera a preparação. Falha posterior conserva os checkpoints já confirmados e as admissões restantes. As comparações no MADM, a pausa, a liberação explícita e a quarentena seletiva continuam obrigatórias: esta prova é de disponibilidade **local**, não de exclusividade corporativa.
+
+Não é necessária migration nova. Após disponibilização autorizada da correção no mesmo worker, repetir o comando com os parâmetros/UUID de reversão preservados. Se a nova prova encontrar uma condição impeditiva, manter o bloqueio e reconciliar a causa; não usar `setval`, offsets, reinicialização ou remoção de constraints.
+
 ## Comandos exatos para a VPS, após aprovação
 
 Pré-requisito: esta versão já em execução no **mesmo worker**, migrations locais `001`–`008` presentes. Não basta executar uma CLI nova ao lado de um worker com o código antigo: ele não conhece o modo `legacy` da reversão. A disponibilização da versão é uma etapa externa, separadamente autorizada; os comandos abaixo não fazem deploy/restart. Não instalar a migration corporativa de reservas.
@@ -154,6 +185,8 @@ O mesmo ciclo existente executará os INSERTs legados, excluindo a quarentena e 
 
 ## Validação local
 
-Build aprovado; `npm test` **133/133**; suíte dirigida de recuperação **56/56**. A suíte corporativa completa teve **136 aprovados / 8 falhas**; o HEAD limpo `c7c1bf7`, compilado e executado separadamente, reproduziu as mesmas sete falhas antigas de histórico/homologação mais o agregado (**123 aprovados / 8 falhas**). O typecheck global mantém os **17 diagnósticos preexistentes**, com saída completa idêntica via `cmp`; `git diff --check` e a sintaxe dos blocos bash passaram. A suíte global e o typecheck não estão integralmente aprovados. [Evidências](../evidence/corporate-legacy-reversion.json).
+Correção da prova da sequência: build aprovado; `npm test` **133/133**; suíte de recuperação/alocação **66/66** (65 subtestes e agregado). A suíte completa teve **146 aprovados / 8 falhas**. O HEAD limpo `8c18c99`, compilado e executado separadamente, reproduziu as mesmas sete falhas antigas de histórico/homologação mais o agregado (**136 aprovados / 8 falhas**). O typecheck mantém os **17 diagnósticos preexistentes**, com saída integral idêntica à do HEAD limpo via `cmp`; `git diff --check` passou. A suíte global e o typecheck não estão integralmente aprovados.
 
-Os testes cobrem o fluxo completo até o INSERT legado, CLI compilada/repetição, preservação do histórico e quarentena, rollback por lote/finalização, checkpoints, novas capturas entre lotes, reinício, COMMIT incerto em três fases, concorrência, limitações por invocação, divergência de dados/aprovação, ausência de migration, recusa de artefatos remotos/atribuições/estado ativo e quarentena de novas colisões. São fixtures menores em PostgreSQL descartável com TLS; não constituem benchmark nem execução sobre as 12.270 admissões produtivas.
+As dez novas provas incluem histórico acima da sequência, preservação de um ID 47.561.749 e da quarentena, colisões em records/outbox/destino local/recibos, conferência do valor real de nextval, sequência ainda não chamada, falta de privilégio/constraint, interrupção/reinício, retomada idempotente e escritor SQL concorrente. [Evidência desta correção](../evidence/corporate-legacy-sequence-validation.json). A [evidência inicial da reversão](../evidence/corporate-legacy-reversion.json) permanece preservada.
+
+Todos os testes usam PostgreSQL descartável com TLS verificado e fixtures menores. Não houve execução sobre as 12.270 admissões produtivas nem benchmark do volume real.

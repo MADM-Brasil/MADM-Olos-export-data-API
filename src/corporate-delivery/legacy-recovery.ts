@@ -8,6 +8,7 @@ import { connect, rollback } from '../corporate-sync/database.js';
 import { SyncError } from '../corporate-sync/errors.js';
 import { digest, type Shape } from '../corporate-sync/mapping.js';
 import { admissionHash, allocatorState, assertLegacyRemote } from './allocator.js';
+import { verifyLegacySequence } from './legacy-sequence.js';
 import { CorporateDelivery } from './delivery.js';
 import { corporateSchema, deliveryPayload, freeze } from './contract.js';
 import { quarantineMembers } from './quarantine.js';
@@ -67,12 +68,7 @@ async function locks(local: PoolClient) {
 async function sequence(local: PoolClient, cfg: Config, target: string) {
   const info = await assertSchema(local, cfg.schema, cfg.table);
   const name = info.sequence!;
-  const meta = (await local.query('SELECT seqincrement::text,seqcycle FROM pg_sequence WHERE seqrelid=$1::regclass', [name])).rows[0];
-  const value = (await local.query(`SELECT last_value::text,is_called FROM ${name}`)).rows[0];
-  const maximum = BigInt((await local.query('SELECT COALESCE(max(target_id),0)::text AS n FROM olos_http.records WHERE target_table=$1', [target])).rows[0].n);
-  if (!meta || meta.seqcycle || BigInt(meta.seqincrement)<=0n || BigInt(value.last_value)<maximum
-    || !value.is_called && BigInt(value.last_value)<=maximum) throw new SyncError('ALLOCATOR_LEGACY_SEQUENCE_UNSAFE');
-  // nextval remains the allocator. No setval, ALTER SEQUENCE, MAX-based assignment or invented offset.
+  await verifyLegacySequence(local,target,name,cfg.sourceKey);
   return name;
 }
 

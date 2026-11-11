@@ -1,0 +1,85 @@
+{
+  "date": "2026-11-11",
+  "baseline_commit": "8c18c99",
+  "production_accessed": false,
+  "commit_performed": false,
+  "push_performed": false,
+  "deploy_performed": false,
+  "reported_production": {
+    "records": 2117157,
+    "sequence_last_value": 2117157,
+    "is_called": true,
+    "increment": 1,
+    "cycle": false,
+    "records_above_sequence": 11618,
+    "maximum_target_id": 47561749,
+    "waiting_admissions": 12270,
+    "verified_live": false
+  },
+  "finding": "The database records identities and frozen payloads, but not authoritative allocator provenance for every historical ID. Height, source_id, row counts and outbox.origin are not proof of external generation.",
+  "change": "Replace the global MAX comparison with a locked check of the actual required sequence progression, and validate every actual nextval before any new local mapping is inserted.",
+  "checks": {
+    "build": {
+      "command": "npm run build",
+      "node": "24.16.0",
+      "result": "passed"
+    },
+    "unit": {
+      "command": "npm test",
+      "passed": 133,
+      "failed": 0
+    },
+    "recovery_subsuite": {
+      "command": "bash scripts/test-corporate-delivery.sh; test/corporate-recovery.integration.ts subgroup",
+      "passed": 66,
+      "failed": 0,
+      "details": "65 passing subtests plus parent, including 10 new sequence-proof tests"
+    },
+    "full_integration": {
+      "command": "bash scripts/test-corporate-delivery.sh",
+      "passed": 146,
+      "failed": 8,
+      "baseline_passed": 136,
+      "baseline_failed": 8,
+      "baseline_method": "Clean git archive HEAD, separate build and execution with disposable PostgreSQL",
+      "same_failures": [
+        "✖ history exige exclusividade com o Admin",
+        "✖ history bloqueia estados corporativos inválidos e leituras pendentes",
+        "✖ history falha remota não repete consumo após reinício",
+        "✖ homologation CLI confirms exactly five, remains paused, never calls OLOS and never drains a second batch",
+        "✖ homologation CLI excludes independent source, Admin and Corporate Sync lock owners",
+        "✖ homologation holds pause against concurrent resume, blocks another CLI and permits only one attempt per instance",
+        "✖ homologation without authorization, without pause or with a structural conflict fails closed"
+      ]
+    },
+    "typecheck": {
+      "command": "npm run typecheck",
+      "result": "17 preexisting diagnostics; full output identical to clean HEAD via cmp"
+    },
+    "diff_check": {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  },
+  "proofs": [
+    "A preserved historical ID 47561749 above an unchanged local sequence does not block allocation of free IDs 2,3,4.",
+    "Existing records, frozen outbox, source hashes, receipts, admissions, quarantine and corporate contents remain unchanged.",
+    "The proof uses is_called, positive increment, no cycle, cache=1 and generator/int32 limits, not MAX(target_id) or historical row count.",
+    "The needed progression counts only waiting admissions without existing source mappings; no arbitrary range or offset is allocated.",
+    "Every prospective ID is checked against records in the bound namespace, global outbox IDs, local destination IDs and retained legacy receipts.",
+    "Immediate valid uniqueness constraints and visible ordinary tables are required; insufficient lock privileges refuse approval.",
+    "Per-transaction table locks exclude concurrent SQL writers, and immediate database uniqueness prevents duplicate local target IDs.",
+    "Each actual nextval value is checked independently of any prior forecast.",
+    "Conflicts in the requested interval block before materialization without consuming IDs; conflicts appearing after committed batches preserve those batches and block further work.",
+    "Never-called sequences use last_value itself as their first candidate.",
+    "Interruption, restart and repeated requests retain already committed IDs and do not create duplicate mappings.",
+    "MADM schema, full row comparisons, hashes, pause/recovery gates and selective quarantine are unchanged."
+  ],
+  "limits": [
+    "Provided counts do not prove whether the production interval 2117158 through 2129427 is free; code must inspect the actual local occupancy.",
+    "Existing data does not certify the historical generator; all persisted IDs remain occupied independently of origin.",
+    "Unsupported cache, metadata, visibility, privileges, uniqueness or capacity keeps the block; no automatic sequence adjustment, skipping of occupied IDs or schema repair.",
+    "This is local allocation safety; the existing MADM collision checks and administrative release remain necessary.",
+    "Tests use smaller datasets and disposable PostgreSQL 16 with verified TLS; no production volume, query plans or latency were benchmarked."
+  ]
+}

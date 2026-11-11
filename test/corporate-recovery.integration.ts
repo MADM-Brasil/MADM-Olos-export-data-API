@@ -13,6 +13,7 @@ import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { logVerification, recoverCollision, recoveryRequest, verifyPending, type RecoveryHooks } from '../src/corporate-delivery/recovery.js';
 import { adoptAllocator, adoptionRequest, reserveIds } from '../src/corporate-delivery/allocator.js';
 import { legacyReversionRequest, revertAllocator, type ReversionHooks } from '../src/corporate-delivery/legacy-recovery.js';
+import { lockLegacyIdSpace, nextLegacyId } from '../src/corporate-delivery/legacy-sequence.js';
 import { allocatorContract } from '../src/corporate-delivery/allocator-contract.js';
 import { fixture, row as corporateRow } from './corporate-sync.fixture.js';
 
@@ -77,6 +78,16 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
   async function insertRemote(index: number, changes: Record<string, unknown> = {}) {
     const payload = { ...(await entries())[index]!.payload, ...changes };
     await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
+  }
+  async function importedHistory(id: number, sourceId: string) {
+    const payload={...((await entries())[0]?.payload??corporateRow(String(id))),internal_id_olos:String(id),olos_call_id:`historical-${sourceId}`,telefone:`55${String(id).padStart(11,'0')}`};
+    const sourceHash=digest(payload);
+    await local.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash,agent_id,campaign_id,disposition_id)
+      VALUES($1,$2,$3,$4,$5,'7','8','9')`,[source,sourceId,target,id,sourceHash]);
+    await local.query(`INSERT INTO olos_http.corporate_outbox(source_key,source_id,target_id,source_hash,payload,payload_hash,origin)
+      VALUES($1,$2,$3,$4,$5,$6,'legacy_backlog')`,[source,sourceId,id,sourceHash,payload,digest(payload)]);
+    await local.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) OVERRIDING SYSTEM VALUE VALUES(${columns.map((_,i)=>`$${i+1}`).join(',')})`,columns.map(name=>payload[name]));
+    return payload;
   }
   const allocationAuthorization = { OLOS_CORPORATE_ID_ALLOCATOR_CONFIRMATION: 'AUTHORIZE_CORPORATE_ID_ALLOCATOR' };
   const allocationArgs = (request = randomUUID()) => ['--confirm-source', source, '--request-id', request, '--evidence', 'INC-ALLOCATOR'];
@@ -768,6 +779,106 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       try{await assert.rejects(revert(input));}finally{dc.connection.destinationUrl=saved;}
       assert.equal((await reversionRuns()).length,0);assert.deepEqual(await admissions(),data);assert.equal((await control()).id_allocator_required,true);
       await stage(8902);await revert(input);assert.equal((await entries()).length,2);
+    });
+    await t.test('historical IDs far above the local sequence do not determine the next safe ID',async()=>{
+      await reset(1);await importedHistory(47561749,'700001');
+      await insertRemote(1,{telefone:'preserved-collision'});
+      await quarantine(args((await verify()).verification_digest));
+      const adoption=await prepare();for(const id of [8901,8902,8903])await stage(id);await reversalMigration();
+      const before=await snapshot(),data=await admissions(),input=reversionArgs(adoption);
+      assert.equal(before.allocator[0].last_value,'1');
+      await revert(input);const after=await snapshot();
+      assert.deepEqual(after.entries.map(e=>e.target_id),[1,2,3,4,47561749]);assert.equal(after.allocator[0].last_value,'4');
+      for(const row of before.entries)assert.deepEqual(after.entries.find(e=>e.source_id===row.source_id),row);
+      for(const row of before.records)assert.deepEqual(after.records.find(e=>e.source_id===row.source_id),row);
+      assert.deepEqual(after.quarantine,before.quarantine);assert.deepEqual(after.remote,before.remote);
+      assert.deepEqual((await admissions()).map(e=>({...e,materialized:false})),data);
+      const frozen=await entries(),cursor=after.allocator;await revert(input);assert.deepEqual(await entries(),frozen);assert.deepEqual((await snapshot()).allocator,cursor);
+      await recover(args((await verify()).verification_digest));await corporateControl(cfg,'corporate-resume');
+      await store!.delivery!.tick();await store!.delivery!.tick();
+      assert.equal((await entries()).filter(e=>e.state==='confirmed').length,4);assert.equal((await control()).blocked,false);
+    });
+    await t.test('a local ID in the needed interval blocks before materialization without moving the sequence',async()=>{
+      await reset(1);await importedHistory(3,'700003');const adoption=await prepare();await stage(8901);await stage(8902);await reversalMigration();
+      const before=await snapshot(),data=await admissions();let observed='';const stop=observeLogs(e=>{observed+=JSON.stringify(e);});
+      try{await assert.rejects(revert(reversionArgs(adoption)),/LEGACY_SEQUENCE_UNSAFE/);}finally{stop();}
+      assert.match(observed,/LOCAL_TARGET_ID_OCCUPIED/);assert.match(observed,/"target_id":"3"/);
+      assert.deepEqual(await snapshot(),before);assert.deepEqual(await admissions(),data);assert.equal((await reversionRuns()).length,0);
+      assert.equal((await local.query('SELECT state FROM olos_http.corporate_id_allocator')).rows[0].state,'adopting');
+    });
+    await t.test('raw destination occupancy and old receipts also prevent local ID reuse',async()=>{
+      for(const scope of ['raw','receipts']){
+        await reset(1);
+        if(scope==='raw'){
+          const payload={...(await entries())[0].payload,internal_id_olos:'2'};
+          await local.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) OVERRIDING SYSTEM VALUE VALUES(${columns.map((_,i)=>`$${i+1}`).join(',')})`,columns.map(n=>payload[n]));
+        }else await local.query("INSERT INTO corporate_sync.receipts(internal_id_olos,payload_hash) VALUES(2,repeat('a',64))");
+        const adoption=await prepare();await stage(8901);await reversalMigration();const before=await snapshot();
+        await assert.rejects(revert(reversionArgs(adoption)),/LEGACY_SEQUENCE_UNSAFE/);
+        assert.deepEqual(await snapshot(),before);assert.equal((await reversionRuns()).length,0);
+      }
+    });
+    await t.test('actual nextval values are checked independently of the forecast',async()=>{
+      await reset(1);await importedHistory(2,'700002');const before=await entries();
+      await assert.rejects(client(async db=>{
+        await db.query('BEGIN');
+        try{
+          const scopes=await lockLegacyIdSpace(db,target);
+          await nextLegacyId(db,'raw.olos_calls_internal_id_olos_seq',target,scopes);
+          await db.query('COMMIT');
+        }catch(error){await db.query('ROLLBACK');throw error;}
+      }),/LEGACY_SEQUENCE_UNSAFE/);
+      assert.deepEqual(await entries(),before);assert.equal((await local.query("SELECT count(*)::int AS n FROM olos_http.records WHERE target_id=2")).rows[0].n,1);
+    });
+    await t.test('high historical IDs stay unchanged through interrupted batches and idempotent recovery',async()=>{
+      await reset(1);await importedHistory(47561749,'700004');const adoption=await prepare();for(const id of [8901,8902,8903])await stage(id);await reversalMigration();const input=reversionArgs(adoption);
+      await assert.rejects(revert(input,{afterBatchCommit:async()=>{throw new Error('synthetic interruption');}}),/synthetic interruption/);
+      const committed=await entries();assert.deepEqual(committed.map(e=>e.target_id),[1,2,3,47561749]);
+      await store!.close();store=new Store(cfg);await store.open();await revert(input);
+      for(const row of committed)assert.deepEqual((await entries()).find(e=>e.source_id===row.source_id),row);
+      assert.deepEqual((await entries()).map(e=>e.target_id),[1,2,3,4,47561749]);assert.equal((await reversionBatches()).length,2);
+      const frozen=await snapshot();await revert(input);assert.deepEqual(await snapshot(),frozen);
+    });
+    await t.test('conflicts that appear between committed batches block the next interval without rewriting prior mappings',async()=>{
+      await reset(1);await importedHistory(47561749,'700005');const adoption=await prepare();for(const id of [8901,8902,8903])await stage(id);await reversalMigration();const input=reversionArgs(adoption,randomUUID(),1);
+      assert.equal((await revert(input)).completed,false);const committed=await entries();
+      await importedHistory(4,'700006');const cursor=(await snapshot()).allocator;
+      await assert.rejects(revert(input),/LEGACY_SEQUENCE_UNSAFE/);
+      for(const row of committed)assert.deepEqual((await entries()).find(e=>e.source_id===row.source_id),row);
+      assert.equal((await admissions()).filter(e=>!e.materialized).length,1);assert.deepEqual((await snapshot()).allocator,cursor);assert.equal((await control()).paused,true);
+    });
+    await t.test('never-called sequences validate their actual first value rather than assuming an increment already happened',async()=>{
+      await reset(0);await importedHistory(47561749,'700007');const adoption=await prepare();await stage(8901);await reversalMigration();
+      assert.equal((await snapshot()).allocator[0].is_called,false);await revert(reversionArgs(adoption));
+      assert.deepEqual((await entries()).map(e=>e.target_id),[1,47561749]);assert.equal((await snapshot()).allocator[0].last_value,'1');
+      await reset(0);await importedHistory(1,'700008');const second=await prepare();await stage(8901);await reversalMigration();const before=await snapshot();
+      await assert.rejects(revert(reversionArgs(second)),/LEGACY_SEQUENCE_UNSAFE/);assert.deepEqual(await snapshot(),before);
+      assert.equal((await snapshot()).allocator[0].is_called,false);
+    });
+    await t.test('a role that cannot exclude concurrent local writers cannot approve the ID proof',async()=>{
+      await reset(1);await local.query('CREATE ROLE local_id_proof_reader LOGIN');
+      await local.query('GRANT USAGE ON SCHEMA raw,olos_http,corporate_sync TO local_id_proof_reader; GRANT SELECT ON ALL TABLES IN SCHEMA raw,olos_http,corporate_sync TO local_id_proof_reader');
+      const url=new URL(sourceUrl);url.username='local_id_proof_reader';const readerPool=new pg.Pool({connectionString:url.toString(),max:1});const reader=await readerPool.connect();
+      try{await reader.query('BEGIN');await assert.rejects(lockLegacyIdSpace(reader,target),/LEGACY_SEQUENCE_UNSAFE/);await reader.query('ROLLBACK');}
+      finally{reader.release(true);await readerPool.end();await local.query('DROP OWNED BY local_id_proof_reader; DROP ROLE local_id_proof_reader');}
+    });
+    await t.test('a competing SQL writer cannot claim a locally allocated ID during materialization',async()=>{
+      await reset(1);await importedHistory(47561749,'700009');const adoption=await prepare();await stage(8901);await reversalMigration();
+      let entered!:()=>void,release!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+      const operation=revert(reversionArgs(adoption),{beforeBatchCommit:async()=>{entered();await gate;}});await ready;
+      let finished=false;
+      const competing=assert.rejects(local.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash)
+        VALUES($1,'competing-local-writer',$2,2,'synthetic-hash')`,[source,target]),(error:any)=>error.code==='23505').then(()=>{finished=true;});
+      try{await pause(30);assert.equal(finished,false);}finally{release();}
+      await operation;await competing;
+      assert.equal((await local.query('SELECT count(*)::int AS n FROM olos_http.records WHERE target_table=$1 AND target_id=2',[target])).rows[0].n,1);
+      assert.equal((await entries()).find(e=>e.target_id===2).source_id,'8901');
+    });
+    await t.test('missing immediate uniqueness protection refuses the sequence proof',async()=>{
+      await reset(1);const adoption=await prepare();await stage(8901);await reversalMigration();
+      await local.query('ALTER TABLE olos_http.records DROP CONSTRAINT records_target_table_target_id_key');
+      const data=await admissions();await assert.rejects(revert(reversionArgs(adoption)),/LEGACY_SEQUENCE_UNSAFE/);
+      assert.deepEqual(await admissions(),data);assert.equal((await reversionRuns()).length,0);
     });
     await t.test('audit migration can be reapplied without changing the queue or evidence', async () => {
       await reset(1); await recover(args((await verify()).verification_digest)); const before = await snapshot();

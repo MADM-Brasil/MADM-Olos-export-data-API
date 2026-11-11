@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import type { Client, Pool, PoolClient } from 'pg';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { retryable, safeCode, SyncError } from '../corporate-sync/errors.js';
-import { columns, digest, integerValue, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
+import { columns, digest, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
 import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
 import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
 import { corporateSchema, freeze, deliveryPayload, matches, uniqueIdentities } from './contract.js';
 import { allocatorState, assertLegacyRemote, admissionHash, reserveIds, allocatorError, type IdAssignment, type AllocatorHooks } from './allocator.js';
+import { lockLegacyIdSpace, nextLegacyId } from './legacy-sequence.js';
 import { pendingAdmission } from './selection.js';
 import { notQuarantined, quarantineMembers } from './quarantine.js';
 import { eligibleOperator } from './operator-eligibility.js';
@@ -139,6 +140,8 @@ export class CorporateDelivery {
     const shape = new Map(state.destination_shape) as Shape;
     const allocator = await allocatorState(local, this.cfg, this.source, this.target);
     if (reversionRequest && (allocator?.state !== 'reverting' || allocator.reversion_request_id !== reversionRequest || !state.paused)) throw new SyncError('ALLOCATOR_REVERSION_STATE_INVALID');
+    const legacyIds = !allocator || allocator.state === 'legacy' || !!reversionRequest;
+    const idSpace = legacyIds ? await lockLegacyIdSpace(local,this.target) : undefined;
     let queued = 0, skipped = 0, duplicates = 0;
     for (const record of input) {
       const previous = (await local.query(`SELECT r.source_hash,r.target_table,r.target_id::text,o.payload_hash
@@ -161,7 +164,7 @@ export class CorporateDelivery {
       }
       const assignment = reserved?.get(record.source_id);
       if (allocator && allocator.state !== 'legacy' && !reversionRequest && !assignment) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
-      const id = assignment?.id ?? integerValue((await local.query('SELECT nextval($1::regclass)::text AS id', [sequence])).rows[0].id, 32);
+      const id = assignment?.id ?? await nextLegacyId(local,sequence,this.target,idSpace!);
       const payload = (await freeze(local, [{ ...record, internal_id_olos: id }], shape, this.cfg))[0]!;
       const campaignCode=campaignPolicyCode(payload.nome_campanha_olos);
       const deliveryState = campaignCode!=='MANUAL_CAMPAIGN_EXCLUDED'&&eligibleOperator(
