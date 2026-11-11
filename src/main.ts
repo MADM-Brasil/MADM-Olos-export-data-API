@@ -16,9 +16,9 @@ async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
   const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
-    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions'];
+    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
-  if (['corporate-check','corporate-status','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions'].includes(command)) { await corporateControl(cfg, command, args); return; }
+  if (['corporate-check','corporate-status','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator'].includes(command)) { await corporateControl(cfg, command, args); return; }
   if (command === 'start' || command === 'admin') { await runManaged(cfg, command === 'admin'); return; }
   if (command === 'inspect-schema') {
     const pool = new pg.Pool({ connectionString: cfg.databaseUrl, max: 1, connectionTimeoutMillis: 10000, statement_timeout: 10000 });

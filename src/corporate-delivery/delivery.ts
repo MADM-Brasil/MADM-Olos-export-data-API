@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Client, Pool, PoolClient } from 'pg';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { retryable, safeCode, SyncError } from '../corporate-sync/errors.js';
@@ -6,6 +7,7 @@ import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
 import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
 import { corporateSchema, freeze, deliveryPayload, matches, uniqueIdentities } from './contract.js';
+import { allocatorState, admissionHash, reserveIds, allocatorError, type IdAssignment, type AllocatorHooks } from './allocator.js';
 import { pendingAdmission } from './selection.js';
 import { notQuarantined, quarantineMembers } from './quarantine.js';
 import { eligibleOperator } from './operator-eligibility.js';
@@ -13,7 +15,7 @@ import { reconcileLegacy } from './reconcile.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { campaignPolicyCode, assertCampaignAllowed, isCampaignPolicyError } from '../corporate-sync/campaign-policy.js';
 
-export interface DeliveryHooks {
+export interface DeliveryHooks extends AllocatorHooks {
   beforeRemoteCommit?: () => Promise<void>;
   afterRemoteCommit?: () => Promise<void>;
   beforeLocalCommit?: () => Promise<void>;
@@ -55,7 +57,9 @@ export class CorporateDelivery {
     const state = (await local.query(`SELECT ready,paused,blocked,legacy_count::text,confirmed_count::text,
       failure_count,next_attempt_at,last_code FROM olos_http.corporate_control WHERE singleton`)).rows[0];
     const quarantined = Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_collision_quarantine WHERE source_key=$1', [this.source])).rows[0].n);
-    return { ...(state ?? { ready: false }), quarantined, pending: Number((await local.query("SELECT count(*)::text AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n) };
+    const allocator = await allocatorState(local, this.cfg, this.source, this.target);
+    const unallocated = allocator ? Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND NOT materialized', [this.source])).rows[0].n) : 0;
+    return { ...(state ?? { ready: false }), allocator: allocator?.state ?? 'legacy', unallocated, quarantined, pending: Number((await local.query("SELECT count(*)::text AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n) };
   }
   async check(local: PoolClient): Promise<void> {
     await assertLocalConsumersCompatible(local, this.source);
@@ -64,6 +68,8 @@ export class CorporateDelivery {
     try {
       await remote.query('BEGIN READ ONLY');
       const contract = await corporateSchema(remote, this.cfg, false);
+      const allocator = await allocatorState(local, this.cfg, this.source, this.target);
+      if (allocator && (allocator.state !== 'active' || contract.allocatorHash !== allocator.contract_hash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
       if (contract.hash !== state.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
     } finally { await rollback(remote); await remote.end().catch(() => {}); }
   }
@@ -82,7 +88,9 @@ export class CorporateDelivery {
       // Homologation holds the session counterpart until its owning Store closes.
       if (!(await local.query('SELECT pg_try_advisory_xact_lock_shared(17320914,4) AS ok')).rows[0].ok) throw new SyncError('CORPORATE_HOMOLOGATION_ACTIVE');
       // Lock before checking: a concurrently finishing delivery may have just discovered a conflict.
+      const allocator = await allocatorState(local, this.cfg, this.source, this.target);
       const state = await this.state(local, true);
+      if (allocator && allocator.state !== 'active') throw new SyncError('ALLOCATOR_ADOPTION_INCOMPLETE');
       if (state.blocked && !['DATABASE_TRANSIENT_FAILURE','CORPORATE_COMMIT_UNKNOWN'].includes(state.last_code)) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
       await local.query(`UPDATE olos_http.corporate_control SET paused=false,blocked=false,failure_count=0,
         next_attempt_at=NULL,updated_at=now() WHERE singleton`);
@@ -124,9 +132,10 @@ export class CorporateDelivery {
     finally { this.active = undefined; }
   }
 
-  async enqueue(local: PoolClient, sequence: string, input: MappedRecord[]): Promise<{ queued: number; skipped: number; duplicates: number }> {
+  async enqueue(local: PoolClient, sequence: string, input: MappedRecord[], reserved?: Map<string, IdAssignment>): Promise<{ queued: number; skipped: number; duplicates: number }> {
     const state = await this.state(local);
     const shape = new Map(state.destination_shape) as Shape;
+    const allocator = await allocatorState(local, this.cfg, this.source, this.target);
     let queued = 0, skipped = 0, duplicates = 0;
     for (const record of input) {
       const previous = (await local.query(`SELECT r.source_hash,r.target_table,r.target_id::text,o.payload_hash
@@ -137,7 +146,19 @@ export class CorporateDelivery {
         if (!previous.payload_hash) throw new SyncError('LEGACY_RECORD_RECONCILIATION_REQUIRED');
         duplicates++; continue;
       }
-      const id = integerValue((await local.query('SELECT nextval($1::regclass)::text AS id', [sequence])).rows[0].id, 32);
+      if (allocator && !reserved) {
+        const waiting = (await local.query('SELECT source_hash,mapped_hash FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND source_id=$2', [this.source, record.source_id])).rows[0];
+        if (waiting) {
+          if (waiting.source_hash !== record.source_hash) throw new SyncError('SOURCE_ID_CONTENT_CONFLICT');
+          duplicates++; continue;
+        }
+        await local.query(`INSERT INTO olos_http.corporate_id_admissions(source_key,source_id,source_hash,request_id,mapped,mapped_hash)
+          VALUES($1,$2,$3,$4,$5,$6)`, [this.source, record.source_id, record.source_hash, randomUUID(), JSON.stringify(record), admissionHash(record)]);
+        queued++; continue;
+      }
+      const assignment = reserved?.get(record.source_id);
+      if (allocator && !assignment) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
+      const id = assignment?.id ?? integerValue((await local.query('SELECT nextval($1::regclass)::text AS id', [sequence])).rows[0].id, 32);
       const payload = (await freeze(local, [{ ...record, internal_id_olos: id }], shape, this.cfg))[0]!;
       const campaignCode=campaignPolicyCode(payload.nome_campanha_olos);
       const deliveryState = campaignCode!=='MANUAL_CAMPAIGN_EXCLUDED'&&eligibleOperator(
@@ -149,6 +170,9 @@ export class CorporateDelivery {
       const policyCode=campaignCode==='MANUAL_CAMPAIGN_EXCLUDED'||deliveryState==='pending'?campaignCode:null;
       await local.query(`INSERT INTO olos_http.corporate_outbox(source_key,source_id,target_id,source_hash,payload,payload_hash,origin,state,delivery_policy_code)
         VALUES($1,$2,$3,$4,$5,$6,'capture',$7,$8)`, [this.source, record.source_id, id, record.source_hash, JSON.stringify(payload), digest(payload), deliveryState,policyCode]);
+      if (assignment) await local.query(`INSERT INTO olos_http.corporate_id_assignments
+        (source_key,source_id,target_id,source_hash,binding,token,legacy) VALUES($1,$2,$3,$4,$5,$6,false)`,
+      [this.source, record.source_id, id, record.source_hash, this.cfg.binding, assignment.token]);
       if (deliveryState === 'pending') queued++;
       else skipped++;
     }
@@ -158,7 +182,45 @@ export class CorporateDelivery {
   // One bounded attempt per existing scheduler cycle/manual command. No timer, retry loop or scheduler here.
   async tick(hooks: DeliveryHooks = {}): Promise<void> {
     if (!this.cfg.connection.writeEnabled || !this.admitted || this.homologationUsed) return;
+    if (!await this.materializeAdmissions(hooks)) return;
     await this.attempt(hooks);
+  }
+
+  // One bounded materialization in the existing delivery cycle, independent of delivery's block.
+  // Capture never opens a corporate connection or waits for an ID reservation.
+  private async materializeAdmissions(hooks: DeliveryHooks): Promise<boolean> {
+    const local = await this.pool.connect();
+    local.on('error', () => {});
+    let remote: Client | undefined;
+    try {
+      await local.query('BEGIN');
+      const allocator = await allocatorState(local, this.cfg, this.source, this.target);
+      if (!allocator) { await local.query('ROLLBACK'); return true; }
+      if (allocator.state !== 'active') { await local.query('ROLLBACK'); return false; }
+      await local.query('SELECT pg_advisory_xact_lock(17320914,6)');
+      const entries = (await local.query(`SELECT source_id,source_hash,request_id,mapped,mapped_hash FROM olos_http.corporate_id_admissions
+        WHERE source_key=$1 AND NOT materialized ORDER BY source_id LIMIT $2 FOR UPDATE`, [this.source, this.cfg.connection.batchSize])).rows;
+      if (!entries.length) { await local.query('ROLLBACK'); return true; }
+      for (const entry of entries) if (entry.mapped.source_id !== entry.source_id || entry.mapped.source_hash !== entry.source_hash
+        || admissionHash(entry.mapped) !== entry.mapped_hash) throw new SyncError('ALLOCATOR_ADMISSION_CHANGED');
+      this.fence();
+      remote = await connect(this.cfg.connection, 'destination');
+      await remote.query('BEGIN');
+      const contract = await corporateSchema(remote, this.cfg, false);
+      const control = await this.state(local);
+      if (contract.allocatorHash !== allocator.contract_hash) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
+      if (contract.hash !== control.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
+      const assigned = await reserveIds(remote, this.cfg, entries.map(e => ({ source_id: e.source_id, source_hash: e.source_hash, request_id: e.request_id })), false);
+      this.fence(); await remote.query('COMMIT'); await hooks.afterReserveCommit?.(); this.fence();
+      await this.enqueue(local, '', entries.map(e => e.mapped), new Map(entries.map((e, i) => [e.source_id, assigned[i]!])));
+      await local.query(`UPDATE olos_http.corporate_id_admissions SET materialized=true WHERE source_key=$1 AND source_id=ANY($2::text[])`, [this.source, entries.map(e => e.source_id)]);
+      await hooks.beforeMaterializeCommit?.(); this.fence(); await local.query('COMMIT');
+      return true;
+    } catch (error) {
+      await rollback(local); if (remote) await rollback(remote);
+      log('corporate_id_allocation_deferred', { error: safeCode(allocatorError(error)) });
+      return false; // Durable admissions and idempotent remote reservations survive either lost acknowledgement.
+    } finally { if (remote) await remote.end().catch(() => {}); local.release(true); }
   }
 
   private async attempt(hooks: DeliveryHooks, homologation?: { limit: number; signal: AbortSignal }): Promise<DeliveryResult> {
@@ -177,6 +239,8 @@ export class CorporateDelivery {
     try {
       await local.query('BEGIN');
       await assertLocalConsumersCompatible(local, this.source);
+      // Match adoption's lock order: allocator admission fence before the control row.
+      const allocator = await allocatorState(local, this.cfg, this.source, this.target);
       const state = await this.state(local, true);
       if (homologation) {
         if (!state.paused) throw new SyncError('CORPORATE_HOMOLOGATION_REQUIRES_PAUSE');
@@ -229,8 +293,9 @@ export class CorporateDelivery {
         remote = await connect(this.cfg.connection, 'destination');
         await remote.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
         await remote.query('LOCK TABLE raw.olos_calls IN ROW EXCLUSIVE MODE');
-        const { shape, hash } = await corporateSchema(remote, this.cfg, true);
+        const { shape, hash, allocatorHash } = await corporateSchema(remote, this.cfg, true);
         if (hash !== state.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
+        if (allocator && (allocator.state !== 'active' || allocatorHash !== allocator.contract_hash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
         const rows = entries.map(entry => deliveryPayload(entry, shape, this.cfg));
         uniqueIdentities(rows);
         found = await matches(remote, rows, shape, this.cfg);
@@ -239,6 +304,15 @@ export class CorporateDelivery {
           assertCampaignAllowed(row.nome_campanha_olos);
           // Exact existing rows are never INSERTed again; even their corporate trigger is not invoked.
           if (found.has(row.internal_id_olos!)) continue;
+          if (allocator) {
+            const entry = entries.find(e => e.target_id === row.internal_id_olos)!;
+            const assignment = (await local.query(`SELECT a.token,a.target_id::text,a.source_hash,r.source_hash AS record_hash FROM olos_http.corporate_id_assignments a
+              JOIN olos_http.records r USING(source_key,source_id) WHERE a.source_key=$1 AND a.source_id=$2 AND a.binding=$3`,
+            [this.source, entry.source_id, this.cfg.binding])).rows[0];
+            if (!assignment?.token || assignment.target_id !== row.internal_id_olos || assignment.source_hash !== assignment.record_hash) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
+            await remote.query("SELECT set_config('olos_delivery_ids.token',$1,true)", [assignment.token]);
+          }
+
           const insertion = await remote.query(`INSERT INTO raw.olos_calls (${columns.map(quote).join(',')})
             VALUES (${columns.map((_, i) => `$${i + 1}`).join(',')})
             ON CONFLICT (internal_id_olos) WHERE internal_id_olos IS NOT NULL DO NOTHING`, columns.map(name => row[name]));
@@ -256,7 +330,7 @@ export class CorporateDelivery {
         if (error instanceof SyncError && ['CORPORATE_OWNER_LOST','CORPORATE_HOMOLOGATION_INTERRUPTED'].includes(error.code)) throw error;
         const failures = state.failure_count + 1;
         // Network termination during COMMIT does not always carry a PostgreSQL/Node error code.
-        const code = commitIssued ? 'CORPORATE_COMMIT_UNKNOWN' : safeCode(error);
+        const code = commitIssued ? 'CORPORATE_COMMIT_UNKNOWN' : safeCode(allocatorError(error));
         const terminal = !(commitIssued || retryable(error)) || failures >= this.cfg.connection.maxRetries;
         const delay = Math.min(60000, this.cfg.connection.backoffMs * 2 ** Math.min(failures - 1, 16));
         await local.query(`UPDATE olos_http.corporate_control SET failure_count=$1,blocked=$2,last_code=$3,

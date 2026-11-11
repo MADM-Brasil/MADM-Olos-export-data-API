@@ -34,3 +34,15 @@ test('quarantine requires its own authorization and cannot reuse a release autho
   await assert.rejects(corporateControl(cfg, 'corporate-quarantine-collisions', args, authorization), /NOT_AUTHORIZED/);
   await assert.rejects(corporateControl(cfg, 'corporate-quarantine-collisions', args.map((v, i) => i === 1 ? 'other' : v), quarantineAuthorization), /SOURCE_MISMATCH/);
 });
+
+test('allocator adoption and preparation require their own authorization and exact source', async () => {
+  const cfg = config({ DATABASE_URL: 'postgresql://test@localhost/local', OLOS_SOURCE_KEY: 'synthetic',
+    ATTEMPTS_PERSISTENCE_MODE: 'corporate', OLOS_CORPORATE_DATABASE_URL: 'postgresql://test@localhost/madm' });
+  const args = ['--confirm-source','synthetic','--request-id','00000000-0000-4000-8000-000000000001','--evidence','INC-ID'];
+  for (const command of ['corporate-prepare-id-allocator','corporate-adopt-id-allocator']) {
+    await assert.rejects(corporateControl(cfg, command, args, authorization), /ADOPTION_NOT_AUTHORIZED/);
+    await assert.rejects(corporateControl(cfg, command, args.map((v, i) => i === 1 ? 'other' : v), {
+      OLOS_CORPORATE_ID_ALLOCATOR_CONFIRMATION: 'AUTHORIZE_CORPORATE_ID_ALLOCATOR',
+    }), /SOURCE_MISMATCH/);
+  }
+});

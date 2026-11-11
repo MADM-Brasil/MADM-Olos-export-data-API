@@ -11,7 +11,9 @@ import { columns, digest } from '../src/corporate-sync/mapping.js';
 import { observeLogs } from '../src/errors.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { logVerification, recoverCollision, recoveryRequest, verifyPending, type RecoveryHooks } from '../src/corporate-delivery/recovery.js';
-import { fixture } from './corporate-sync.fixture.js';
+import { adoptAllocator, adoptionRequest, reserveIds } from '../src/corporate-delivery/allocator.js';
+import { allocatorContract } from '../src/corporate-delivery/allocator-contract.js';
+import { fixture, row as corporateRow } from './corporate-sync.fixture.js';
 
 const enabled = process.env.OLOS_DIRECT_DISPOSABLE_TEST === 'true';
 const authorization = { OLOS_CORPORATE_RECOVERY_CONFIRMATION: 'AUTHORIZE_CORPORATE_COLLISION_RECOVERY' };
@@ -42,7 +44,7 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
   async function reset(n = 5) {
     await store?.close(); store = undefined;
     await local.query('DROP SCHEMA IF EXISTS raw CASCADE; DROP SCHEMA IF EXISTS olos_http CASCADE; DROP SCHEMA IF EXISTS corporate_sync CASCADE; DROP SCHEMA IF EXISTS olos_billing CASCADE');
-    await remote.query('DROP SCHEMA IF EXISTS raw CASCADE; DROP SCHEMA IF EXISTS core CASCADE');
+    await remote.query('DROP SCHEMA IF EXISTS raw CASCADE; DROP SCHEMA IF EXISTS core CASCADE; DROP SCHEMA IF EXISTS olos_delivery_ids CASCADE');
     await local.query(await readFile(new URL('./fixture.sql', import.meta.url), 'utf8'));
     for (const name of ['001_ingestion.sql','corporate-sync/001_control.sql','002_corporate_delivery.sql','003_corporate_outbox_skipped.sql','005_corporate_campaign_policy.sql','006_corporate_collision_recovery.sql','007_corporate_collision_quarantine.sql']) {
       await local.query(await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
@@ -73,6 +75,25 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
   }
   async function insertRemote(index: number, changes: Record<string, unknown> = {}) {
     const payload = { ...(await entries())[index]!.payload, ...changes };
+    await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
+  }
+  const allocationAuthorization = { OLOS_CORPORATE_ID_ALLOCATOR_CONFIRMATION: 'AUTHORIZE_CORPORATE_ID_ALLOCATOR' };
+  const allocationArgs = (request = randomUUID()) => ['--confirm-source', source, '--request-id', request, '--evidence', 'INC-ALLOCATOR'];
+  const adopt = (input: string[], hooks = {}) => client(db => adoptAllocator(db, dc, source, target, adoptionRequest(input, allocationAuthorization, source), hooks));
+  const allocatorMigration = async () => local.query(await readFile(new URL('../migrations/008_corporate_id_allocator.sql', import.meta.url), 'utf8'));
+  const remoteAllocatorMigration = async () => remote.query(await readFile(new URL('../migrations/corporate/001_id_allocator.sql', import.meta.url), 'utf8'));
+  const admissions = async () => (await local.query('SELECT * FROM olos_http.corporate_id_admissions ORDER BY source_id')).rows;
+  const assignments = async () => (await local.query('SELECT * FROM olos_http.corporate_id_assignments ORDER BY target_id')).rows;
+  async function prepare(input = allocationArgs()) {
+    await allocatorMigration(); await corporateControl(cfg, 'corporate-pause');
+    await corporateControl(cfg, 'corporate-prepare-id-allocator', input, allocationAuthorization);
+    return input;
+  }
+  async function enableAllocator() {
+    const input = await prepare(); await remoteAllocatorMigration(); await adopt(input); return input;
+  }
+  async function insertForeign(id: string) {
+    const payload = corporateRow(id);
     await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
   }
   try {
@@ -381,6 +402,202 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       await local.query('UPDATE olos_http.corporate_control SET blocked=false,paused=false'); await store!.delivery!.tick();
       assert.equal((await control()).last_code, 'CORPORATE_QUARANTINE_MIGRATION_REQUIRED'); assert.equal((await control()).blocked, true);
       await stage(8999); assert.equal((await entries()).length, 3);
+    });
+    await t.test('authoritative adoption preserves legacy/quarantine IDs and stops consuming the local sequence', async () => {
+      await reset(2); await insertRemote(0, { telefone: 'legacy-collision' });
+      await quarantine(args((await verify()).verification_digest)); const before = await snapshot();
+      const input = await prepare(); await insertForeign('3'); await remoteAllocatorMigration(); await adopt(input);
+      const adopted = await snapshot();
+      for (const key of ['entries','records','reads','allocator','remote','sequence','quarantine','quarantineRuns'] as const) {
+        if (key !== 'remote' && key !== 'sequence') assert.deepEqual(adopted[key], before[key], key);
+      }
+      const legacyAssignments = await assignments(); assert.deepEqual(legacyAssignments.map(a => a.target_id), [1,2]);
+      assert.equal(legacyAssignments[0].token, null); assert(legacyAssignments[1].token);
+      await stage(8901); await stage(8902); assert.equal((await admissions()).length, 2);
+      assert.equal((await entries()).length, 2); assert.deepEqual((await snapshot()).allocator, before.allocator);
+      await recover(args((await verify()).verification_digest)); await corporateControl(cfg, 'corporate-resume');
+      await store!.delivery!.tick(); await store!.delivery!.tick();
+      const all = await entries(); assert.deepEqual(all.map(e => e.target_id), [1,2,4,5]);
+      assert.deepEqual(all[0], before.entries[0]); assert.equal(all.filter(e => e.state === 'confirmed').length, 3);
+      assert.equal((await control()).blocked, false); assert.deepEqual((await snapshot()).allocator, before.allocator);
+      const oldState = await assignments(); await adopt(input); assert.deepEqual(await assignments(), oldState);
+      await assert.rejects(adopt(allocationArgs()), /REQUEST_REUSED/);
+    });
+    await t.test('MADM outage leaves durable captures without IDs and later materializes them once', async () => {
+      await reset(0); await enableAllocator(); const saved = dc.connection.destinationUrl;
+      dc.connection.destinationUrl = 'postgresql://postgres@localhost:1/madm';
+      try { await stage(8901); await store!.delivery!.tick(); await stage(8902); await stage(8901); }
+      finally { dc.connection.destinationUrl = saved; }
+      assert.equal((await admissions()).length, 2); assert.equal((await entries()).length, 0); assert.equal((await store!.unresolved()).length, 0);
+      assert((await local.query('SELECT state FROM olos_http.reads')).rows.every(r => r.state === 'done'));
+      const status = await store!.delivery!.status(store!.client!); assert.equal(status.unallocated, 2); assert.equal(status.allocator, 'active');
+      await recover(args((await verify()).verification_digest)); await corporateControl(cfg, 'corporate-resume');
+      await store!.delivery!.tick(); await store!.delivery!.tick();
+      assert.equal((await entries()).length, 2); assert((await entries()).every(e => e.state === 'confirmed')); assert((await admissions()).every(e => e.materialized));
+    });
+    await t.test('adopting intent survives connection failures while captures continue; same request recovers', async () => {
+      await reset(1); const input = await prepare(); await remoteAllocatorMigration(); const saved = dc.connection.destinationUrl;
+      dc.connection.destinationUrl = 'postgresql://postgres@localhost:1/madm';
+      try { await assert.rejects(adopt(input)); await stage(8901); await stage(8902); }
+      finally { dc.connection.destinationUrl = saved; }
+      assert.equal((await local.query('SELECT state FROM olos_http.corporate_id_allocator')).rows[0].state, 'adopting');
+      assert.equal((await entries()).length, 1); assert.equal((await admissions()).length, 2);
+      await adopt(input); assert.equal((await local.query('SELECT state FROM olos_http.corporate_id_allocator')).rows[0].state, 'active');
+      await assert.rejects(stage(8901, { CallId: 'changed' }), /SOURCE_ID_CONTENT_CONFLICT/);
+    });
+    await t.test('lost adoption acknowledgement after remote commit preserves reservations and original IDs on retry', async () => {
+      await reset(2); const input = await prepare(); await remoteAllocatorMigration(); const before = await snapshot();
+      await assert.rejects(adopt(input, { afterReserveCommit: async () => { throw new Error('synthetic lost remote commit'); } }), /synthetic/);
+      assert.equal((await assignments()).length, 0); assert.equal((await local.query('SELECT state FROM olos_http.corporate_id_allocator')).rows[0].state, 'adopting');
+      const remoteBefore = (await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows;
+      await stage(8901); await adopt(input);
+      assert.deepEqual((await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows, remoteBefore);
+      assert.deepEqual((await entries()), before.entries); assert.deepEqual((await snapshot()).allocator, before.allocator);
+    });
+    await t.test('reservation idempotency survives remote commit followed by local rollback and restart', async () => {
+      await reset(0); await enableAllocator(); await stage(8901); await stage(8902);
+      await store!.delivery!.tick({ afterReserveCommit: async () => { throw new Error('synthetic lost acknowledgement'); } });
+      assert.equal((await entries()).length, 0); assert.equal((await assignments()).length, 0);
+      const reserved = (await remote.query('SELECT internal_id,token FROM olos_delivery_ids.registry ORDER BY internal_id')).rows;
+      assert.equal(reserved.length, 2);
+      await store!.close(); store = new Store(cfg); await store.open();
+      await store.delivery!.tick({ beforeMaterializeCommit: async () => { throw new Error('synthetic local rollback'); } }); assert.equal((await entries()).length, 0);
+      await recover(args((await verify()).verification_digest)); await corporateControl(cfg, 'corporate-resume'); await store.delivery!.tick();
+      assert.deepEqual((await assignments()).map(a => ({ internal_id: a.target_id, token: a.token })), reserved);
+      assert.equal((await entries()).length, 2); assert((await entries()).every(e => e.state === 'confirmed'));
+    });
+    await t.test('concurrent authoritative allocators and direct corporate writers cannot consume the same ID', async () => {
+      await reset(0); await enableAllocator();
+      const second = new pg.Client({ connectionString: destinationUrl.toString() }); await second.connect();
+      const items = (prefix: string) => Array.from({ length: 30 }, (_, i) => ({ source_id: `${prefix}${i}`, source_hash: 'hash', request_id: randomUUID() }));
+      const first = items('a'), other = items('b');
+      try {
+        const allocated = await Promise.all([reserveIds(remote, dc, first, false), reserveIds(second, dc, other, false)]);
+        assert.equal(new Set(allocated.flat().map(a => a.id)).size, 60);
+        assert.deepEqual(await reserveIds(second, dc, first, false), allocated[0]);
+        await assert.rejects(reserveIds(remote, dc, [{ ...first[0], source_hash: 'changed' }], false), /REQUEST_CONFLICT/);
+        await assert.rejects(insertForeign(allocated[0]![0]!.id), (e: any) => e.code === 'P3103');
+        await insertForeign('61');
+        const next = await reserveIds(second, dc, [{ source_id: 'later', source_hash: 'hash', request_id: randomUUID() }], false);
+        assert.equal(next[0]!.id, '62');
+      } finally { await second.end(); }
+    });
+    await t.test('remote uniqueness holds when a competing writer waits behind an uncommitted reservation', async () => {
+      await reset(0); await enableAllocator(); await remote.query('BEGIN');
+      const reserved = await reserveIds(remote, dc, [{ source_id: 'race', source_hash: 'hash', request_id: randomUUID() }], false);
+      const second = new pg.Client({ connectionString: destinationUrl.toString() }); await second.connect();
+      const payload = corporateRow(reserved[0]!.id); let finished = false;
+      const racing = assert.rejects(second.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(n => payload[n])), (e: any) => e.code === 'P3103').then(() => { finished = true; });
+      try { await pause(30); assert.equal(finished, false); await remote.query('COMMIT'); await racing; }
+      finally { await remote.query('ROLLBACK'); await second.end(); }
+      assert.equal((await remote.query('SELECT count(*)::int AS n FROM raw.olos_calls')).rows[0].n, 0);
+    });
+    await t.test('int32 exhaustion fails closed without wrapping or falling back to the local sequence', async () => {
+      await reset(0); await enableAllocator(); await remote.query('UPDATE olos_delivery_ids.counter SET next_candidate=2147483647');
+      const seq = (await snapshot()).allocator;
+      await stage(8901); await store!.delivery!.tick(); assert.equal((await entries())[0].target_id, 2147483647);
+      await stage(8902); await store!.delivery!.tick(); assert.equal((await entries()).length, 1);
+      assert.equal((await admissions()).filter(e => !e.materialized).length, 1); assert.deepEqual((await snapshot()).allocator, seq);
+      await assert.rejects(reserveIds(remote, dc, [{ source_id: 'overflow', source_hash: 'hash', request_id: randomUUID() }], false), /INT32_EXHAUSTED/);
+    });
+    await t.test('contract drift and admission corruption prevent allocation without losing captures', async () => {
+      await reset(0); await enableAllocator(); await stage(8901);
+      await remote.query('ALTER TABLE raw.olos_calls DISABLE TRIGGER trg_olos_calls_reserve_internal_id');
+      await store!.delivery!.tick(); assert.equal((await entries()).length, 0); await stage(8902); assert.equal((await admissions()).length, 2);
+      await remote.query('ALTER TABLE raw.olos_calls ENABLE ALWAYS TRIGGER trg_olos_calls_reserve_internal_id');
+      await local.query("UPDATE olos_http.corporate_id_admissions SET mapped_hash=repeat('a',64) WHERE source_id='8901'");
+      await store!.delivery!.tick(); assert.equal((await entries()).length, 0); assert((await admissions()).every(e => !e.materialized));
+    });
+    await t.test('legacy writers are fenced after adoption and allocator state cannot silently disappear', async () => {
+      await reset(0); await enableAllocator();
+      await assert.rejects(local.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash)
+        VALUES($1,'legacy-writer',$2,123,'hash')`, [source, target]), /ALLOCATOR_ASSIGNMENT_REQUIRED/);
+      assert.equal((await local.query("SELECT count(*)::int AS n FROM olos_http.records WHERE source_id='legacy-writer'")).rows[0].n, 0);
+      await local.query('DROP TABLE olos_http.corporate_id_allocator CASCADE');
+      await assert.rejects(stage(8901), /ALLOCATOR_LOCAL_STATE_MISSING/);
+      assert.equal((await entries()).length, 0);
+    });
+    await t.test('captures do not wait for the remote adoption commit and resume refuses incomplete adoption', async () => {
+      await reset(1); const input = await prepare(); await remoteAllocatorMigration();
+      await assert.rejects(corporateControl(cfg, 'corporate-resume'), /ADOPTION_INCOMPLETE/);
+      let entered!: () => void, release!: () => void;
+      const ready = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+      const adopting = adopt(input, { afterReserveCommit: async () => { entered(); await gate; } }); await ready;
+      try { await stage(8901); assert.equal((await admissions()).length, 1); assert.equal((await entries()).length, 1); }
+      finally { release(); }
+      await adopting;
+    });
+    await t.test('concurrent materialization and delivery consume each reservation only once', async () => {
+      await reset(0); await enableAllocator(); for (const id of [8901,8902,8903,8904]) await stage(id);
+      await recover(args((await verify()).verification_digest)); await corporateControl(cfg, 'corporate-resume');
+      await Promise.all([store!.delivery!.tick(), store!.delivery!.tick()]); await store!.delivery!.tick();
+      assert.equal((await entries()).length, 4); assert.equal((await assignments()).length, 4); assert.equal((await control()).confirmed_count, '4');
+      assert((await entries()).every(e => e.state === 'confirmed')); assert.equal((await control()).blocked, false);
+    });
+    await t.test('uncertain local adoption commit is reconciled by the same durable request', async () => {
+      for (const lostCommit of [1,2]) {
+        await reset(1); await allocatorMigration(); await corporateControl(cfg, 'corporate-pause'); await remoteAllocatorMigration(); const input = allocationArgs();
+        await assert.rejects(client(db => {
+          let commits = 0;
+          const ambiguous = new Proxy(db, { get(connection, key) {
+            if (key === 'query') return async (sql: string, parameters?: unknown[]) => {
+              const result = await connection.query(sql, parameters);
+              if (sql === 'COMMIT' && ++commits === lostCommit) throw new Error('synthetic lost local acknowledgement'); return result;
+            };
+            return Reflect.get(connection, key);
+          } });
+          return adoptAllocator(ambiguous, dc, source, target, adoptionRequest(input, allocationAuthorization, source));
+        }), /LOCAL_COMMIT_UNKNOWN/);
+        await stage(8901); await adopt(input);
+        assert.equal((await assignments()).length, 1); assert.equal((await admissions()).length, 1);
+        assert.equal((await local.query('SELECT state FROM olos_http.corporate_id_allocator')).rows[0].state, 'active');
+      }
+    });
+    await t.test('database guard protects reservations from another role and retains tombstones after deletion', async () => {
+      await reset(0); await enableAllocator();
+      await remote.query('CREATE ROLE allocator_test_client LOGIN; CREATE ROLE allocator_test_external LOGIN');
+      await remote.query(`GRANT USAGE ON SCHEMA raw,core TO allocator_test_client,allocator_test_external;
+        GRANT SELECT,INSERT ON raw.olos_calls TO allocator_test_client,allocator_test_external;
+        GRANT USAGE ON ALL SEQUENCES IN SCHEMA raw TO allocator_test_client,allocator_test_external;
+        GRANT USAGE ON SCHEMA olos_delivery_ids TO allocator_test_client;
+        GRANT EXECUTE ON FUNCTION olos_delivery_ids.reserve(text,jsonb,boolean) TO allocator_test_client`);
+      const firstUrl = new URL(destinationUrl); firstUrl.username = 'allocator_test_client'; const otherUrl = new URL(destinationUrl); otherUrl.username = 'allocator_test_external';
+      const first = new pg.Client({ connectionString: firstUrl.toString() }), other = new pg.Client({ connectionString: otherUrl.toString() });
+      await first.connect(); await other.connect();
+      try {
+        const assignment = (await reserveIds(first, dc, [{ source_id: 'role-test', source_hash: 'hash', request_id: randomUUID() }], false))[0]!;
+        await assert.rejects(other.query('SELECT * FROM olos_delivery_ids.registry'), (e: any) => e.code === '42501');
+        await assert.rejects(first.query('ALTER TABLE raw.olos_calls DISABLE TRIGGER trg_olos_calls_reserve_internal_id'), (e: any) => e.code === '42501');
+        await other.query("SELECT set_config('olos_delivery_ids.token',$1,false)", [assignment.token]);
+        const payload = corporateRow(assignment.id);
+        await assert.rejects(other.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(n => payload[n])), (e: any) => e.code === 'P3103');
+        await first.query('BEGIN'); await first.query("SELECT set_config('olos_delivery_ids.token',$1,true)", [assignment.token]);
+        await first.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(n => payload[n])); await first.query('COMMIT');
+        await remote.query('DELETE FROM raw.olos_calls WHERE internal_id_olos=$1', [assignment.id]);
+        await remote.query('UPDATE olos_delivery_ids.counter SET next_candidate=1');
+        const next = await reserveIds(first, dc, [{ source_id: 'after-deletion', source_hash: 'hash', request_id: randomUUID() }], false);
+        assert.notEqual(next[0]!.id, assignment.id);
+      } finally {
+        await first.end(); await other.end(); await remote.query('DROP OWNED BY allocator_test_client,allocator_test_external; DROP ROLE allocator_test_client; DROP ROLE allocator_test_external');
+      }
+    });
+    await t.test('resume respects adoption lock order and does not retain the control row while waiting for the allocator fence', async () => {
+      await reset(0); await allocatorMigration(); await local.query('UPDATE olos_http.corporate_control SET blocked=false,paused=true');
+      await client(async db => {
+        await db.query('BEGIN'); await db.query('SELECT pg_advisory_xact_lock(17320914,5)');
+        const resuming = corporateControl(cfg, 'corporate-resume');
+        try {
+          await pause(30);
+          await db.query('SELECT singleton FROM olos_http.corporate_control FOR UPDATE NOWAIT');
+        } finally { await db.query('COMMIT'); }
+        await resuming;
+      });
+      assert.equal((await control()).paused, false);
+    });
+    await t.test('allocator migrations are idempotent and preserve history and corporate row contents', async () => {
+      await reset(2); await insertRemote(0); const input = await enableAllocator(); const before = await snapshot();
+      await allocatorMigration(); await remoteAllocatorMigration(); await adopt(input);
+      assert.deepEqual(await snapshot(), before); assert.equal(await allocatorContract(remote), (await local.query('SELECT contract_hash FROM olos_http.corporate_id_allocator')).rows[0].contract_hash);
     });
     await t.test('audit migration can be reapplied without changing the queue or evidence', async () => {
       await reset(1); await recover(args((await verify()).verification_digest)); const before = await snapshot();

@@ -3,7 +3,7 @@ import type { Config } from './config.js';
 import { columns, type Column, type Shape } from './mapping.js';
 import { SyncError } from './errors.js';
 
-export async function schema(db: Client, side: 'source' | 'destination', cfg: Config, write = false): Promise<Shape> {
+export async function schema(db: Client, side: 'source' | 'destination', cfg: Config, write = false, allocator = false): Promise<Shape> {
   const meta = (await db.query(`SELECT c.relkind, c.relrowsecurity, c.relforcerowsecurity,
     EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS triggers,
     EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid) AS rules,
@@ -36,10 +36,12 @@ export async function schema(db: Client, side: 'source' | 'destination', cfg: Co
       'ON raw.olos_calls FOR EACH ROW ' +
       'EXECUTE FUNCTION raw.fn_olos_calls_normalizar_telefone()';
 
-    if (triggers.length !== 1 ||
-        triggers[0].name !== 'trg_olos_calls_normalizar_telefone' ||
-        triggers[0].definition !== expectedTrigger ||
-        triggers[0].enabled !== 'O') {
+    const phone = triggers.find(t => t.name === 'trg_olos_calls_normalizar_telefone');
+    const guard = triggers.find(t => t.name === 'trg_olos_calls_reserve_internal_id');
+    if (triggers.length !== (allocator && guard ? 2 : 1) ||
+        phone?.definition !== expectedTrigger || phone.enabled !== 'O' ||
+        (guard && (!allocator || guard.enabled !== 'A' || guard.definition !==
+          'CREATE TRIGGER trg_olos_calls_reserve_internal_id BEFORE INSERT OR UPDATE OF internal_id_olos ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION olos_delivery_ids.guard_internal_id()'))) {
       throw new SyncError('DESTINATION_TRIGGER_REVIEW_REQUIRED');
     }
 

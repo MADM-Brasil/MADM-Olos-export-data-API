@@ -1,0 +1,82 @@
+{
+  "date": "2026-11-11",
+  "baseline_commit": "bd8b58a",
+  "production_accessed": false,
+  "deploy_performed": false,
+  "commit_performed": false,
+  "push_performed": false,
+  "checks": {
+    "build": {
+      "command": "npm run build",
+      "node": "24.16.0",
+      "result": "passed"
+    },
+    "unit": {
+      "command": "npm test",
+      "passed": 132,
+      "failed": 0
+    },
+    "corporate_sync": {
+      "command": "bash scripts/test-corporate-sync.sh",
+      "passed": 42,
+      "failed": 0
+    },
+    "recovery_allocator_subsuite": {
+      "command": "bash scripts/test-corporate-delivery.sh; test/corporate-recovery.integration.ts subgroup",
+      "passed": 43,
+      "failed": 0,
+      "details": "42 passing subtests plus parent aggregate; disposable PostgreSQL 16, verified TLS, internal Docker network, zero published ports"
+    },
+    "full_corporate_delivery": {
+      "command": "bash scripts/test-corporate-delivery.sh",
+      "passed": 123,
+      "failed": 8,
+      "baseline_passed": 107,
+      "baseline_failed": 8,
+      "baseline_method": "Separate clean git archive HEAD with separate build and disposable database execution",
+      "same_failures": [
+        "✖ history exige exclusividade com o Admin",
+        "✖ history bloqueia estados corporativos inválidos e leituras pendentes",
+        "✖ history falha remota não repete consumo após reinício",
+        "✖ homologation CLI confirms exactly five, remains paused, never calls OLOS and never drains a second batch",
+        "✖ homologation CLI excludes independent source, Admin and Corporate Sync lock owners",
+        "✖ homologation holds pause against concurrent resume, blocks another CLI and permits only one attempt per instance",
+        "✖ homologation without authorization, without pause or with a structural conflict fails closed"
+      ]
+    },
+    "typecheck": {
+      "command": "npm run typecheck",
+      "result": "17 preexisting errors; complete stdout identical to clean HEAD via cmp"
+    },
+    "diff_check": {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  },
+  "proofs": [
+    "Existing local sequence is not advanced or reset by adoption, authoritative allocation or delivery.",
+    "Confirmed and quarantined IDs, outbox payloads/hashes, records, receipts, corporate call contents and legacy schema hash are preserved.",
+    "New calls have no internal ID until a committed authoritative reservation; capture can complete durably without MADM.",
+    "Concurrent reservers receive disjoint int32 IDs; direct writers register their IDs or are rejected by the same registry key.",
+    "A competing writer waits for an uncommitted reservation and then cannot consume its ID.",
+    "A separate SQL role cannot read tokens, disable the guard or use another roles token.",
+    "Adopting intent is durable before remote changes, and capture does not wait for the remote adoption commit.",
+    "Remote allocation/adoption commit followed by local failure or uncertain local commit recovers idempotently with the same IDs/tokens.",
+    "Concurrent materialization/delivery confirms each call once; resume respects adoption lock order.",
+    "At int32 exhaustion, calls remain durably unallocated; no wrap, arbitrary numeric range, MAX-based allocator or fallback nextval is used.",
+    "Legacy record writers without authoritative assignments are rejected by a deferred local database fence.",
+    "Migrations are idempotent; old quarantine and verification/recovery remain functional."
+  ],
+  "adoption_requirements": [
+    "Reviewed local migration 008 and corporate migration corporate/001_id_allocator.sql; no migrations were run outside disposable test databases.",
+    "Same updated worker already running; pause only delivery, prepare durable adopting mode, install DBA-approved corporate guard, adopt using original request UUID.",
+    "Guard applies to every corporate writer; privileged DDL bypass or registry tampering is outside the exclusivity contract.",
+    "Runtime grants are USAGE/EXECUTE for the corporate reservation API; do not grant direct registry/counter access.",
+    "All existing local IDs are registered without remapping; previously known collisions still need the existing selective recovery procedure."
+  ],
+  "limits": [
+    "No proof of production schema, writer compatibility, current quarantine count, WAN latency or throughput.",
+    "Normal schema/hash/logical-identity guards still block unrelated integrity failures.",
+    "Finite positive int32 capacity fails closed; durable admission storage and existing batch size bound operational capacity."
+  ]
+}

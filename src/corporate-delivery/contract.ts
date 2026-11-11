@@ -3,12 +3,13 @@ import type { Client, PoolClient } from 'pg';
 import { schema } from '../corporate-sync/schema.js';
 import { columns, digest, compare, identityColumns, mapRow, projection, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
 import { SyncError } from '../corporate-sync/errors.js';
+import { allocatorContract } from './allocator-contract.js';
 import type { DeliveryConfig } from './config.js';
 
 export async function corporateSchema(db: Client, cfg: DeliveryConfig, write: boolean) {
   const identity = (await db.query("SELECT current_database() AS name, current_setting('session_replication_role') AS replication")).rows[0];
   if (identity.name !== 'madm' || identity.replication !== 'origin') throw new SyncError('CORPORATE_DATABASE_CONTRACT_INVALID');
-  const shape = await schema(db, 'destination', cfg.connection, write);
+  const shape = await schema(db, 'destination', cfg.connection, write, true);
   if ((await db.query(`SELECT 1 FROM pg_index WHERE indrelid='raw.olos_calls'::regclass
     AND (indisunique OR indisexclusion) AND (NOT indisvalid OR NOT indisready) LIMIT 1`)).rowCount) throw new SyncError('CORPORATE_INDEX_NOT_READY');
   for (const name of ['raw_olos_call_id', 'telefone_match_key', 'data_carga', 'created_at', 'updated_at']) {
@@ -19,8 +20,9 @@ export async function corporateSchema(db: Client, cfg: DeliveryConfig, write: bo
   if (raw?.identity_generation !== 'ALWAYS') throw new SyncError('CORPORATE_IDENTITY_ALWAYS_REQUIRED');
   const functions = (await db.query(`SELECT pg_get_functiondef('raw.fn_olos_calls_normalizar_telefone()'::regprocedure) AS trigger_body,
     pg_get_functiondef('core.gerar_telefone_match_key(text)'::regprocedure) AS normalizer_body`)).rows[0];
+  const allocatorHash = (await db.query("SELECT 1 FROM pg_trigger WHERE tgrelid='raw.olos_calls'::regclass AND tgname='trg_olos_calls_reserve_internal_id'")).rowCount ? await allocatorContract(db) : undefined;
   const hash = createHash('sha256').update(JSON.stringify([[...shape], functions])).digest('hex');
-  return { shape, hash };
+  return { shape, hash, allocatorHash };
 }
 
 export async function freeze(db: PoolClient, input: Record<string, unknown>[], shape: Shape, cfg: DeliveryConfig): Promise<Row[]> {

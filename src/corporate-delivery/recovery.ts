@@ -7,6 +7,7 @@ import { log } from '../errors.js';
 import type { DeliveryConfig } from './config.js';
 import { corporateSchema, deliveryPayload, matchCandidates } from './contract.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
+import { allocatorState } from './allocator.js';
 import { pendingAdmission } from './selection.js';
 import { notQuarantined, quarantineMembers } from './quarantine.js';
 
@@ -23,7 +24,7 @@ export interface PendingIssue {
   fields: string[];
 }
 export interface PendingVerification {
-  pending: number; quarantined: number; eligible: number; existing: number;
+  pending: number; unallocated: number; quarantined: number; eligible: number; existing: number;
   schema_hash: string; verification_digest: string; issues: PendingIssue[];
 }
 export interface RecoveryRequest {
@@ -49,12 +50,15 @@ async function state(local: PoolClient, cfg: DeliveryConfig, source: string, tar
 // Both callers establish their own snapshots/locks. All pending rows are checked, including
 // those not currently admitted by the automatic policy; absence remotely is a normal pending insert.
 async function inspect(local: PoolClient, remote: Client, cfg: DeliveryConfig, source: string, target: string, control: Record<string, unknown>): Promise<PendingVerification> {
-  const { shape, hash } = await corporateSchema(remote, cfg, false);
+  const { shape, hash, allocatorHash } = await corporateSchema(remote, cfg, false);
+  const allocator = await allocatorState(local, cfg, source, target, false);
+  if (allocator && (allocator.state !== 'active' || allocator.contract_hash !== allocatorHash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
+  const unallocated = allocator ? Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND NOT materialized', [source])).rows[0].n) : 0;
   if (hash !== control.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
   const quarantined = await quarantineMembers(local, cfg, source, target, shape);
-  const proof = createHash('sha256').update(JSON.stringify(['corporate-pending-verification-v2', source, target, cfg.binding,
-    control.generation, control.blocked, control.last_code, hash, quarantined]));
-  const report: PendingVerification = { pending: quarantined.length, quarantined: quarantined.length, eligible: 0, existing: 0, schema_hash: hash, verification_digest: '', issues: [] };
+  const proof = createHash('sha256').update(JSON.stringify([allocator ? 'corporate-pending-verification-v3' : 'corporate-pending-verification-v2', source, target, cfg.binding,
+    control.generation, control.blocked, control.last_code, hash, quarantined, ...(allocator ? [allocator.contract_hash, unallocated] : [])]));
+  const report: PendingVerification = { pending: quarantined.length, unallocated, quarantined: quarantined.length, eligible: 0, existing: 0, schema_hash: hash, verification_digest: '', issues: [] };
   const identities = new Map<string, string>();
   const admission = pendingAdmission(4);
   let cursor: string | null = null;
@@ -122,7 +126,7 @@ async function inspect(local: PoolClient, remote: Client, cfg: DeliveryConfig, s
 export function logVerification(report: PendingVerification): void {
   for (const issue of report.issues) log('corporate_pending_divergence', { target_id: issue.target_id, remote_id: issue.remote_id ?? null,
     related_target_id: issue.related_target_id ?? null, error: issue.code, fields: issue.fields.join(',') });
-  log('corporate_pending_verified', { valid: report.issues.length === 0, pending: report.pending, quarantined: report.quarantined, eligible: report.eligible,
+  log('corporate_pending_verified', { valid: report.issues.length === 0, pending: report.pending, unallocated: report.unallocated, quarantined: report.quarantined, eligible: report.eligible,
     existing: report.existing, divergences: report.issues.length, verification_digest: report.verification_digest });
 }
 
