@@ -22,3 +22,15 @@ test('CLI rejects missing authorization and wrong source before opening any data
   await assert.rejects(corporateControl(cfg, 'corporate-recover-collision', args.map((v, i) => i === 1 ? 'other' : v), authorization), /SOURCE_MISMATCH/);
   await assert.rejects(corporateControl(cfg, 'corporate-verify-pending', ['--repair']), /ARGUMENTS/);
 });
+
+test('quarantine requires its own authorization and cannot reuse a release authorization', async () => {
+  const quarantineAuthorization = { OLOS_CORPORATE_QUARANTINE_CONFIRMATION: 'AUTHORIZE_CORPORATE_COLLISION_QUARANTINE' };
+  assert.throws(() => recoveryRequest(args, authorization, 'synthetic', true), /NOT_AUTHORIZED/);
+  assert.throws(() => recoveryRequest(args, quarantineAuthorization, 'synthetic'), /NOT_AUTHORIZED/);
+  assert.equal(recoveryRequest(args, quarantineAuthorization, 'synthetic', true).action, 'quarantine');
+  assert.equal(recoveryRequest(args, authorization, 'synthetic').action, 'release');
+  const cfg = config({ DATABASE_URL: 'postgresql://test@localhost/local', OLOS_SOURCE_KEY: 'synthetic',
+    ATTEMPTS_PERSISTENCE_MODE: 'corporate', OLOS_CORPORATE_DATABASE_URL: 'postgresql://test@localhost/madm' });
+  await assert.rejects(corporateControl(cfg, 'corporate-quarantine-collisions', args, authorization), /NOT_AUTHORIZED/);
+  await assert.rejects(corporateControl(cfg, 'corporate-quarantine-collisions', args.map((v, i) => i === 1 ? 'other' : v), quarantineAuthorization), /SOURCE_MISMATCH/);
+});

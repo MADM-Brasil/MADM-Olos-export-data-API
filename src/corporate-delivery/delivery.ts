@@ -7,6 +7,7 @@ import type { MappedRecord } from '../mapping.js';
 import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
 import { corporateSchema, freeze, deliveryPayload, matches, uniqueIdentities } from './contract.js';
 import { pendingAdmission } from './selection.js';
+import { notQuarantined, quarantineMembers } from './quarantine.js';
 import { eligibleOperator } from './operator-eligibility.js';
 import { reconcileLegacy } from './reconcile.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
@@ -53,7 +54,8 @@ export class CorporateDelivery {
     if (binding && (binding.binding !== this.cfg.binding || binding.source_key !== this.source)) throw new SyncError('CORPORATE_BINDING_CHANGED');
     const state = (await local.query(`SELECT ready,paused,blocked,legacy_count::text,confirmed_count::text,
       failure_count,next_attempt_at,last_code FROM olos_http.corporate_control WHERE singleton`)).rows[0];
-    return { ...(state ?? { ready: false }), pending: Number((await local.query("SELECT count(*)::text AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n) };
+    const quarantined = Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_collision_quarantine WHERE source_key=$1', [this.source])).rows[0].n);
+    return { ...(state ?? { ready: false }), quarantined, pending: Number((await local.query("SELECT count(*)::text AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n) };
   }
   async check(local: PoolClient): Promise<void> {
     await assertLocalConsumersCompatible(local, this.source);
@@ -181,13 +183,24 @@ export class CorporateDelivery {
         if (state.blocked) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
         if (state.retry_wait) throw new SyncError('CORPORATE_RETRY_WAIT');
       } else if (state.paused || state.blocked || state.retry_wait) { await local.query('COMMIT'); return empty; }
-      // Homologation retains its existing selection contract.
+      // Integrity failures in the isolation ledger block delivery without stopping OLOS capture.
+      try { await quarantineMembers(local, this.cfg, this.source, this.target, new Map(state.destination_shape)); }
+      catch (error) {
+        if (!(error instanceof SyncError)) throw error;
+        await local.query(`UPDATE olos_http.corporate_control SET blocked=true,last_code=$1,failure_count=failure_count+1,
+          updated_at=now() WHERE singleton`, [error.code]);
+        await local.query('COMMIT');
+        log('corporate_delivery_deferred', { error: error.code, blocked: true });
+        if (homologation) throw error;
+        return empty;
+      }
+      // Homologation retains its existing selection contract except explicit quarantine exclusion.
       // Automatic delivery admits only calls with identified operators.
       const admission = pendingAdmission(3);
       const entries = homologation
         ? (await local.query(`SELECT source_id,target_id::text,payload,payload_hash
-            FROM olos_http.corporate_outbox
-            WHERE source_key=$1 AND state='pending'
+            FROM olos_http.corporate_outbox o
+            WHERE source_key=$1 AND state='pending' AND ${notQuarantined}
             ORDER BY target_id LIMIT $2 FOR UPDATE`,
             [this.source, homologation.limit])).rows
         : (await local.query(`SELECT o.source_id,o.target_id::text,o.payload,o.payload_hash,
@@ -195,7 +208,7 @@ export class CorporateDelivery {
             FROM olos_http.corporate_outbox o
             JOIN olos_http.records r USING (source_key,source_id)
             WHERE o.source_key=$1
-              AND o.state='pending'
+              AND o.state='pending' AND ${notQuarantined}
               AND ${admission.sql}
             ORDER BY o.target_id LIMIT $2
             FOR UPDATE OF o,r`,

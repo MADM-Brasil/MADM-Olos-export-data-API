@@ -8,6 +8,7 @@ import type { DeliveryConfig } from './config.js';
 import { corporateSchema, deliveryPayload, matchCandidates } from './contract.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { pendingAdmission } from './selection.js';
+import { notQuarantined, quarantineMembers } from './quarantine.js';
 
 interface PendingEntry {
   source_id: string; target_id: string; payload: Record<string, unknown>; payload_hash: string;
@@ -22,18 +23,19 @@ export interface PendingIssue {
   fields: string[];
 }
 export interface PendingVerification {
-  pending: number; eligible: number; existing: number;
+  pending: number; quarantined: number; eligible: number; existing: number;
   schema_hash: string; verification_digest: string; issues: PendingIssue[];
 }
 export interface RecoveryRequest {
-  source: string; verification: string; requestId: string; evidence: string;
+  source: string; verification: string; requestId: string; evidence: string; action: 'release' | 'quarantine';
 }
-export function recoveryRequest(args: string[], env: NodeJS.ProcessEnv, source: string): RecoveryRequest {
-  if (env.OLOS_CORPORATE_RECOVERY_CONFIRMATION !== 'AUTHORIZE_CORPORATE_COLLISION_RECOVERY') throw new SyncError('CORPORATE_RECOVERY_NOT_AUTHORIZED');
+export function recoveryRequest(args: string[], env: NodeJS.ProcessEnv, source: string, quarantine = false): RecoveryRequest {
+  if (quarantine ? env.OLOS_CORPORATE_QUARANTINE_CONFIRMATION !== 'AUTHORIZE_CORPORATE_COLLISION_QUARANTINE'
+    : env.OLOS_CORPORATE_RECOVERY_CONFIRMATION !== 'AUTHORIZE_CORPORATE_COLLISION_RECOVERY') throw new SyncError('CORPORATE_RECOVERY_NOT_AUTHORIZED');
   if (args.length !== 8 || args[0] !== '--confirm-source' || args[2] !== '--verification' || args[4] !== '--request-id' || args[6] !== '--evidence') throw new SyncError('CORPORATE_RECOVERY_ARGUMENTS_REQUIRED');
   if (args[1] !== source) throw new SyncError('CORPORATE_RECOVERY_SOURCE_MISMATCH');
   if (!/^[0-9a-f]{64}$/.test(args[3]!) || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(args[5]!) || !/^[A-Za-z0-9._:-]{1,100}$/.test(args[7]!)) throw new SyncError('CORPORATE_RECOVERY_ARGUMENTS_INVALID');
-  return { source, verification: args[3]!, requestId: args[5]!, evidence: args[7]! };
+  return { source, action: quarantine ? 'quarantine' : 'release', verification: args[3]!, requestId: args[5]!, evidence: args[7]! };
 }
 
 async function state(local: PoolClient, cfg: DeliveryConfig, source: string, target: string, lock = false) {
@@ -49,9 +51,10 @@ async function state(local: PoolClient, cfg: DeliveryConfig, source: string, tar
 async function inspect(local: PoolClient, remote: Client, cfg: DeliveryConfig, source: string, target: string, control: Record<string, unknown>): Promise<PendingVerification> {
   const { shape, hash } = await corporateSchema(remote, cfg, false);
   if (hash !== control.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
-  const proof = createHash('sha256').update(JSON.stringify(['corporate-pending-verification-v1', source, target, cfg.binding,
-    control.generation, control.blocked, control.last_code, hash]));
-  const report: PendingVerification = { pending: 0, eligible: 0, existing: 0, schema_hash: hash, verification_digest: '', issues: [] };
+  const quarantined = await quarantineMembers(local, cfg, source, target, shape);
+  const proof = createHash('sha256').update(JSON.stringify(['corporate-pending-verification-v2', source, target, cfg.binding,
+    control.generation, control.blocked, control.last_code, hash, quarantined]));
+  const report: PendingVerification = { pending: quarantined.length, quarantined: quarantined.length, eligible: 0, existing: 0, schema_hash: hash, verification_digest: '', issues: [] };
   const identities = new Map<string, string>();
   const admission = pendingAdmission(4);
   let cursor: string | null = null;
@@ -60,7 +63,7 @@ async function inspect(local: PoolClient, remote: Client, cfg: DeliveryConfig, s
       r.agent_id,r.target_id::text AS record_target_id,r.target_table,r.source_hash AS record_hash,
       (${admission.sql}) IS TRUE AS eligible
       FROM olos_http.corporate_outbox o LEFT JOIN olos_http.records r USING(source_key,source_id)
-      WHERE o.source_key=$1 AND o.state='pending' AND ($2::bigint IS NULL OR o.target_id>$2)
+      WHERE o.source_key=$1 AND o.state='pending' AND ${notQuarantined} AND ($2::bigint IS NULL OR o.target_id>$2)
       ORDER BY o.target_id LIMIT $3`, [source, cursor, cfg.connection.batchSize, ...admission.parameters])).rows;
     if (!batch.length) break;
     const rows: Row[] = [];
@@ -119,7 +122,7 @@ async function inspect(local: PoolClient, remote: Client, cfg: DeliveryConfig, s
 export function logVerification(report: PendingVerification): void {
   for (const issue of report.issues) log('corporate_pending_divergence', { target_id: issue.target_id, remote_id: issue.remote_id ?? null,
     related_target_id: issue.related_target_id ?? null, error: issue.code, fields: issue.fields.join(',') });
-  log('corporate_pending_verified', { valid: report.issues.length === 0, pending: report.pending, eligible: report.eligible,
+  log('corporate_pending_verified', { valid: report.issues.length === 0, pending: report.pending, quarantined: report.quarantined, eligible: report.eligible,
     existing: report.existing, divergences: report.issues.length, verification_digest: report.verification_digest });
 }
 
@@ -140,8 +143,9 @@ export async function verifyPending(local: PoolClient, cfg: DeliveryConfig, sour
 
 export interface RecoveryHooks { afterLocks?: () => Promise<void>; beforeLocalCommit?: () => Promise<void> }
 export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, source: string, target: string,
-  request: RecoveryRequest, hooks: RecoveryHooks = {}): Promise<{ alreadyApplied: boolean }> {
+  request: RecoveryRequest, hooks: RecoveryHooks = {}, quarantine = false): Promise<{ alreadyApplied: boolean }> {
   if (request.source !== source) throw new SyncError('CORPORATE_RECOVERY_SOURCE_MISMATCH');
+  if (request.action !== (quarantine ? 'quarantine' : 'release')) throw new SyncError('CORPORATE_RECOVERY_NOT_AUTHORIZED');
   let remote: Client | undefined;
   let commitIssued = false;
   try {
@@ -151,7 +155,11 @@ export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, s
     // Excludes capture admission and edits to the frozen queue while retaining the OLOS owner.
     await local.query('LOCK TABLE olos_http.records,olos_http.corporate_outbox IN SHARE MODE');
     if (!(await local.query("SELECT to_regclass('olos_http.corporate_collision_recoveries') IS NOT NULL AS present")).rows[0].present) throw new SyncError('CORPORATE_RECOVERY_MIGRATION_REQUIRED');
-    const applied = (await local.query('SELECT * FROM olos_http.corporate_collision_recoveries WHERE request_id=$1', [request.requestId])).rows[0];
+    // Control row serializes administrative operations; table locks also stabilize membership evidence.
+    await quarantineMembers(local, cfg, source, target, new Map(control.destination_shape));
+    await local.query('LOCK TABLE olos_http.corporate_collision_quarantine_runs,olos_http.corporate_collision_quarantine IN SHARE MODE');
+    const auditTable = quarantine ? 'olos_http.corporate_collision_quarantine_runs' : 'olos_http.corporate_collision_recoveries';
+    const applied = (await local.query(`SELECT * FROM ${auditTable} WHERE request_id=$1`, [request.requestId])).rows[0];
     if (applied) {
       if (applied.source_key !== source || applied.target_table !== target || applied.binding !== cfg.binding || applied.verification_digest !== request.verification || applied.evidence_ref !== request.evidence) throw new SyncError('CORPORATE_RECOVERY_REQUEST_REUSED');
       await local.query('ROLLBACK');
@@ -166,15 +174,22 @@ export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, s
     await hooks.afterLocks?.();
     const report = await inspect(local, remote, cfg, source, target, control);
     logVerification(report);
-    if (report.issues.length) throw new SyncError('CORPORATE_PENDING_DIVERGES');
+    if (!quarantine && report.issues.length) throw new SyncError('CORPORATE_PENDING_DIVERGES');
     if (report.verification_digest !== request.verification) throw new SyncError('CORPORATE_VERIFICATION_STALE');
-    await local.query(`INSERT INTO olos_http.corporate_collision_recoveries
-      (request_id,source_key,target_table,binding,verification_digest,evidence_ref,previous_generation,previous_code,pending_count,eligible_count,existing_count,schema_hash)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-    [request.requestId, source, target, cfg.binding, request.verification, request.evidence, control.generation, control.last_code,
-      report.pending, report.eligible, report.existing, report.schema_hash]);
-    await local.query(`UPDATE olos_http.corporate_control SET blocked=false,paused=true,last_code=NULL,failure_count=0,
-      next_attempt_at=NULL,generation=generation+1,updated_at=now() WHERE singleton`);
+    if (quarantine) {
+      await isolateCollisions(local, cfg, source, target, request, control, report);
+      const next = await state(local, cfg, source, target);
+      // This second pass validates every remaining pending row. Any remaining issue keeps the block.
+      logVerification(await inspect(local, remote, cfg, source, target, next));
+    } else {
+      await local.query(`INSERT INTO olos_http.corporate_collision_recoveries
+        (request_id,source_key,target_table,binding,verification_digest,evidence_ref,previous_generation,previous_code,pending_count,eligible_count,existing_count,schema_hash)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [request.requestId, source, target, cfg.binding, request.verification, request.evidence, control.generation, control.last_code,
+        report.pending, report.eligible, report.existing, report.schema_hash]);
+      await local.query(`UPDATE olos_http.corporate_control SET blocked=false,paused=true,last_code=NULL,failure_count=0,
+        next_attempt_at=NULL,generation=generation+1,updated_at=now() WHERE singleton`);
+    }
     await hooks.beforeLocalCommit?.();
     // Keep remote exclusion through local COMMIT. A later divergence still encounters the original delivery guards.
     await remote.query('SELECT 1');
@@ -183,7 +198,34 @@ export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, s
     return { alreadyApplied: false };
   } catch (error) {
     await rollback(local);
-    if (commitIssued) throw new SyncError('CORPORATE_RECOVERY_COMMIT_UNKNOWN');
+    if (commitIssued) throw new SyncError(quarantine ? 'CORPORATE_QUARANTINE_COMMIT_UNKNOWN' : 'CORPORATE_RECOVERY_COMMIT_UNKNOWN');
     throw error;
   } finally { if (remote) { await rollback(remote); await remote.end().catch(() => {}); } }
+}
+
+
+// Only rows whose complete diagnosis consists of confirmed INTERNAL_ID_COLLISION issues qualify.
+// Hash, mapping, schema, normalization, logical-other-ID and content-only errors are never quarantined here.
+async function isolateCollisions(local: PoolClient, cfg: DeliveryConfig, source: string, target: string,
+  request: RecoveryRequest, control: Record<string, unknown>, report: PendingVerification) {
+  const grouped = new Map<string, PendingIssue[]>();
+  for (const issue of report.issues) grouped.set(issue.target_id, [...(grouped.get(issue.target_id) ?? []), issue]);
+  const collisions = [...grouped].filter(([, issues]) => issues.every(issue => issue.code === 'INTERNAL_ID_COLLISION' && issue.remote_id
+    && issue.fields.some(field => (identityColumns as readonly string[]).includes(field))));
+  if (!collisions.length) throw new SyncError('CORPORATE_NO_CONFIRMED_COLLISIONS');
+  await local.query(`INSERT INTO olos_http.corporate_collision_quarantine_runs
+    (request_id,source_key,target_table,binding,verification_digest,evidence_ref,previous_generation,previous_code,pending_count,member_count,schema_hash)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+  [request.requestId, source, target, cfg.binding, request.verification, request.evidence, control.generation, control.last_code,
+    report.pending, collisions.length, report.schema_hash]);
+  for (const [id, issues] of collisions) {
+    const inserted = await local.query(`INSERT INTO olos_http.corporate_collision_quarantine
+      (source_key,source_id,target_id,source_hash,payload_hash,request_id,code,remote_ids,fields)
+      SELECT source_key,source_id,target_id,source_hash,payload_hash,$3,'INTERNAL_ID_COLLISION',$4,$5
+      FROM olos_http.corporate_outbox o WHERE source_key=$1 AND target_id=$2 AND state='pending' AND ${notQuarantined}`,
+    [source, id, request.requestId, [...new Set(issues.map(issue => issue.remote_id!))], [...new Set(issues.flatMap(issue => issue.fields))]]);
+    if (inserted.rowCount !== 1) throw new SyncError('CORPORATE_QUARANTINE_CHANGED');
+    log('corporate_collision_quarantine_member_prepared', { target_id: id, request_id: request.requestId });
+  }
+  await local.query('UPDATE olos_http.corporate_control SET generation=generation+1,updated_at=now() WHERE singleton');
 }

@@ -2,13 +2,15 @@
 
 Implementação local; nenhum procedimento deste documento foi executado na VPS. O contexto informado é `blocked=true`, `last_code=INTERNAL_ID_COLLISION`, 479 pendentes e coleta OLOS retomada. Esses valores não foram consultados em produção. O diagnóstico determina a fila atual; a contagem pode ter aumentado com novas capturas.
 
+Para isolar colisões comprovadas e retomar as demais chamadas, usar o [procedimento seletivo](selective-collision-recovery.md), com migration local `007` e a seleção atualizada no mesmo worker.
+
 ## Contrato dos comandos
 
 `node dist/main.js corporate-verify-pending` é estritamente somente leitura: usa `REPEATABLE READ READ ONLY` nos dois bancos, sem Store, chamadas OLOS, locks de ownership, migrations, INSERT, UPDATE, recibos ou timers. Retorna exit code 0 somente com validação concluída sem divergências. Uma falha de conexão/schema termina com erro e nunca representa uma validação aprovada.
 
-O comando percorre **todos** os pendentes da origem, em ordem de `target_id`, com paginação. Reutiliza o predicado SQL de admissão automática, `deliveryPayload`/`mapRow`, `projection`, `compare` e a consulta `matchCandidates` da entrega. Valida o schema/funções e seu hash congelado, integridade dos payloads/hashes/IDs, vínculo em `records`, identidades duplicadas inclusive entre páginas e correspondências remotas por ID ou identidade lógica. A cobertura inclui pendentes atualmente inelegíveis, para impedir que um conflito escondido depois do LIMIT ou dos filtros seja ignorado. `eligible` informa quantos passariam pelos mesmos filtros da entrega; a recuperação não altera esses filtros ou estados. Uma linha ausente no destino é uma inserção pendente normal; uma linha existente precisa ser integralmente compatível.
+Na versão com quarentena, o comando valida os vínculos/hashes dos isolados e percorre **todos os pendentes não isolados** da origem, em ordem de `target_id`, com paginação. Reutiliza o predicado SQL de admissão automática, `deliveryPayload`/`mapRow`, `projection`, `compare` e a consulta `matchCandidates` da entrega. Valida o schema/funções e seu hash congelado, integridade dos payloads/hashes/IDs, vínculo em `records`, identidades duplicadas inclusive entre páginas e correspondências remotas por ID ou identidade lógica. A cobertura inclui pendentes atualmente inelegíveis, para impedir que um conflito escondido depois do LIMIT ou dos filtros seja ignorado. `eligible` informa quantos passariam pelos mesmos filtros da entrega; a recuperação não altera esses filtros ou estados. Uma linha ausente no destino é uma inserção pendente normal; uma linha existente precisa ser integralmente compatível.
 
-As linhas `corporate_pending_divergence` contêm somente IDs internos/corporativos, nomes de campos e códigos de erro. Não mostram telefone, nome, CPF, email, CallId, datas das chamadas, valores anteriores/esperados, URLs ou payloads. A linha final `corporate_pending_verified` contém contagens, `valid` e `verification_digest`. O digest SHA-256 vincula origem/binding, schema, geração/bloqueio, fila local e resultados remotos. O comando não persiste diagnóstico no banco; o operador pode guardar o stdout em arquivo privado.
+As linhas `corporate_pending_divergence` contêm somente IDs internos/corporativos, nomes de campos e códigos de erro. Não mostram telefone, nome, CPF, email, CallId, datas das chamadas, valores anteriores/esperados, URLs ou payloads. A linha final `corporate_pending_verified` contém contagens, `valid` e `verification_digest`. O digest SHA-256 atual usa domínio v2 e vincula origem/binding, schema, geração/bloqueio, fila local, associação de quarentena e resultados remotos. Os digests/auditorias anteriores permanecem preservados. O comando não persiste diagnóstico no banco; o operador pode guardar o stdout em arquivo privado.
 
 `node dist/main.js corporate-recover-collision ...` exige por invocação:
 
@@ -30,7 +32,7 @@ Repetir exatamente a mesma requisição retorna `already_applied=true` e não li
 
 ## Execução na VPS, somente após aprovação
 
-Pré-requisito: versão revisada já disponibilizada no mesmo worker, com os dois novos comandos e a migration local. Este documento não autoriza build/deploy. Executar no diretório do projeto Compose efetivamente usado na VPS. Se o serviço for administrado por outro projeto, informar o ID exato do container aprovado no lugar da descoberta abaixo. Não iniciar outro worker nem o Corporate Sync antigo.
+Pré-requisito: versão revisada já em execução no mesmo worker e migrations locais `006` e `007` aplicadas. Este documento não autoriza build/deploy. Executar no diretório do projeto Compose efetivamente usado na VPS. Se o serviço for administrado por outro projeto, informar o ID exato do container aprovado no lugar da descoberta abaixo. Não iniciar outro worker nem o Corporate Sync antigo.
 
 ```bash
 set -euo pipefail
@@ -50,6 +52,8 @@ docker exec "$container" node dist/main.js corporate-status
 : "${LOCAL_DBA_DATABASE_URL:?defina a conexao administrativa do banco local aprovado}"
 psql "$LOCAL_DBA_DATABASE_URL" -X -v ON_ERROR_STOP=1 \
   -f migrations/006_corporate_collision_recovery.sql
+psql "$LOCAL_DBA_DATABASE_URL" -X -v ON_ERROR_STOP=1 \
+  -f migrations/007_corporate_collision_quarantine.sql
 
 # Diagnóstico somente leitura e arquivo privado exclusivo para esta revisão.
 verification_file="$(mktemp /tmp/corporate-verify-pending.XXXXXX)"

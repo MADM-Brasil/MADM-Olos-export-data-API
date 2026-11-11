@@ -9,8 +9,9 @@ import { logVerification, recoverCollision, recoveryRequest, verifyPending } fro
 // They never capture OLOS, acquire its lock or admit an independent delivery loop.
 export async function corporateControl(cfg: Config, command: string, args: string[] = [], env: NodeJS.ProcessEnv = process.env): Promise<void> {
   if (!cfg.corporateDelivery) throw new WorkerError('CORPORATE_MODE_REQUIRED');
-  if (!['corporate-status','corporate-check','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision'].includes(command)) throw new WorkerError('COMMAND_INVALID');
-  const request = command === 'corporate-recover-collision' ? recoveryRequest(args, env, cfg.sourceKey) : undefined;
+  if (!['corporate-status','corporate-check','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions'].includes(command)) throw new WorkerError('COMMAND_INVALID');
+  const quarantine = command === 'corporate-quarantine-collisions';
+  const request = command === 'corporate-recover-collision' || quarantine ? recoveryRequest(args, env, cfg.sourceKey, quarantine) : undefined;
   if (command === 'corporate-verify-pending' && args.length) throw new WorkerError('COMMAND_ARGUMENTS_INVALID');
   const pool = new pg.Pool({ connectionString: cfg.databaseUrl, max: 1, connectionTimeoutMillis: 10000, statement_timeout: 30000 });
   pool.on('error', () => {});
@@ -26,14 +27,14 @@ export async function corporateControl(cfg: Config, command: string, args: strin
         if (report.issues.length) throw new WorkerError('CORPORATE_PENDING_DIVERGES');
       }
       if (request) {
-        const result = await recoverCollision(local, cfg.corporateDelivery, cfg.sourceKey, target, request);
-        log('corporate_collision_recovery_recorded', { request_id: request.requestId, already_applied: result.alreadyApplied });
+        const result = await recoverCollision(local, cfg.corporateDelivery, cfg.sourceKey, target, request, {}, quarantine);
+        log(quarantine ? 'corporate_collision_quarantine_recorded' : 'corporate_collision_recovery_recorded', { request_id: request.requestId, already_applied: result.alreadyApplied });
       }
       if (command === 'corporate-check') { await delivery.check(local); log('corporate_schema_checked'); }
       if (command === 'corporate-status') {
         const state = await delivery.status(local);
         log('corporate_delivery_status', { ready: !!state.ready, paused: !!state.paused, blocked: !!state.blocked,
-          pending: state.pending, confirmed: Number(state.confirmed_count ?? 0), legacy: Number(state.legacy_count ?? 0), error: state.last_code ?? null });
+          pending: state.pending, quarantined: state.quarantined, confirmed: Number(state.confirmed_count ?? 0), legacy: Number(state.legacy_count ?? 0), error: state.last_code ?? null });
       }
       if (command === 'corporate-pause') { await delivery.pause(local); log('corporate_delivery_paused'); }
       if (command === 'corporate-resume') { await delivery.resume(local); log('corporate_delivery_resumed'); }

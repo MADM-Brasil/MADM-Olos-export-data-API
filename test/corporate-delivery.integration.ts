@@ -72,6 +72,7 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     await local.query(await readFile(new URL('../migrations/002_corporate_delivery.sql', import.meta.url), 'utf8'));
     await local.query(await readFile(new URL('../migrations/003_corporate_outbox_skipped.sql', import.meta.url), 'utf8'));
     await local.query(await readFile(new URL('../migrations/005_corporate_campaign_policy.sql', import.meta.url), 'utf8'));
+    await local.query(await readFile(new URL('../migrations/007_corporate_collision_quarantine.sql', import.meta.url), 'utf8'));
     await remote.query(fixture(false));
     await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN raw_olos_call_id RESTART WITH 8000000000');
     const legacy = new Store(config(base)); await legacy.open();
