@@ -1,24 +1,16 @@
 import type { Client, Pool, PoolClient } from 'pg';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { retryable, safeCode, SyncError } from '../corporate-sync/errors.js';
-import { columns, digest, integerValue, mapRow, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
+import { columns, digest, integerValue, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
 import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
 import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
-import { corporateSchema, freeze, matches, uniqueIdentities } from './contract.js';
+import { corporateSchema, freeze, deliveryPayload, matches, uniqueIdentities } from './contract.js';
+import { pendingAdmission } from './selection.js';
 import { eligibleOperator } from './operator-eligibility.js';
 import { reconcileLegacy } from './reconcile.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
-import { campaignPolicyCode, campaignAdmissionSql, assertCampaignAllowed, isCampaignPolicyError } from '../corporate-sync/campaign-policy.js';
-
-// Match JavaScript trim semantics for operator admission.
-const operatorNameWhitespace =
-  '\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u00a0\\u1680' +
-  '\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007' +
-  '\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff';
-
-const operatorNamePlaceholderPattern =
-  '^([0-9]+|-1|null|undefined|n/a|unknown|desconhecido|sem operador|sem agente|não identificado|nao identificado)$';
+import { campaignPolicyCode, assertCampaignAllowed, isCampaignPolicyError } from '../corporate-sync/campaign-policy.js';
 
 export interface DeliveryHooks {
   beforeRemoteCommit?: () => Promise<void>;
@@ -191,7 +183,7 @@ export class CorporateDelivery {
       } else if (state.paused || state.blocked || state.retry_wait) { await local.query('COMMIT'); return empty; }
       // Homologation retains its existing selection contract.
       // Automatic delivery admits only calls with identified operators.
-      const campaign=campaignAdmissionSql("o.payload->>'nome_campanha_olos'",5);
+      const admission = pendingAdmission(3);
       const entries = homologation
         ? (await local.query(`SELECT source_id,target_id::text,payload,payload_hash
             FROM olos_http.corporate_outbox
@@ -204,20 +196,13 @@ export class CorporateDelivery {
             JOIN olos_http.records r USING (source_key,source_id)
             WHERE o.source_key=$1
               AND o.state='pending'
-              AND r.agent_id ~ '^[1-9][0-9]*$'
-              AND jsonb_typeof(o.payload->'nome_agente')='string'
-              AND btrim(o.payload->>'nome_agente',$3)<>''
-              AND btrim(o.payload->>'nome_agente',$3) !~* $4
-              AND jsonb_typeof(o.payload->'nome_campanha_olos')='string'
-              AND ${campaign.sql}
+              AND ${admission.sql}
             ORDER BY o.target_id LIMIT $2
             FOR UPDATE OF o,r`,
             [
               this.source,
               this.cfg.connection.batchSize,
-              operatorNameWhitespace,
-              operatorNamePlaceholderPattern,
-              ...campaign.parameters
+              ...admission.parameters
             ])).rows;
       if (!entries.length) { await local.query('COMMIT'); return empty; }
       // Validate the complete selected set, including the one-shot/manual path.
@@ -233,11 +218,7 @@ export class CorporateDelivery {
         await remote.query('LOCK TABLE raw.olos_calls IN ROW EXCLUSIVE MODE');
         const { shape, hash } = await corporateSchema(remote, this.cfg, true);
         if (hash !== state.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
-        const rows = entries.map(entry => {
-          const row = mapRow(entry.payload, shape, this.cfg.connection);
-          if (digest(row) !== entry.payload_hash || row.internal_id_olos !== entry.target_id) throw new SyncError('CORPORATE_PAYLOAD_CHANGED');
-          return row;
-        });
+        const rows = entries.map(entry => deliveryPayload(entry, shape, this.cfg));
         uniqueIdentities(rows);
         found = await matches(remote, rows, shape, this.cfg);
         for (const row of rows) {

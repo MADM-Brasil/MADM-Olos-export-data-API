@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Client, PoolClient } from 'pg';
 import { schema } from '../corporate-sync/schema.js';
-import { columns, compare, identityColumns, mapRow, projection, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
+import { columns, digest, compare, identityColumns, mapRow, projection, quote, type Row, type Shape } from '../corporate-sync/mapping.js';
 import { SyncError } from '../corporate-sync/errors.js';
 import type { DeliveryConfig } from './config.js';
 
@@ -31,17 +31,15 @@ export async function freeze(db: PoolClient, input: Record<string, unknown>[], s
   return result.rows.map(row => mapRow(row, shape, cfg.connection));
 }
 
+export function deliveryPayload(entry: { payload: Record<string, unknown>; payload_hash: string; target_id: string }, shape: Shape, cfg: DeliveryConfig): Row {
+  const row = mapRow(entry.payload, shape, cfg.connection);
+  if (digest(row) !== entry.payload_hash || row.internal_id_olos !== entry.target_id) throw new SyncError('CORPORATE_PAYLOAD_CHANGED');
+  return row;
+}
+
 export async function matches(db: Client, rows: Row[], shape: Shape, cfg: DeliveryConfig): Promise<Map<string, string>> {
-  const p = projection(shape, 'd', false, cfg.connection);
-  const declarations = columns.map(name => `${quote(name)} ${shape.get(name)!.type}`).join(',');
-  // Identity fields are required/non-null in the mapped payload. Equality permits hash joins.
-  const identity = identityColumns.map(name => `d.${quote(name)}=x.${quote(name)}`).join(' AND ');
   const expected = new Map(rows.map(row => [row.internal_id_olos, row]));
-  const result = await db.query(`WITH expected AS (SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(${declarations}))
-    SELECT d.raw_olos_call_id::text AS remote_id,${p.sql} FROM raw.olos_calls d JOIN (
-      SELECT d.raw_olos_call_id FROM raw.olos_calls d JOIN expected x ON d.internal_id_olos=x.internal_id_olos
-      UNION SELECT d.raw_olos_call_id FROM raw.olos_calls d JOIN expected x ON ${identity}
-    ) matched USING(raw_olos_call_id)`, [JSON.stringify(rows)]);
+  const result = await matchCandidates(db, rows, shape, cfg);
   const found = new Map<string, string>();
   for (const raw of result.rows) {
     const wanted = expected.get(raw.internal_id_olos);
@@ -50,6 +48,20 @@ export async function matches(db: Client, rows: Row[], shape: Shape, cfg: Delive
     found.set(raw.internal_id_olos, raw.remote_id);
   }
   return found;
+}
+
+// Keep diagnostic candidate lookup identical to the delivery lookup, including logical matches at other IDs.
+export async function matchCandidates(db: Client, rows: Row[], shape: Shape, cfg: DeliveryConfig) {
+  const p = projection(shape, 'd', false, cfg.connection);
+  const declarations = columns.map(name => `${quote(name)} ${shape.get(name)!.type}`).join(',');
+  // Identity fields are required/non-null in the mapped payload. Equality permits hash joins.
+  const identity = identityColumns.map(name => `d.${quote(name)}=x.${quote(name)}`).join(' AND ');
+  const result = await db.query(`WITH expected AS (SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(${declarations}))
+    SELECT d.raw_olos_call_id::text AS remote_id,${p.sql} FROM raw.olos_calls d JOIN (
+      SELECT d.raw_olos_call_id FROM raw.olos_calls d JOIN expected x ON d.internal_id_olos=x.internal_id_olos
+      UNION SELECT d.raw_olos_call_id FROM raw.olos_calls d JOIN expected x ON ${identity}
+    ) matched USING(raw_olos_call_id)`, [JSON.stringify(rows)]);
+  return result;
 }
 
 export function uniqueIdentities(rows: Row[]): void {

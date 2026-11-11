@@ -120,6 +120,8 @@ Comandos adicionados ao **mesmo** `dist/main.js`, sem autenticar/consumir OLOS:
 | `corporate-reconcile` | concilia/adota o legado; requer origem parada, confirmações e leitura MADM |
 | `corporate-pause` | pausa somente entrega; captura pode continuar |
 | `corporate-resume` | retoma entrega com autorização; pode rearmar falha transitória/COMMIT incerto após esgotar tentativas |
+| `corporate-verify-pending` | diagnóstico READ ONLY de toda a fila, com IDs/campos divergentes e digest |
+| `corporate-recover-collision` | liberação explícita de INTERNAL_ID_COLLISION revalidado, com evidência local e entrega pausada |
 | `corporate-deliver-once` | uma tentativa de um lote, respeitando pausa/backoff; exige o lock da origem e não concorre com o serviço ativo |
 | `corporate-homologate --limit N` | homologação de um único lote de até N registros, com N obrigatório entre 1 e 5, mantendo a pausa; autorização exclusiva e escrita contínua desabilitada |
 
@@ -194,3 +196,7 @@ Para validar uma publicação seletiva, exportar somente o índice Git para um d
 9. Retomar o agendador atual, acompanhar captura e entrega separadamente e dimensionar o lote sem criar outro serviço ou scheduler.
 
 Rollback operacional seguro: pausar entrega e/ou parar o mesmo worker, manter o modo/configuração coerente com o estado adotado e preservar outbox/recibos. Não voltar simplesmente ao modo local nem reiniciar o Sync antigo; as proteções impedem esse retorno porque ele pode perder IDs/entregas pendentes. Retorno ao protocolo antigo exige plano específico de conciliação. Não deletar chamadas MADM, não executar down migration e não limpar o marcador de ownership para contornar o bloqueio.
+
+## Recuperação de colisão interna
+
+O [procedimento administrativo de INTERNAL_ID_COLLISION](collision-recovery.md) descreve as autorizações, migration local, verificação, liberação idempotente e comandos para a VPS. `corporate-resume` mantém a recusa de erros de integridade; os novos comandos não alteram payloads, hashes, IDs, recibos ou estados das chamadas.

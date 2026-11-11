@@ -1,14 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { pendingAdmission } from '../src/corporate-delivery/selection.js';
 
 test('filtro automático exige operador válido antes do LIMIT', () => {
   const source = readFileSync(
     'src/corporate-delivery/delivery.ts', 'utf8'
   );
 
-  assert.match(source, /r\.agent_id ~ '\^\[1-9\]\[0-9\]\*\$'/);
-  assert.match(source, /jsonb_typeof\(o\.payload->'nome_agente'\)='string'/);
+  assert.match(pendingAdmission(3).sql, /r\.agent_id ~ '\^\[1-9\]\[0-9\]\*\$'/);
+  assert.match(pendingAdmission(3).sql, /jsonb_typeof\(o\.payload->'nome_agente'\)='string'/);
   assert.match(source, /ORDER BY o\.target_id LIMIT \$2/);
   assert.match(source, /FOR UPDATE OF o,r/);
   assert.match(source, /const entries = homologation/);
@@ -16,7 +17,7 @@ test('filtro automático exige operador válido antes do LIMIT', () => {
 
 test('política rejeita placeholders e preserva operador legítimo', () => {
   const source = readFileSync(
-    'src/corporate-delivery/delivery.ts', 'utf8'
+    'src/corporate-delivery/selection.ts', 'utf8'
   );
 
   const match = source.match(
@@ -49,7 +50,7 @@ test('filtro não exige CPF ou email', () => {
 
   assert.ok(start >= 0 && end > start);
 
-  const selection = source.slice(start, end);
+  const selection = source.slice(start, end) + pendingAdmission(3).sql;
 
   assert.doesNotMatch(selection, /payload->'cpf'/);
   assert.doesNotMatch(selection, /payload->'email'/);

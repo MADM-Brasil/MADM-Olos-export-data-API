@@ -1,0 +1,72 @@
+{
+  "date": "2026-11-11",
+  "scope": "Local implementation and disposable synthetic PostgreSQL only",
+  "production_accessed": false,
+  "deploy_performed": false,
+  "commit_performed": false,
+  "push_performed": false,
+  "checks": {
+    "build": {
+      "command": "npm run build",
+      "result": "passed",
+      "node": "24.16.0"
+    },
+    "unit": {
+      "command": "npm test",
+      "passed": 130,
+      "failed": 0,
+      "node": "24.16.0"
+    },
+    "recovery_integration": {
+      "command": "OLOS_DIRECT_TEST_FILES=test/corporate-recovery.integration.ts bash scripts/test-corporate-delivery.sh",
+      "passed": 17,
+      "failed": 0,
+      "environment": "node:24-bookworm-slim; disposable PostgreSQL 16; internal Docker network; no published ports; verified TLS"
+    },
+    "corporate_sync": {
+      "command": "bash scripts/test-corporate-sync.sh",
+      "passed": 42,
+      "failed": 0
+    },
+    "full_corporate_delivery": {
+      "command": "bash scripts/test-corporate-delivery.sh",
+      "result": "partial; preexisting failures",
+      "passed": 97,
+      "failed": 8,
+      "baseline_passed": 80,
+      "baseline_failed": 8,
+      "baseline": "clean git archive HEAD in separate temporary directory, separately built; same seven failing subtests plus aggregate",
+      "same_baseline_failures": [
+        "✖ history exige exclusividade com o Admin",
+        "✖ history bloqueia estados corporativos inválidos e leituras pendentes",
+        "✖ history falha remota não repete consumo após reinício",
+        "✖ homologation CLI confirms exactly five, remains paused, never calls OLOS and never drains a second batch",
+        "✖ homologation CLI excludes independent source, Admin and Corporate Sync lock owners",
+        "✖ homologation holds pause against concurrent resume, blocks another CLI and permits only one attempt per instance",
+        "✖ homologation without authorization, without pause or with a structural conflict fails closed"
+      ]
+    },
+    "typecheck": {
+      "command": "npm run typecheck",
+      "result": "failed; 17 preexisting diagnostics",
+      "baseline_comparison": "complete stdout identical via cmp before and after changes",
+      "affected_file": "test/corporate-delivery.integration.ts",
+      "symbols": [
+        "historyCaptureAuthorized",
+        "assertHistoryReady",
+        "history"
+      ]
+    },
+    "diff_check": {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  },
+  "limits": [
+    "No proof of production schema, privileges, timing or historical collision cause.",
+    "The 479 pending records were reported by the user; no production query was executed.",
+    "Release needs permission for SHARE locks and can briefly delay local admission and remote writers.",
+    "Recovery clears only a fully revalidated INTERNAL_ID_COLLISION and leaves delivery paused.",
+    "Receipt and control changes are locally atomic; no claim of distributed atomicity."
+  ]
+}
