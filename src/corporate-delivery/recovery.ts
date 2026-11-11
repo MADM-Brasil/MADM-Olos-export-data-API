@@ -7,7 +7,7 @@ import { log } from '../errors.js';
 import type { DeliveryConfig } from './config.js';
 import { corporateSchema, deliveryPayload, matchCandidates } from './contract.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
-import { allocatorState } from './allocator.js';
+import { allocatorState, assertLegacyRemote } from './allocator.js';
 import { pendingAdmission } from './selection.js';
 import { notQuarantined, quarantineMembers } from './quarantine.js';
 
@@ -52,12 +52,13 @@ async function state(local: PoolClient, cfg: DeliveryConfig, source: string, tar
 async function inspect(local: PoolClient, remote: Client, cfg: DeliveryConfig, source: string, target: string, control: Record<string, unknown>): Promise<PendingVerification> {
   const { shape, hash, allocatorHash } = await corporateSchema(remote, cfg, false);
   const allocator = await allocatorState(local, cfg, source, target, false);
-  if (allocator && (allocator.state !== 'active' || allocator.contract_hash !== allocatorHash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
+  if (allocator?.state === 'legacy') await assertLegacyRemote(remote);
+  if (allocator && allocator.state !== 'legacy' && (allocator.state !== 'active' || allocator.contract_hash !== allocatorHash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
   const unallocated = allocator ? Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND NOT materialized', [source])).rows[0].n) : 0;
   if (hash !== control.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
   const quarantined = await quarantineMembers(local, cfg, source, target, shape);
-  const proof = createHash('sha256').update(JSON.stringify([allocator ? 'corporate-pending-verification-v3' : 'corporate-pending-verification-v2', source, target, cfg.binding,
-    control.generation, control.blocked, control.last_code, hash, quarantined, ...(allocator ? [allocator.contract_hash, unallocated] : [])]));
+  const proof = createHash('sha256').update(JSON.stringify([allocator?.state === 'legacy' ? 'corporate-pending-verification-v4-legacy' : allocator ? 'corporate-pending-verification-v3' : 'corporate-pending-verification-v2', source, target, cfg.binding,
+    control.generation, control.blocked, control.last_code, hash, quarantined, ...(allocator?.state === 'legacy' ? [allocator.reversion_request_id, unallocated] : allocator ? [allocator.contract_hash, unallocated] : [])]));
   const report: PendingVerification = { pending: quarantined.length, unallocated, quarantined: quarantined.length, eligible: 0, existing: 0, schema_hash: hash, verification_digest: '', issues: [] };
   const identities = new Map<string, string>();
   const admission = pendingAdmission(4);
@@ -193,6 +194,9 @@ export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, s
         report.pending, report.eligible, report.existing, report.schema_hash]);
       await local.query(`UPDATE olos_http.corporate_control SET blocked=false,paused=true,last_code=NULL,failure_count=0,
         next_attempt_at=NULL,generation=generation+1,updated_at=now() WHERE singleton`);
+      const allocation = await allocatorState(local,cfg,source,target,false);
+      if (allocation?.state === 'legacy') await local.query(`UPDATE olos_http.corporate_id_reversions SET validated_at=clock_timestamp(),validation_digest=$2
+        WHERE request_id=$1 AND state='completed'`, [allocation.reversion_request_id,request.verification]);
     }
     await hooks.beforeLocalCommit?.();
     // Keep remote exclusion through local COMMIT. A later divergence still encounters the original delivery guards.

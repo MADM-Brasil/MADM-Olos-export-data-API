@@ -7,7 +7,7 @@ import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
 import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
 import { corporateSchema, freeze, deliveryPayload, matches, uniqueIdentities } from './contract.js';
-import { allocatorState, admissionHash, reserveIds, allocatorError, type IdAssignment, type AllocatorHooks } from './allocator.js';
+import { allocatorState, assertLegacyRemote, admissionHash, reserveIds, allocatorError, type IdAssignment, type AllocatorHooks } from './allocator.js';
 import { pendingAdmission } from './selection.js';
 import { notQuarantined, quarantineMembers } from './quarantine.js';
 import { eligibleOperator } from './operator-eligibility.js';
@@ -59,7 +59,7 @@ export class CorporateDelivery {
     const quarantined = Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_collision_quarantine WHERE source_key=$1', [this.source])).rows[0].n);
     const allocator = await allocatorState(local, this.cfg, this.source, this.target);
     const unallocated = allocator ? Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND NOT materialized', [this.source])).rows[0].n) : 0;
-    return { ...(state ?? { ready: false }), allocator: allocator?.state ?? 'legacy', unallocated, quarantined, pending: Number((await local.query("SELECT count(*)::text AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n) };
+    return { ...(state ?? { ready: false }), allocator: allocator?.state ?? 'legacy', allocator_request_id: allocator?.request_id ?? null, reversion_request_id: allocator?.reversion_request_id ?? null, unallocated, quarantined, pending: Number((await local.query("SELECT count(*)::text AS n FROM olos_http.corporate_outbox WHERE state='pending'")).rows[0].n) };
   }
   async check(local: PoolClient): Promise<void> {
     await assertLocalConsumersCompatible(local, this.source);
@@ -69,7 +69,8 @@ export class CorporateDelivery {
       await remote.query('BEGIN READ ONLY');
       const contract = await corporateSchema(remote, this.cfg, false);
       const allocator = await allocatorState(local, this.cfg, this.source, this.target);
-      if (allocator && (allocator.state !== 'active' || contract.allocatorHash !== allocator.contract_hash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
+      if (allocator?.state === 'legacy') await assertLegacyRemote(remote);
+      if (allocator && allocator.state !== 'legacy' && (allocator.state !== 'active' || contract.allocatorHash !== allocator.contract_hash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
       if (contract.hash !== state.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
     } finally { await rollback(remote); await remote.end().catch(() => {}); }
   }
@@ -90,7 +91,8 @@ export class CorporateDelivery {
       // Lock before checking: a concurrently finishing delivery may have just discovered a conflict.
       const allocator = await allocatorState(local, this.cfg, this.source, this.target);
       const state = await this.state(local, true);
-      if (allocator && allocator.state !== 'active') throw new SyncError('ALLOCATOR_ADOPTION_INCOMPLETE');
+      if (allocator && !['active','legacy'].includes(allocator.state)) throw new SyncError('ALLOCATOR_ADOPTION_INCOMPLETE');
+      if (allocator?.state === 'legacy' && !allocator.reversion_validated) throw new SyncError('ALLOCATOR_REVERSION_VALIDATION_REQUIRED');
       if (state.blocked && !['DATABASE_TRANSIENT_FAILURE','CORPORATE_COMMIT_UNKNOWN'].includes(state.last_code)) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
       await local.query(`UPDATE olos_http.corporate_control SET paused=false,blocked=false,failure_count=0,
         next_attempt_at=NULL,updated_at=now() WHERE singleton`);
@@ -132,10 +134,11 @@ export class CorporateDelivery {
     finally { this.active = undefined; }
   }
 
-  async enqueue(local: PoolClient, sequence: string, input: MappedRecord[], reserved?: Map<string, IdAssignment>): Promise<{ queued: number; skipped: number; duplicates: number }> {
+  async enqueue(local: PoolClient, sequence: string, input: MappedRecord[], reserved?: Map<string, IdAssignment>, reversionRequest?: string): Promise<{ queued: number; skipped: number; duplicates: number }> {
     const state = await this.state(local);
     const shape = new Map(state.destination_shape) as Shape;
     const allocator = await allocatorState(local, this.cfg, this.source, this.target);
+    if (reversionRequest && (allocator?.state !== 'reverting' || allocator.reversion_request_id !== reversionRequest || !state.paused)) throw new SyncError('ALLOCATOR_REVERSION_STATE_INVALID');
     let queued = 0, skipped = 0, duplicates = 0;
     for (const record of input) {
       const previous = (await local.query(`SELECT r.source_hash,r.target_table,r.target_id::text,o.payload_hash
@@ -146,7 +149,7 @@ export class CorporateDelivery {
         if (!previous.payload_hash) throw new SyncError('LEGACY_RECORD_RECONCILIATION_REQUIRED');
         duplicates++; continue;
       }
-      if (allocator && !reserved) {
+      if (allocator && allocator.state !== 'legacy' && !reserved && !reversionRequest) {
         const waiting = (await local.query('SELECT source_hash,mapped_hash FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND source_id=$2', [this.source, record.source_id])).rows[0];
         if (waiting) {
           if (waiting.source_hash !== record.source_hash) throw new SyncError('SOURCE_ID_CONTENT_CONFLICT');
@@ -157,7 +160,7 @@ export class CorporateDelivery {
         queued++; continue;
       }
       const assignment = reserved?.get(record.source_id);
-      if (allocator && !assignment) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
+      if (allocator && allocator.state !== 'legacy' && !reversionRequest && !assignment) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
       const id = assignment?.id ?? integerValue((await local.query('SELECT nextval($1::regclass)::text AS id', [sequence])).rows[0].id, 32);
       const payload = (await freeze(local, [{ ...record, internal_id_olos: id }], shape, this.cfg))[0]!;
       const campaignCode=campaignPolicyCode(payload.nome_campanha_olos);
@@ -195,7 +198,7 @@ export class CorporateDelivery {
     try {
       await local.query('BEGIN');
       const allocator = await allocatorState(local, this.cfg, this.source, this.target);
-      if (!allocator) { await local.query('ROLLBACK'); return true; }
+      if (!allocator || allocator.state === 'legacy') { await local.query('ROLLBACK'); return true; }
       if (allocator.state !== 'active') { await local.query('ROLLBACK'); return false; }
       await local.query('SELECT pg_advisory_xact_lock(17320914,6)');
       const entries = (await local.query(`SELECT source_id,source_hash,request_id,mapped,mapped_hash FROM olos_http.corporate_id_admissions
@@ -295,7 +298,8 @@ export class CorporateDelivery {
         await remote.query('LOCK TABLE raw.olos_calls IN ROW EXCLUSIVE MODE');
         const { shape, hash, allocatorHash } = await corporateSchema(remote, this.cfg, true);
         if (hash !== state.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
-        if (allocator && (allocator.state !== 'active' || allocatorHash !== allocator.contract_hash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
+        if (allocator?.state === 'legacy') await assertLegacyRemote(remote);
+        if (allocator && allocator.state !== 'legacy' && (allocator.state !== 'active' || allocatorHash !== allocator.contract_hash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
         const rows = entries.map(entry => deliveryPayload(entry, shape, this.cfg));
         uniqueIdentities(rows);
         found = await matches(remote, rows, shape, this.cfg);
@@ -304,7 +308,7 @@ export class CorporateDelivery {
           assertCampaignAllowed(row.nome_campanha_olos);
           // Exact existing rows are never INSERTed again; even their corporate trigger is not invoked.
           if (found.has(row.internal_id_olos!)) continue;
-          if (allocator) {
+          if (allocator?.state === 'active') {
             const entry = entries.find(e => e.target_id === row.internal_id_olos)!;
             const assignment = (await local.query(`SELECT a.token,a.target_id::text,a.source_hash,r.source_hash AS record_hash FROM olos_http.corporate_id_assignments a
               JOIN olos_http.records r USING(source_key,source_id) WHERE a.source_key=$1 AND a.source_id=$2 AND a.binding=$3`,

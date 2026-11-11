@@ -12,6 +12,7 @@ import { observeLogs } from '../src/errors.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { logVerification, recoverCollision, recoveryRequest, verifyPending, type RecoveryHooks } from '../src/corporate-delivery/recovery.js';
 import { adoptAllocator, adoptionRequest, reserveIds } from '../src/corporate-delivery/allocator.js';
+import { legacyReversionRequest, revertAllocator, type ReversionHooks } from '../src/corporate-delivery/legacy-recovery.js';
 import { allocatorContract } from '../src/corporate-delivery/allocator-contract.js';
 import { fixture, row as corporateRow } from './corporate-sync.fixture.js';
 
@@ -92,6 +93,13 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
   async function enableAllocator() {
     const input = await prepare(); await remoteAllocatorMigration(); await adopt(input); return input;
   }
+  const reversionAuthorization = { OLOS_CORPORATE_LEGACY_REVERSION_CONFIRMATION: 'AUTHORIZE_CORPORATE_LEGACY_REVERSION' };
+  const reversionArgs = (adoption: string[], id = randomUUID(), maxBatches?: number) => ['--confirm-source',source,'--adoption-request',adoption[3]!,
+    '--request-id',id,'--evidence','INC-LEGACY',...(maxBatches ? ['--max-batches',String(maxBatches)] : [])];
+  const reversalMigration = async () => local.query(await readFile(new URL('../migrations/009_corporate_allocator_reversion.sql', import.meta.url), 'utf8'));
+  const revert = (input: string[], hooks: ReversionHooks = {}) => client(db => revertAllocator(db,cfg,store!.delivery!,legacyReversionRequest(input,reversionAuthorization,source),hooks));
+  const reversionRuns = async () => (await local.query('SELECT * FROM olos_http.corporate_id_reversions')).rows;
+  const reversionBatches = async () => (await local.query('SELECT * FROM olos_http.corporate_id_reversion_batches ORDER BY batch_no')).rows;
   async function insertForeign(id: string) {
     const payload = corporateRow(id);
     await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
@@ -598,6 +606,168 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       await reset(2); await insertRemote(0); const input = await enableAllocator(); const before = await snapshot();
       await allocatorMigration(); await remoteAllocatorMigration(); await adopt(input);
       assert.deepEqual(await snapshot(), before); assert.equal(await allocatorContract(remote), (await local.query('SELECT contract_hash FROM olos_http.corporate_id_allocator')).rows[0].contract_hash);
+    });
+    await t.test('emergency legacy reversion preserves history, materializes all admissions once and resumes the original INSERT path', async () => {
+      await reset(2); await local.query('UPDATE olos_http.corporate_control SET blocked=false,paused=false'); await store!.delivery!.tick();
+      await stage(8101); await stage(8102); await insertRemote(2,{telefone:'old-collision'});
+      await local.query("UPDATE olos_http.corporate_control SET blocked=true,last_code='INTERNAL_ID_COLLISION'");
+      await quarantine(args((await verify()).verification_digest)); const adoption = await prepare();
+      for (const id of [8901,8902,8903,8904,8905]) await stage(id);
+      await reversalMigration(); const before = await snapshot(), oldAdmissions = await admissions(); const input = reversionArgs(adoption);
+      let output = ''; const stop = observeLogs(e => { output+=JSON.stringify(e); });
+      try { await corporateControl(cfg,'corporate-revert-id-allocator',input,reversionAuthorization); } finally { stop(); }
+      assert.doesNotMatch(output,/private-|Private Agent|55119000|@|old-collision/);
+      const after = await snapshot();
+      for (const entry of before.entries) assert.deepEqual(after.entries.find(e=>e.source_id===entry.source_id),entry);
+      for (const record of before.records) assert.deepEqual(after.records.find(r=>r.source_id===record.source_id),record);
+      assert.deepEqual(after.remote,before.remote); assert.deepEqual(after.sequence,before.sequence); assert.deepEqual(after.quarantine,before.quarantine);
+      assert.deepEqual(after.quarantineRuns,before.quarantineRuns); assert.deepEqual(after.reads,before.reads);
+      assert.equal(after.control.confirmed_count,'2'); assert.equal(after.control.blocked,true); assert.equal(after.control.last_code,'INTERNAL_ID_COLLISION'); assert.equal(after.control.paused,true);
+      assert.equal(after.control.id_allocator_required,false); assert.equal((await assignments()).length,0);
+      const materialized = await admissions(); assert.equal(materialized.length,5);
+      for (let i=0;i<materialized.length;i++) { assert.deepEqual({...materialized[i],materialized:false},oldAdmissions[i]); assert.equal(materialized[i].materialized,true); }
+      const run = (await reversionRuns())[0]; assert.equal(run.state,'completed'); assert.equal(run.initial_count,'5'); assert.equal(run.materialized_count,'5'); assert.equal(run.adoption_request_id,adoption[3]);
+      assert.equal((await reversionBatches()).length,3); assert.equal(after.entries.length,9);
+      const seq = after.allocator; const duplicate = await revert(input); assert.deepEqual(duplicate,{completed:true,alreadyApplied:true}); assert.deepEqual(await snapshot(),after); assert.deepEqual((await snapshot()).allocator,seq);
+      await assert.rejects(adopt(adoption),/ADOPTION_REVERTED/); assert.equal((await control()).id_allocator_required,false);
+      await stage(8999); assert.equal((await admissions()).length,5); assert.equal((await entries()).length,10);
+      await assert.rejects(corporateControl(cfg,'corporate-resume'),/REVERSION_VALIDATION_REQUIRED/);
+      const remaining = await verify(); assert.equal(remaining.unallocated,0); assert.equal(remaining.quarantined,1); assert.deepEqual(remaining.issues,[]);
+      await recover(args(remaining.verification_digest));
+      assert.equal((await reversionRuns())[0].validation_digest,remaining.verification_digest);
+      await corporateControl(cfg,'corporate-resume');
+      for (let i=0;i<5;i++) await store!.delivery!.tick();
+      assert.equal((await entries()).filter(e=>e.state==='confirmed').length,9); assert.equal((await control()).blocked,false);
+      assert.deepEqual((await entries()).find(e=>e.source_id==='8101'),before.entries.find(e=>e.source_id==='8101'));
+      assert.deepEqual(await revert(input),{completed:true,alreadyApplied:true}); assert.equal((await control()).paused,false);
+      const status = await store!.delivery!.status(store!.client!); assert.equal(status.allocator,'legacy'); assert.equal(status.unallocated,0); assert.equal(status.reversion_request_id,input[5]);
+    });
+    await t.test('reversion refuses remote allocator evidence, assignments, active state and missing migration without modifying data', async () => {
+      await reset(1); const adoption = await prepare(); await stage(8901); const input = reversionArgs(adoption);
+      await assert.rejects(revert(input),/REVERSION_MIGRATION_REQUIRED/); await reversalMigration();
+      const before = await snapshot(), data = await admissions();
+      await remote.query('CREATE SCHEMA olos_delivery_ids'); await assert.rejects(revert(input),/REVERSION_REMOTE_PRESENT/);
+      assert.deepEqual(await snapshot(),before); assert.deepEqual(await admissions(),data); assert.equal((await reversionRuns()).length,0);
+      await reset(1); const another = await prepare(); await stage(8901); await reversalMigration();
+      await local.query("INSERT INTO olos_http.corporate_id_assignments(source_key,source_id,target_id,source_hash,binding,token,legacy) SELECT source_key,source_id,target_id,source_hash,$1,NULL,true FROM olos_http.records",[dc.binding]);
+      await assert.rejects(revert(reversionArgs(another)),/ASSIGNMENTS_EXIST/); assert.equal((await reversionRuns()).length,0);
+      await reset(0); const active = await prepare(); await reversalMigration();
+      await local.query("UPDATE olos_http.corporate_id_allocator SET state='active',contract_hash=repeat('a',64),adopted_at=now()");
+      await assert.rejects(revert(reversionArgs(active)),/STATE_INVALID/); assert.equal((await control()).id_allocator_required,true);
+    });
+    await t.test('batch rollback preserves admissions and existing rows; repetition completes without duplicates', async () => {
+      await reset(1); const adoption = await prepare(); for (const id of [8901,8902,8903]) await stage(id); await reversalMigration();
+      const input = reversionArgs(adoption), before = await snapshot(), data = await admissions();
+      await assert.rejects(revert(input,{beforeBatchCommit:async()=>{throw new Error('synthetic batch failure');}}),/synthetic batch failure/);
+      assert.deepEqual(await entries(),before.entries); assert.deepEqual((await snapshot()).records,before.records); assert.deepEqual(await admissions(),data);
+      assert.equal((await reversionRuns())[0].state,'materializing'); assert.equal((await reversionRuns())[0].materialized_count,'0'); assert.equal((await reversionBatches()).length,0);
+      assert.equal((await control()).paused,true); await assert.rejects(corporateControl(cfg,'corporate-resume'),/ADOPTION_INCOMPLETE/);
+      await revert(input); assert.equal((await entries()).length,4); assert.equal((await reversionBatches()).length,2); assert((await admissions()).every(e=>e.materialized));
+    });
+    await t.test('committed progress survives interruption, a new capture and process restart', async () => {
+      await reset(0); const adoption = await prepare(); for (const id of [8901,8902,8903]) await stage(id); await reversalMigration(); const input = reversionArgs(adoption);
+      await assert.rejects(revert(input,{afterBatchCommit:async()=>{throw new Error('synthetic interruption');}}),/synthetic interruption/);
+      const committed = await entries(); assert.equal(committed.length,2); assert.equal((await reversionRuns())[0].materialized_count,'2');
+      await stage(8999); await store!.close(); store = new Store(cfg); await store.open();
+      await revert(input); for (const original of committed) assert.deepEqual((await entries()).find(e=>e.source_id===original.source_id),original);
+      assert.equal((await entries()).length,4); assert.equal((await reversionRuns())[0].initial_count,'3'); assert.equal((await reversionRuns())[0].materialized_count,'4');
+      assert((await admissions()).every(e=>e.materialized));
+    });
+    await t.test('limited invocations retain pause until a later invocation finalizes the same request', async () => {
+      await reset(0); const adoption = await prepare(); for (const id of [8901,8902,8903]) await stage(id); await reversalMigration();
+      const input = reversionArgs(adoption,randomUUID(),1); const result = await revert(input);
+      assert.equal(result.completed,false); assert.equal((await entries()).length,2); assert.equal((await control()).paused,true);
+      await assert.rejects(corporateControl(cfg,'corporate-resume'),/ADOPTION_INCOMPLETE/);
+      await assert.rejects(corporateControl(cfg,'corporate-revert-id-allocator',input,reversionAuthorization),/REVERSION_INCOMPLETE/);
+      assert.equal((await admissions()).filter(e=>!e.materialized).length,0); assert.equal((await reversionRuns())[0].state,'materializing');
+      await revert(input); assert.equal((await reversionRuns())[0].state,'completed');
+    });
+    await t.test('uncertain commits at intent, batch and completion reconcile with the original request', async () => {
+      for (const lostCommit of [1,2,3]) {
+        await reset(0); const adoption = await prepare(); await stage(8901); await reversalMigration(); const input = reversionArgs(adoption);
+        await assert.rejects(client(db=>{
+          let commits=0;
+          const ambiguous = new Proxy(db,{get(connection,key){
+            if(key==='query') return async(sql:string,parameters?:unknown[])=>{const result=await connection.query(sql,parameters);if(sql==='COMMIT'&&++commits===lostCommit)throw new Error('lost acknowledgement');return result;};
+            return Reflect.get(connection,key);
+          }});
+          return revertAllocator(ambiguous,cfg,store!.delivery!,legacyReversionRequest(input,reversionAuthorization,source));
+        }),/REVERSION_COMMIT_UNKNOWN/);
+        const committed=await entries(); await revert(input); assert.equal((await entries()).length,1);
+        for(const row of committed) assert.deepEqual((await entries()).find(e=>e.source_id===row.source_id),row);
+        assert.equal((await reversionBatches()).length,1); assert.equal((await reversionRuns())[0].state,'completed');
+      }
+    });
+    await t.test('reversion excludes concurrent capture persistence, delivery, resume and another reversion per batch', async () => {
+      await reset(0); const adoption=await prepare(); await stage(8901); await stage(8902); await reversalMigration(); const input=reversionArgs(adoption);
+      let entered!:()=>void, release!:()=>void;
+      const ready=new Promise<void>(r=>{entered=r;}), gate=new Promise<void>(r=>{release=r;}); let first=true;
+      const operation=revert(input,{afterLocks:async()=>{if(first){first=false;entered();await gate;}}}); await ready;
+      let captured=false,delivered=false;
+      const capturing=stage(8999).then(()=>{captured=true;}); const delivering=store!.delivery!.tick().then(()=>{delivered=true;});
+      const resuming=assert.rejects(corporateControl(cfg,'corporate-resume'),/ADOPTION_INCOMPLETE|DELIVERY_BLOCKED|REVERSION_VALIDATION_REQUIRED/);
+      await assert.rejects(revert(input),/REVERSION_BUSY/);
+      try{await pause(50);assert.equal(captured,false);assert.equal(delivered,false);}finally{release();}
+      await operation; await Promise.all([capturing,delivering,resuming]);
+      assert.equal((await entries()).length,3); assert.equal((await control()).paused,true); assert.equal((await assignments()).length,0);
+    });
+    await t.test('admission or approval divergence cannot be discarded or overwritten during reversion', async () => {
+      await reset(0); const adoption=await prepare(); await stage(8901); await reversalMigration(); const input=reversionArgs(adoption);
+      await local.query("UPDATE olos_http.corporate_id_admissions SET mapped_hash=repeat('a',64)");
+      await assert.rejects(revert(input),/ADMISSION_CHANGED/); assert.equal((await reversionRuns()).length,0); assert.equal((await entries()).length,0);
+      assert.equal((await local.query('SELECT state FROM olos_http.corporate_id_allocator')).rows[0].state,'adopting');
+      await reset(0); const next=await prepare(); await stage(8901); await reversalMigration(); const original=reversionArgs(next); await revert(original);
+      await assert.rejects(revert(original.map((v,i)=>i===7?'INC-OTHER':v)),/REQUEST_REUSED/);
+      await assert.rejects(revert(reversionArgs(next)),/REQUEST_REUSED/);
+      assert.equal((await entries()).length,1);
+    });
+    await t.test('newly materialized legacy collisions are isolated by the existing procedure before delivery resumes', async () => {
+      await reset(0); await insertForeign('1'); const adoption=await prepare(); await stage(8901); await stage(8902); await reversalMigration();
+      await revert(reversionArgs(adoption)); const report=await verify(); assert.equal(report.issues[0]!.code,'INTERNAL_ID_COLLISION');
+      await assert.rejects(recover(args(report.verification_digest)),/PENDING_DIVERGES/); const remoteBefore=(await snapshot()).remote;
+      await quarantine(args(report.verification_digest)); const valid=await verify(); assert.equal(valid.quarantined,1); assert.deepEqual(valid.issues,[]);
+      await recover(args(valid.verification_digest)); await corporateControl(cfg,'corporate-resume'); await store!.delivery!.tick();
+      assert.deepEqual((await entries()).map(e=>e.state),['pending','confirmed']);
+      assert.deepEqual((await snapshot()).remote.find(r=>r.internal_id_olos===1),remoteBefore[0]);
+    });
+    await t.test('finalization rollback is resumable and migrations retain all local triggers and evidence', async () => {
+      await reset(0); const adoption=await prepare(); await stage(8901); await reversalMigration(); const input=reversionArgs(adoption);
+      await assert.rejects(revert(input,{beforeCompleteCommit:async()=>{throw new Error('synthetic completion failure');}}),/synthetic completion failure/);
+      const frozen=await entries(); const oldAdmissions=await admissions(); const batches=await reversionBatches();
+      assert.equal((await reversionRuns())[0].state,'materializing');
+      await reversalMigration(); await allocatorMigration(); await revert(input);
+      assert.deepEqual(await entries(),frozen); assert.deepEqual(await admissions(),oldAdmissions); assert.deepEqual(await reversionBatches(),batches);
+      assert.equal((await local.query("SELECT count(*)::int AS n FROM pg_trigger WHERE tgrelid='olos_http.records'::regclass AND tgname='corporate_id_assignment_required' AND tgenabled='O'")).rows[0].n,1);
+      assert.equal((await control()).id_allocator_required,false); assert.equal((await reversionRuns())[0].state,'completed');
+    });
+    await t.test('a previously persisted admission is recognized exactly, without reallocating its ID or replacing its payload',async()=>{
+      await reset(0);const adoption=await prepare();for(const id of [8901,8902,8903])await stage(id);await reversalMigration();const input=reversionArgs(adoption,randomUUID(),1);
+      await revert(input);
+      const waiting=(await admissions()).find(e=>!e.materialized)!;
+      const seq=(await local.query("SELECT pg_get_serial_sequence('raw.olos_calls','internal_id_olos') AS name")).rows[0].name;
+      await client(async db=>{
+        await db.query('BEGIN');await db.query('SELECT pg_advisory_xact_lock(17320914,5)');
+        await store!.delivery!.enqueue(db,seq,[waiting.mapped],undefined,input[5]);await db.query('COMMIT');
+      });
+      const frozen=await entries(),cursor=(await snapshot()).allocator;
+      await revert(input);await revert(input);
+      assert.deepEqual(await entries(),frozen);assert.deepEqual((await snapshot()).allocator,cursor);assert.equal((await entries()).length,3);
+      assert.equal((await reversionRuns())[0].materialized_count,'3');assert((await admissions()).every(e=>e.materialized));
+    });
+    await t.test('compiled CLI restores legacy and repeats the same request without issuing remote writes',async()=>{
+      await reset(0);const adoption=await prepare();await stage(8901);await reversalMigration();const input=reversionArgs(adoption);
+      const before=(await snapshot()).remote;
+      const result=await promisify(execFile)(process.execPath,['dist/main.js','corporate-revert-id-allocator',...input],{env:{...env,...reversionAuthorization},timeout:15000});
+      assert.match(result.stdout,/"completed":true/);assert.match(result.stdout,/corporate_legacy_reversion_recorded/);
+      const frozen=await entries();const repeated=await promisify(execFile)(process.execPath,['dist/main.js','corporate-revert-id-allocator',...input],{env:{...env,...reversionAuthorization},timeout:15000});
+      assert.match(repeated.stdout,/"already_applied":true/);assert.deepEqual(await entries(),frozen);assert.deepEqual((await snapshot()).remote,before);
+    });
+    await t.test('read-only remote failure before reversal keeps adopting and preserves all data', async()=>{
+      await reset(0);const adoption=await prepare();await stage(8901);await reversalMigration();const input=reversionArgs(adoption),data=await admissions();
+      const saved=dc.connection.destinationUrl;dc.connection.destinationUrl='postgresql://postgres@localhost:1/madm';
+      try{await assert.rejects(revert(input));}finally{dc.connection.destinationUrl=saved;}
+      assert.equal((await reversionRuns()).length,0);assert.deepEqual(await admissions(),data);assert.equal((await control()).id_allocator_required,true);
+      await stage(8902);await revert(input);assert.equal((await entries()).length,2);
     });
     await t.test('audit migration can be reapplied without changing the queue or evidence', async () => {
       await reset(1); await recover(args((await verify()).verification_digest)); const before = await snapshot();

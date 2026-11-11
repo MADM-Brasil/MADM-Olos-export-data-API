@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { legacyReversionRequest } from '../src/corporate-delivery/legacy-recovery.js';
 import { recoveryRequest } from '../src/corporate-delivery/recovery.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { config } from '../src/config.js';
@@ -45,4 +46,15 @@ test('allocator adoption and preparation require their own authorization and exa
       OLOS_CORPORATE_ID_ALLOCATOR_CONFIRMATION: 'AUTHORIZE_CORPORATE_ID_ALLOCATOR',
     }), /SOURCE_MISMATCH/);
   }
+});
+
+test('legacy reversion requires separate authorization, exact source and preparation/request IDs',async()=>{
+  const args=['--confirm-source','synthetic','--adoption-request','00000000-0000-4000-8000-000000000001','--request-id','00000000-0000-4000-8000-000000000002','--evidence','INC-LEGACY'];
+  const auth={OLOS_CORPORATE_LEGACY_REVERSION_CONFIRMATION:'AUTHORIZE_CORPORATE_LEGACY_REVERSION'};
+  assert.throws(()=>legacyReversionRequest(args,authorization,'synthetic'),/NOT_AUTHORIZED/);
+  assert.throws(()=>legacyReversionRequest(args,auth,'other'),/SOURCE_MISMATCH/);
+  for(const invalid of [args.slice(0,6),args.map((v,i)=>i===3?'bad':v),args.map((v,i)=>i===5?'bad':v),[...args,'--max-batches','0'],[...args,'--max-batches','10001']])assert.throws(()=>legacyReversionRequest(invalid,auth,'synthetic'),/ARGUMENTS_INVALID/);
+  assert.equal(legacyReversionRequest(args,auth,'synthetic').maxBatches,1000);assert.equal(legacyReversionRequest([...args,'--max-batches','1'],auth,'synthetic').maxBatches,1);
+  const cfg=config({DATABASE_URL:'postgresql://test@localhost/local',OLOS_SOURCE_KEY:'synthetic',ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:'postgresql://test@localhost/madm'});
+  await assert.rejects(corporateControl(cfg,'corporate-revert-id-allocator',args,{}),/NOT_AUTHORIZED/);
 });

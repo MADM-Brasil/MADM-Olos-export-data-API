@@ -2,6 +2,8 @@
 
 Implementação e testes locais; nenhum acesso à produção, deploy, commit ou push. As 221 chamadas em quarentena foram informadas pelo operador e não foram consultadas.
 
+Para desfazer exclusivamente uma preparação ainda em `adopting`, sem alocador remoto instalado, existe o [procedimento emergencial auditado](legacy-reversion.md). Ele conserva os dados da `008`; não é retorno ao binário antigo nem rollback de uma adoção ativa.
+
 ## Auditoria e contrato
 
 `src/db.ts` não existe neste checkout. A descoberta/validação real está em `src/schema.ts`: `pg_get_serial_sequence(target,'internal_id_olos')`, coluna local `int8`, PK e privilégio USAGE. `Store.open()` guarda esse nome em `Store.sequence`.

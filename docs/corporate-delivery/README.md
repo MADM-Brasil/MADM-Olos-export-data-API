@@ -125,6 +125,7 @@ Comandos adicionados ao **mesmo** `dist/main.js`, sem autenticar/consumir OLOS:
 | `corporate-quarantine-collisions` | isolamento administrativo de colisões comprovadas; preserva pending, hashes, IDs e bloqueio |
 | `corporate-prepare-id-allocator` | interrompe a alocação local legada e passa a admitir chamadas sem ID, com captura ativa |
 | `corporate-adopt-id-allocator` | adota reservas exclusivas no MADM, preservando todos os IDs existentes |
+| `corporate-revert-id-allocator` | reverte preparação não adotada, materializa admissões pelo fluxo legado e conserva pausa/bloqueio até validação |
 | `corporate-deliver-once` | uma tentativa de um lote, respeitando pausa/backoff; exige o lock da origem e não concorre com o serviço ativo |
 | `corporate-homologate --limit N` | homologação de um único lote de até N registros, com N obrigatório entre 1 e 5, mantendo a pausa; autorização exclusiva e escrita contínua desabilitada |
 
@@ -207,3 +208,5 @@ O [procedimento administrativo de INTERNAL_ID_COLLISION](collision-recovery.md) 
 A [recuperação seletiva emergencial](selective-collision-recovery.md) acrescenta a migration local `007`, o isolamento explícito e a seleção que exclui somente membros formalmente auditados. A coleta OLOS continua independente.
 
 O [contrato de alocação autoritativa](id-allocation.md) documenta os consumidores da sequência, as migrations local `008`/corporativa `001`, a reserva idempotente e o procedimento de adoção sem parar a coleta. Após a preparação, a sequência local deixa de alocar IDs no fluxo corporativo.
+
+O [procedimento emergencial de retorno ao fluxo legado](legacy-reversion.md) usa a migration **somente local** `009`, preserva a preparação/admissões e não instala o alocador corporativo.

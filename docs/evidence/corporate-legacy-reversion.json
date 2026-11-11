@@ -1,0 +1,88 @@
+{
+  "date": "2026-11-11",
+  "baseline_commit": "c7c1bf7",
+  "production_accessed": false,
+  "deploy_performed": false,
+  "commit_performed": false,
+  "push_performed": false,
+  "reported_production_state": {
+    "allocator": "adopting",
+    "paused": true,
+    "blocked": true,
+    "last_code": "INTERNAL_ID_COLLISION",
+    "unmaterialized_admissions": 12270,
+    "outbox_pending": 371,
+    "quarantined": 221,
+    "confirmed": 54390,
+    "verified_in_production": false
+  },
+  "checks": {
+    "build": {
+      "command": "npm run build",
+      "node": "24.16.0",
+      "result": "passed"
+    },
+    "unit": {
+      "command": "npm test",
+      "passed": 133,
+      "failed": 0
+    },
+    "directed_integration": {
+      "command": "OLOS_DIRECT_TEST_FILES=test/corporate-recovery.integration.ts bash scripts/test-corporate-delivery.sh",
+      "passed": 56,
+      "failed": 0,
+      "environment": "Disposable PostgreSQL 16, verified TLS, internal Docker network, zero published ports; 55 subtests plus parent"
+    },
+    "full_integration": {
+      "command": "bash scripts/test-corporate-delivery.sh",
+      "passed": 136,
+      "failed": 8,
+      "baseline_passed": 123,
+      "baseline_failed": 8,
+      "baseline_method": "Clean git archive HEAD, separately built and executed with disposable databases",
+      "same_failures": [
+        "✖ history exige exclusividade com o Admin",
+        "✖ history bloqueia estados corporativos inválidos e leituras pendentes",
+        "✖ history falha remota não repete consumo após reinício",
+        "✖ homologation CLI confirms exactly five, remains paused, never calls OLOS and never drains a second batch",
+        "✖ homologation CLI excludes independent source, Admin and Corporate Sync lock owners",
+        "✖ homologation holds pause against concurrent resume, blocks another CLI and permits only one attempt per instance",
+        "✖ homologation without authorization, without pause or with a structural conflict fails closed"
+      ]
+    },
+    "typecheck": {
+      "command": "npm run typecheck",
+      "result": "17 preexisting diagnostics, complete stdout identical via cmp to before edits"
+    },
+    "diff_check": {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    "operational_shell": {
+      "command": "bash -n on documented bash blocks",
+      "result": "passed; no operational command executed"
+    }
+  },
+  "proofs": [
+    "Prepared-only reversal requires its own authorization, exact source, original adoption request and stable reversal UUID.",
+    "Remote proof is READ ONLY; any allocator namespace/guard, existing assignments, active allocator or schema/integrity failure refuses reversal.",
+    "Original admissions and adoption metadata remain; mapped payloads, original hashes and admission request IDs are unchanged.",
+    "Frozen historical outbox, records, receipts, confirmed count, quarantine and existing corporate rows are preserved.",
+    "Each legacy materialization commits records/outbox, admission flag, ID mapping and batch evidence atomically.",
+    "Batch rollback, interruption after committed progress, process restart and uncertain intent/batch/completion commits recover without duplicate IDs or payload replacement.",
+    "A prior exact mapping is recognized without a new nextval or historical update.",
+    "Capture persistence, delivery and resume are fenced during each batch; captures may proceed between batches and their new admissions are included.",
+    "A session fence rejects concurrent reversion processes; changed approvals or request IDs cannot overwrite the recovery.",
+    "Delivery stays paused and blocked through materialization; resume also requires validation persisted by the existing collision-recovery operation.",
+    "New legacy collisions remain pending and can be selectively quarantined before valid rows are delivered.",
+    "Compiled CLI was executed and repeated successfully in the disposable fixture.",
+    "Local migration 008 trigger remains installed; no DROP TRIGGER, manual control update, setval or ALTER SEQUENCE is part of recovery."
+  ],
+  "limits": [
+    "Returning to a local sequence does not guarantee global exclusivity with MADM; recurring collisions still require existing selective quarantine and validation.",
+    "No production counts, privileges, latency or materialization throughput were verified; test datasets are smaller than the reported 12270 admissions.",
+    "Sequence numbers consumed by a rolled-back transaction can leave normal gaps; committed IDs are never remapped.",
+    "The same updated worker must run this code; a new CLI beside the old binary is insufficient.",
+    "This is not a rollback of an active or remotely installed allocator; uncertain remote authority is preserved and blocks the procedure."
+  ]
+}
