@@ -106,3 +106,22 @@ test('CSV remains exact for empty, one-day and 366-day snapshots without sensiti
   const csv=reportCsv(rows);assert.equal(csv.split('\r\n').length,367);assert.match(csv,/9007199254740993/);assert.match(csv,/Indisponível/);assert.doesNotMatch(csv,/PRIVATE/);
   assert.equal(reportCsv(rows.slice(0,1)).split('\r\n').length,2);
 });
+
+test('v2 keeps local receipt counts independent of MADM totals and scales the graph without changing v1 validation',async()=>{
+  const {reportModel}=await import('../admin/public/ui.js');
+  const totals={calls:'0',identified_calls:'0',operators:'0',confirmed:'5',pending:'7',not_queued:'0',inconsistent:'0'};
+  const snapshot={snapshot_contract_version:2,from:'2026-11-01',to:'2026-11-01',observed_at:'2026-11-01T12:00:00Z',outbox_available:true,
+    summary:{...totals,undated:'0',missing_mapping:'0'},period:totals,failed_reads:'0',daily:[{day:'2026-11-01',...totals}]};
+  const model=reportModel(snapshot);assert.equal(model.total,0n);assert.equal(model.series[0].confirmed,5n);assert.equal(model.empty,false);assert(model.scale>=5n);
+  assert.throws(()=>reportModel({...snapshot,snapshot_contract_version:1}));
+  assert.match(reportCsv(snapshot.daily,2),/\(MADM\)/);assert.match(reportCsv(snapshot.daily,2),/\(local\)/);
+  assert.doesNotMatch(reportCsv(snapshot.daily,1),/\(MADM\)/);
+});
+
+test('analytical freshness exposes updater failure while preserving the last valid generation',async()=>{
+  const {reportStale}=await import('../admin/public/ui.js');
+  const now=Date.parse('2026-11-01T12:00:00Z'),snapshot={observed_at:new Date(now).toISOString(),cache_seconds:300};
+  assert.equal(reportStale(snapshot,now),false);assert.equal(reportStale({...snapshot,last_refresh_error:'REPORT_CORPORATE_TIMEOUT'},now),true);
+  assert.equal(reportStale({...snapshot,snapshot_state:'STALE'},now),true);assert.equal(reportStale(snapshot,now,true),true);
+  assert.equal(reportStale(snapshot,now+300001),true);assert.equal(reportStale({...snapshot,observed_at:'invalid'},now),true);
+});

@@ -12,6 +12,8 @@ function unsafe(reason: string, fields: Record<string,string|number|boolean|null
 // The original tables contain occupied IDs, not a complete record of their allocator provenance.
 // Never infer provenance or a new cursor from MAX(target_id), source_id, row counts or outbox.origin.
 export async function lockLegacyIdSpace(local: PoolClient, target: string): Promise<Scope[]> {
+  // Fence before ID tables; keep capture independent of delivery's control row.
+  await local.query('SELECT pg_advisory_xact_lock_shared(17320914,5)');
   const scopes: Scope[] = [
     {relation:'olos_http.records',column:'target_id',target:true},
     {relation:'olos_http.corporate_outbox',column:'target_id',target:false},
@@ -24,6 +26,10 @@ export async function lockLegacyIdSpace(local: PoolClient, target: string): Prom
     const privilege = (await local.query(`SELECT has_table_privilege($1,'UPDATE') OR has_table_privilege($1,'DELETE')
       OR has_table_privilege($1,'TRUNCATE') AS can_lock`,[scope.relation])).rows[0];
     if (!privilege.can_lock) unsafe('LOCAL_ID_LOCK_PRIVILEGE_REQUIRED',{scope:scope.relation});
+  }
+  if((await local.query("SELECT to_regclass('olos_http.corporate_allocation_fence') IS NOT NULL AS present")).rows[0].present){
+    const fence=await local.query('SELECT 1 FROM olos_http.corporate_allocation_fence WHERE target_table=$1 FOR SHARE',[target]);
+    if(fence.rowCount!==1)throw new SyncError('READOPTION_AUTHORITY_EVIDENCE_CHANGED');
   }
   // Also exclude writers that do not take the application advisory fence. No sequence mutation.
   await local.query(`LOCK TABLE ${scopes.map(s=>s.relation).join(',')} IN SHARE ROW EXCLUSIVE MODE`);
@@ -76,6 +82,9 @@ export async function verifyLegacySequence(local: PoolClient, target: string, se
   log('corporate_legacy_sequence_verified',{first_candidate:first.toString(),last_candidate:last.toString(),new_records:count.toString()});
 }
 export async function nextLegacyId(local: PoolClient, sequence: string, target: string, scopes: Scope[]): Promise<string> {
+  await local.query('SELECT pg_advisory_xact_lock_shared(17320914,5)');
+  const authority=(await local.query<{required:boolean|null}>("SELECT (to_jsonb(c)->>'id_allocator_required')::boolean AS required FROM olos_http.corporate_control c WHERE singleton AND target_table=$1",[target])).rows[0];
+  if(authority?.required)throw new SyncError('ALLOCATOR_LEGACY_GENERATION_FORBIDDEN');
   const id = integerValue((await local.query('SELECT nextval($1::regclass)::text AS id',[sequence])).rows[0].id,32);
   if (BigInt(id)<1n) unsafe('SEQUENCE_CAPACITY_NOT_PROVEN',{target_id:id});
   // Recheck the actual value, independently of any forecast or unexpected competing nextval caller.

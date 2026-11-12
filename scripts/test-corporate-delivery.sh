@@ -36,6 +36,11 @@ printf 'ISOLATION_VERIFIED internal_network=true published_ports=0 temporary_pos
 docker exec "$container" createdb -U postgres olos_direct_test
 docker exec "$container" createdb -U postgres madm
 docker exec "$container" createdb -U postgres olos_admin_homolog
+# Regression for the administrative runbook: libpq expands an explicit dbname
+# URI, not a URI stored only in PGDATABASE. Synthetic credentials and verified TLS.
+test "$(docker exec "$container" psql --dbname='postgresql://postgres@localhost:5432/madm?sslmode=verify-full&sslrootcert=/tmp/test.crt' \
+  -X -At -v ON_ERROR_STOP=1 -c 'SELECT current_database()')" = madm
+printf 'RUNBOOK_DBNAME_URI_VERIFIED database=madm tls=verify-full\n'
 docker cp "$container:/tmp/test.crt" "$certs/ca.crt" >/dev/null
 chmod 755 "$certs"
 chmod 644 "$certs/ca.crt"

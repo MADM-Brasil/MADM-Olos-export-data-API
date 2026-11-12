@@ -53,12 +53,13 @@ async function inspect(local: PoolClient, remote: Client, cfg: DeliveryConfig, s
   const { shape, hash, allocatorHash } = await corporateSchema(remote, cfg, false);
   const allocator = await allocatorState(local, cfg, source, target, false);
   if (allocator?.state === 'legacy') await assertLegacyRemote(remote);
-  if (allocator && allocator.state !== 'legacy' && (allocator.state !== 'active' || allocator.contract_hash !== allocatorHash)) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
+  const transitioning=allocator?.generation_request_id&&allocator.state==='adopting';
+  if (allocator && allocator.state !== 'legacy' && (transitioning?allocator.expected_contract_hash!==allocatorHash:(allocator.state !== 'active' || allocator.contract_hash !== allocatorHash))) throw new SyncError('ALLOCATOR_CONTRACT_CHANGED');
   const unallocated = allocator ? Number((await local.query('SELECT count(*)::text AS n FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND NOT materialized', [source])).rows[0].n) : 0;
   if (hash !== control.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
   const quarantined = await quarantineMembers(local, cfg, source, target, shape);
-  const proof = createHash('sha256').update(JSON.stringify([allocator?.state === 'legacy' ? 'corporate-pending-verification-v4-legacy' : allocator ? 'corporate-pending-verification-v3' : 'corporate-pending-verification-v2', source, target, cfg.binding,
-    control.generation, control.blocked, control.last_code, hash, quarantined, ...(allocator?.state === 'legacy' ? [allocator.reversion_request_id, unallocated] : allocator ? [allocator.contract_hash, unallocated] : [])]));
+  const proof = createHash('sha256').update(JSON.stringify([allocator?.generation_request_id?'corporate-pending-verification-v5-readoption':allocator?.state === 'legacy' ? 'corporate-pending-verification-v4-legacy' : allocator ? 'corporate-pending-verification-v3' : 'corporate-pending-verification-v2', source, target, cfg.binding,
+    control.generation, control.blocked, control.last_code, hash, quarantined, ...(allocator?.generation_request_id?[allocator.generation_request_id]:[]), ...(allocator?.state === 'legacy' ? [allocator.reversion_request_id, unallocated] : allocator ? [allocator.contract_hash, unallocated] : [])]));
   const report: PendingVerification = { pending: quarantined.length, unallocated, quarantined: quarantined.length, eligible: 0, existing: 0, schema_hash: hash, verification_digest: '', issues: [] };
   const identities = new Map<string, string>();
   const admission = pendingAdmission(4);
@@ -156,7 +157,9 @@ export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, s
   try {
     await local.query('BEGIN');
     if (!(await local.query('SELECT pg_try_advisory_xact_lock_shared(17320914,4) AS ok')).rows[0].ok) throw new SyncError('CORPORATE_HOMOLOGATION_ACTIVE');
+    await local.query('SELECT pg_advisory_xact_lock_shared(17320914,5)');
     const control = await state(local, cfg, source, target, true);
+    if(!quarantine&&control.id_allocator_generation&&(await allocatorState(local,cfg,source,target,false))?.state==='adopting')throw new SyncError('READOPTION_ACTIVATION_INCOMPLETE');
     // Excludes capture admission and edits to the frozen queue while retaining the OLOS owner.
     await local.query('LOCK TABLE olos_http.records,olos_http.corporate_outbox IN SHARE MODE');
     if (!(await local.query("SELECT to_regclass('olos_http.corporate_collision_recoveries') IS NOT NULL AS present")).rows[0].present) throw new SyncError('CORPORATE_RECOVERY_MIGRATION_REQUIRED');
@@ -222,10 +225,10 @@ async function isolateCollisions(local: PoolClient, cfg: DeliveryConfig, source:
     && issue.fields.some(field => (identityColumns as readonly string[]).includes(field))));
   if (!collisions.length) throw new SyncError('CORPORATE_NO_CONFIRMED_COLLISIONS');
   await local.query(`INSERT INTO olos_http.corporate_collision_quarantine_runs
-    (request_id,source_key,target_table,binding,verification_digest,evidence_ref,previous_generation,previous_code,pending_count,member_count,schema_hash)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    (request_id,source_key,target_table,binding,verification_digest,evidence_ref,previous_generation,previous_code,pending_count,member_count,schema_hash${typeof control.id_allocator_generation==='string'?',readoption_request_id':''})
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11${typeof control.id_allocator_generation==='string'?',$12':''})`,
   [request.requestId, source, target, cfg.binding, request.verification, request.evidence, control.generation, control.last_code,
-    report.pending, collisions.length, report.schema_hash]);
+    report.pending, collisions.length, report.schema_hash,...(typeof control.id_allocator_generation==='string'?[control.id_allocator_generation]:[])]);
   for (const [id, issues] of collisions) {
     const inserted = await local.query(`INSERT INTO olos_http.corporate_collision_quarantine
       (source_key,source_id,target_id,source_hash,payload_hash,request_id,code,remote_ids,fields)

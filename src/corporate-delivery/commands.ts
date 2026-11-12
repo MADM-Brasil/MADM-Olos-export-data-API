@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { readoptionAction,readoptionArguments,executeReadoptionCommand } from './readoption-command.js';
 import type { Config } from '../config.js';
 import { log, WorkerError } from '../errors.js';
 import { quote } from '../schema.js';
@@ -11,7 +12,9 @@ import { logVerification, recoverCollision, recoveryRequest, verifyPending } fro
 // They never capture OLOS, acquire its lock or admit an independent delivery loop.
 export async function corporateControl(cfg: Config, command: string, args: string[] = [], env: NodeJS.ProcessEnv = process.env): Promise<void> {
   if (!cfg.corporateDelivery) throw new WorkerError('CORPORATE_MODE_REQUIRED');
-  if (!['corporate-status','corporate-check','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator'].includes(command)) throw new WorkerError('COMMAND_INVALID');
+  const action=readoptionAction(command);
+  const readoption=action?readoptionArguments(action,args,env,cfg.sourceKey):undefined;
+  if (!action&&!['corporate-status','corporate-check','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator'].includes(command)) throw new WorkerError('COMMAND_INVALID');
   const reversion = command === 'corporate-revert-id-allocator' ? legacyReversionRequest(args,env,cfg.sourceKey) : undefined;
   const adoption = ['corporate-adopt-id-allocator','corporate-prepare-id-allocator'].includes(command) ? adoptionRequest(args, env, cfg.sourceKey) : undefined;
   const quarantine = command === 'corporate-quarantine-collisions';
@@ -23,6 +26,7 @@ export async function corporateControl(cfg: Config, command: string, args: strin
     const local = await pool.connect();
     local.on('error', () => {});
     try {
+      if(readoption){await executeReadoptionCommand(local,cfg.corporateDelivery,`${quote(cfg.schema)}.${quote(cfg.table)}`,readoption);return;}
       const delivery = new CorporateDelivery(cfg.corporateDelivery, cfg.sourceKey, `${quote(cfg.schema)}.${quote(cfg.table)}`, pool, () => false, () => {});
       const target = `${quote(cfg.schema)}.${quote(cfg.table)}`;
       if (reversion) {

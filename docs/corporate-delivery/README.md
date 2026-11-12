@@ -210,3 +210,5 @@ A [recuperação seletiva emergencial](selective-collision-recovery.md) acrescen
 O [contrato de alocação autoritativa](id-allocation.md) documenta os consumidores da sequência, as migrations local `008`/corporativa `001`, a reserva idempotente e o procedimento de adoção sem parar a coleta. Após a preparação, a sequência local deixa de alocar IDs no fluxo corporativo.
 
 O [procedimento emergencial de retorno ao fluxo legado](legacy-reversion.md) usa a migration **somente local** `009`, preserva a preparação/admissões e não instala o alocador corporativo.
+
+A [readoção da autoridade corporativa](id-allocator-readoption.md) cria uma geração independente após reversão validada, com barreira transacional, registro histórico em lotes e recuperação por UUID. O [runbook de implantação e recuperação](id-allocator-readoption-runbook.md) exige aprovação do DBA para a migration corporativa e mantém separadas a ativação do alocador e a liberação da entrega.

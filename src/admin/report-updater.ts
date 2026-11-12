@@ -2,8 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { WorkerError, log } from '../errors.js';
 import { quote } from '../schema.js';
-import { collectReportSnapshot, validateReportData, reportDataHash, reportContractVersion, reportZone,
-  reportRefreshSeconds, reportPayloadLimit, reportValidationMetadata, reportContract } from './report-snapshot.js';
+import { collectReportSnapshot, reportDataHash, reportZone,
+  reportRefreshSeconds, reportPayloadLimit } from './report-snapshot.js';
+import { legacyReportFormat, type ReportFormat } from './report-format.js';
 export const reportBuildTimeoutMs=30_000;
 export const reportBuildWallTimeoutMs=40_000;
 export function reportRetryMs(attempt:number) {return attempt>=3?300_000:attempt===2?60_000:30_000;}
@@ -20,9 +21,9 @@ export class ReportUpdater {
   private readonly target:string;
   private readonly key:unknown[];
   private readonly tag:string;
-  constructor(private readonly pool:Pool,private readonly source:string,private readonly destination:{schema:string;table:string}) {
+  constructor(private readonly pool:Pool,private readonly source:string,private readonly destination:{schema:string;table:string},private readonly format:ReportFormat=legacyReportFormat) {
     this.target=`${quote(destination.schema)}.${quote(destination.table)}`;
-    this.key=[source,this.target,reportContractVersion];
+    this.key=[source,this.target,this.format.version];
     this.tag=createHash('sha256').update(source+'\0'+this.target).digest('hex').slice(0,16);
   }
   start() {
@@ -84,7 +85,7 @@ export class ReportUpdater {
       phase='resources';
       await db.query("SET LOCAL temp_file_limit='768MB'");
       phase='collection';
-      const data=validateReportData(await collectReportSnapshot(db,this.source,this.destination));
+      const data=this.format.validate(await (this.format.collect??collectReportSnapshot)(db,this.source,this.destination));
       if(this.stopped||active.released||active.lost)throw new WorkerError('REPORT_UPDATE_STOPPED');
       const encoded=JSON.stringify(data),bytes=Buffer.byteLength(encoded);
       if(bytes>reportPayloadLimit)throw new WorkerError('REPORT_SNAPSHOT_TOO_LARGE');
@@ -94,7 +95,7 @@ export class ReportUpdater {
       const id=randomUUID(),hash=reportDataHash(data);
       await db.query(`INSERT INTO olos_http.report_snapshots(id,source_key,target_table,contract_version,timezone,status,observed_at,collection_date,data,validation,data_hash,contract_name)
         VALUES($4,$1,$2,$3,$5,'published',$6,$7,$8,$9,$10,$11)`,[...this.key,id,reportZone,data.observed_at,data.collection_date,encoded,
-        JSON.stringify(reportValidationMetadata(data)),hash,reportContract]);
+        JSON.stringify(this.format.metadata(data)),hash,this.format.name]);
       const published=await db.query(`UPDATE olos_http.report_snapshot_state SET published_id=$5,status='ready',failure_count=0,last_error=NULL,
         next_attempt_at=least($6::timestamptz+($7::int*interval '1 second'),(($8::date+1)::timestamp AT TIME ZONE 'America/Sao_Paulo'))
         WHERE source_key=$1 AND target_table=$2 AND contract_version=$3 AND attempt_id=$4

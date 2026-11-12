@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { reportRuntime } from './report-runtime.js';
 import { ReportUpdater } from './report-updater.js';
 import { resolve } from 'node:path';
 import { once } from 'node:events';
@@ -13,7 +14,8 @@ import { adminServer } from './server.js';
 import { OperationalEvents } from './events.js';
 
 export async function runManaged(cfg: Config, web: boolean, env = process.env) {
-  const repo = new AdminRepository(cfg.databaseUrl, cfg.sourceKey, { schema: cfg.schema, table: cfg.table });
+  const reports=web?reportRuntime(cfg,env):undefined;
+  const repo = new AdminRepository(cfg.databaseUrl, cfg.sourceKey, { schema: cfg.schema, table: cfg.table },reports?.format);
   let server: ReturnType<typeof adminServer> | undefined;
   let scheduler: DynamicScheduler | undefined;
   const events = new OperationalEvents();
@@ -48,7 +50,7 @@ export async function runManaged(cfg: Config, web: boolean, env = process.env) {
       log('admin_listening', { port });
       reportPool=new pg.Pool({connectionString:cfg.databaseUrl,max:1,connectionTimeoutMillis:1000,statement_timeout:5000,application_name:'olos-report-updater'});
       reportPool.on('error',()=>log('report_snapshot_failed',{error:'REPORT_UNAVAILABLE'}));
-      reportUpdater=new ReportUpdater(reportPool,cfg.sourceKey,{schema:cfg.schema,table:cfg.table});
+      reportUpdater=new ReportUpdater(reportPool,cfg.sourceKey,{schema:cfg.schema,table:cfg.table},reports?.format);
       reportUpdater.start();
     }
     process.once('SIGTERM', stop); process.once('SIGINT', stop);
@@ -59,6 +61,7 @@ export async function runManaged(cfg: Config, web: boolean, env = process.env) {
     if (server) { server.closeIdleConnections(); await new Promise<void>(done => server!.close(() => done())); }
     await reportUpdater?.stop();
     await reportPool?.end();
+    await reports?.pool?.end();
     await repo.close();
   }
 }

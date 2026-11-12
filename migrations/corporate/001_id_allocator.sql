@@ -53,6 +53,7 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE='P3106', MESSAGE='ALLOCATOR_REQUEST_INVALID';
   END IF;
   SELECT c.next_candidate INTO STRICT candidate FROM olos_delivery_ids.counter c WHERE c.singleton FOR UPDATE;
+  IF candidate<1 OR candidate>2147483648 THEN RAISE EXCEPTION USING ERRCODE='P3105', MESSAGE='ALLOCATOR_REGISTRY_DIVERGES'; END IF;
   FOR item IN SELECT value FROM jsonb_array_elements(p_requests) LOOP
     reserved_source_id:=item->>'source_id'; reserved_source_hash:=item->>'source_hash';
     IF item->>'source_id' IS NULL OR item->>'source_hash' IS NULL THEN RAISE EXCEPTION USING ERRCODE='P3106', MESSAGE='ALLOCATOR_REQUEST_INVALID'; END IF;
@@ -96,6 +97,12 @@ BEGIN
         IF occupied.state<>'used' THEN RAISE EXCEPTION USING ERRCODE='P3104', MESSAGE='ALLOCATOR_LEGACY_ID_RESERVED'; END IF;
         new_token:=NULL; EXIT;
       END IF;
+      -- Find the next actual registry gap using indexes, rather than looping
+      -- once per historical ID. The counter lock serializes allocators; the
+      -- registry PK still arbitrates concurrent external corporate writers.
+      SELECT coalesce((SELECT r.internal_id::bigint+1 FROM olos_delivery_ids.registry r
+        WHERE r.internal_id>=chosen AND NOT EXISTS(SELECT 1 FROM olos_delivery_ids.registry n
+          WHERE n.internal_id=r.internal_id::bigint+1) ORDER BY r.internal_id LIMIT 1),2147483648) INTO candidate;
     END LOOP;
     id:=chosen; reservation_token:=new_token; RETURN NEXT;
   END LOOP;

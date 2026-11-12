@@ -8,6 +8,10 @@ export function count(value) {
   return value !== null && value !== undefined && /^\d+$/.test(String(value)) ? BigInt(value).toLocaleString('pt-BR') : 'Indisponível';
 }
 export function dayLabel(value) { return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.split('-').reverse().join('/') : '—'; }
+export function reportStale(snapshot,now=Date.now(),failed=false) {
+  const age=now-Date.parse(snapshot.observed_at);
+  return failed||snapshot.snapshot_state==='STALE'||!!snapshot.last_refresh_error||!Number.isFinite(age)||age>(snapshot.cache_seconds??300)*1000||age< -5000;
+}
 export function defaultRange(now = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
   const part = type => parts.find(p => p.type === type).value;
@@ -17,10 +21,11 @@ export function defaultRange(now = new Date()) {
 }
 export const reportFields = ['day','calls','identified_calls','operators','with_cpf','with_email','confirmed','pending','not_queued','inconsistent'];
 const headers = ['Data da ligação (America/Sao_Paulo)','Chamadas únicas','Chamadas com operador','Operadores distintos','Com CPF','Com e-mail','Confirmadas (recibo local MADM)','Pendentes (outbox)','Sem outbox','Divergentes (outbox)'];
-export function reportCsv(rows) {
+export function reportCsv(rows,version=1) {
   // Only explicitly selected dates/counts. Never export payloads or spreadsheet formulas.
   const cell = value => `"${String(value ?? 'Indisponível').replaceAll('"', '""')}"`;
-  return '\ufeff' + [headers, ...rows.map(row => reportFields.map(key => {
+  const columns=version===2?headers.map((h,i)=>i>=1&&i<=5?h+' (MADM)':i>=6?h+' (local)':h):headers;
+  return '\ufeff' + [columns, ...rows.map(row => reportFields.map(key => {
     const value = row[key];
     return key === 'day' ? dayLabel(value) : /^\d+$/.test(String(value ?? '')) ? value : 'Indisponível';
   }))].map(row => row.map(cell).join(';')).join('\r\n');
@@ -88,7 +93,7 @@ export function chartCompact(value) {
   }
   return count(value);
 }
-export function chartModel(rows, from, to, corporate = false) {
+export function chartModel(rows, from, to, corporate = false, independentReceipts = false) {
   const validDay=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString().slice(0,10)===value;
   if(!validDay(from)||!validDay(to)||from>to||!Array.isArray(rows))throw new Error('CHART_DATA_INVALID');
   const byDay=new Map();
@@ -98,7 +103,7 @@ export function chartModel(rows, from, to, corporate = false) {
     const calls=BigInt(row.calls),identified=BigInt(row.identified_calls);
     if(identified>calls)throw new Error('CHART_DATA_INVALID');
     const confirmed=corporate&&typeof row.confirmed==='string'&&/^\d+$/.test(row.confirmed)?BigInt(row.confirmed):null;
-    if(corporate&&(confirmed===null||confirmed>calls))throw new Error('CHART_DATA_INVALID');
+    if(corporate&&(confirmed===null||(!independentReceipts&&confirmed>calls)))throw new Error('CHART_DATA_INVALID');
     byDay.set(row.day,{day:row.day,calls,identified,confirmed});
   }
   const series=[],cursor=new Date(`${from}T12:00:00Z`);
@@ -109,10 +114,10 @@ export function chartModel(rows, from, to, corporate = false) {
   let total=0n,identified=0n,peak=null;
   for(const row of series){total+=row.calls;identified+=row.identified;if(row.calls>0n&&(!peak||row.calls>peak.calls))peak=row;}
   const denominator=BigInt(series.length),averageTenths=(total*10n+denominator/2n)/denominator;
-  const maximum=peak?.calls||0n,raw=(maximum+4n)/5n;
+  const maximum=independentReceipts?series.reduce((n,row)=>{const receipt=row.confirmed??0n,candidate=row.calls>receipt?row.calls:receipt;return candidate>n?candidate:n;},0n):(peak?.calls||0n),raw=(maximum+4n)/5n;
   let magnitude=1n;while(magnitude*10n<=raw)magnitude*=10n;
   const step=[1n,2n,5n,10n].map(n=>n*magnitude).find(n=>n>=raw)||1n;
-  return {series,total,identified,peak,denominator,average:`${count(averageTenths/10n)}${averageTenths%10n?','+averageTenths%10n:''}`,percent:chartPercent(identified,total),step,scale:maximum?((maximum+step-1n)/step)*step:5n,empty:total===0n};
+  return {series,total,identified,peak,denominator,average:`${count(averageTenths/10n)}${averageTenths%10n?','+averageTenths%10n:''}`,percent:chartPercent(identified,total),step,scale:maximum?((maximum+step-1n)/step)*step:5n,empty:total===0n&&(!independentReceipts||maximum===0n)};
 }
 const chartRenders=new WeakMap();
 const weekDay=day=>new Intl.DateTimeFormat('pt-BR',{timeZone:zone,weekday:'short'}).format(new Date(`${day}T15:00:00Z`)).replace('.','').replace(/^./,c=>c.toUpperCase());
@@ -137,7 +142,7 @@ export function renderChart(root, rows, from, to, options = {}) {
   const step=(width-left-right)/model.series.length,w=Math.min(28,step*(options.corporate ? .22 : .28)),gap=Math.min(5,step*.06);
   model.series.forEach((row,index)=>{
     const center=left+step*(index+.5),current=row.day===today;
-    const group=svgNode('g',{'data-day-index':index,tabindex:0,role:'button','aria-describedby':root.id==='calls-chart'?'chart-tooltip':root.id+'-tooltip','aria-label':`${dayLabel(row.day)}${current?' · Hoje, em andamento':''} · Coletadas ${count(row.calls)} · Identificadas ${count(row.identified)} (${chartPercent(row.identified,row.calls)})${options.corporate?' · Recibos confirmados '+count(row.confirmed):''}`,class:current?'day-group current-day':'day-group'});
+    const group=svgNode('g',{'data-day-index':index,tabindex:0,role:'button','aria-describedby':root.id==='calls-chart'?'chart-tooltip':root.id+'-tooltip','aria-label':`${dayLabel(row.day)}${current?' · Hoje, em andamento':''} · Chamadas ${count(row.calls)} · Identificadas ${count(row.identified)} (${chartPercent(row.identified,row.calls)})${options.corporate?' · Recibos confirmados '+count(row.confirmed):''}`,class:current?'day-group current-day':'day-group'});
     if(current)group.append(svgNode('rect',{x:center-step*.44,y:top,width:step*.88,height:bottom-top,class:'today-band',rx:8}));
     group.append(svgNode('rect',{x:center-step*.48,y:top,width:step*.96,height:height-top,fill:'transparent',class:'day-target'}));
     const bars=options.corporate?[[row.calls,'calls-bar',center-w*1.5-gap],[row.confirmed,'confirmed-bar',center-w/2],[row.identified,'operators-bar',center+w/2+gap]]:[[row.calls,'calls-bar',center-gap/2-w],[row.identified,'operators-bar',center+gap/2]];
@@ -162,7 +167,7 @@ export function renderChart(root, rows, from, to, options = {}) {
     if(tooltipKey!==key){
     tooltipKey=key;tooltip.replaceChildren();
     const heading=document.createElement('strong');heading.textContent=`${dayLabel(row.day)} · ${current?'Hoje · em andamento':weekDay(row.day)}`;tooltip.append(heading);
-    for(const [label,value] of [['Coletadas',count(row.calls)],['Identificadas',`${count(row.identified)} (${chartPercent(row.identified,row.calls)})`],...(options.corporate?[['Recibos confirmados',count(row.confirmed)]]:[])]){
+    for(const [label,value] of [['Chamadas',count(row.calls)],['Identificadas',`${count(row.identified)} (${chartPercent(row.identified,row.calls)})`],...(options.corporate?[['Recibos confirmados',count(row.confirmed)]]:[])]){
       const line=document.createElement('div'),name=document.createElement('span'),amount=document.createElement('b');name.textContent=label+':';amount.textContent=value;line.append(name,amount);tooltip.append(line);
     }
     if(Number.isFinite(Date.parse(state.observedAt))){const meta=document.createElement('small');meta.textContent=`Snapshot: ${date(state.observedAt)} · Brasília`;tooltip.append(meta);}
@@ -192,10 +197,10 @@ export function renderDashboardMetrics(element, r, selected = false) {
   const totals=selected?r.period:r.summary;
   if(selected)element('metric-operators').textContent=count(totals.operators);
   for (const [id,value] of [['calls',totals.calls],['identified',totals.identified_calls],['confirmed',totals.confirmed],['pending',totals.pending],['errors',r.failed_reads]]) element('metric-'+id).textContent=count(value);
-  element('metrics-observed').textContent=`Snapshot local · ${date(r.observed_at)} · intervalo de atualização: ${r.cache_seconds ?? 300} s`;
+  element('metrics-observed').textContent=`${r.calls_source==='madm.raw.olos_calls'?'Chamadas: MADM · operação: local':'Snapshot local v1'} · ${date(r.observed_at)} · intervalo de atualização: ${r.cache_seconds ?? 300} s`;
   const gaps=[];
   if(r.summary.undated!=='0')gaps.push(`${count(r.summary.undated)} registros sem data de chamada; fora do gráfico`);
-  if(r.summary.missing_mapping!=='0')gaps.push(`${count(r.summary.missing_mapping)} mappings sem registro local`);
+  if(r.summary.missing_mapping!=='0')gaps.push(`${count(r.summary.missing_mapping)} chamadas sem vínculo de identidade validado`);
   if(r.summary.inconsistent&&r.summary.inconsistent!=='0')gaps.push(`${count(r.summary.inconsistent)} recibos divergentes`);
   element('metrics-error').textContent=gaps.join(' · ');
 }
@@ -269,7 +274,7 @@ export function reportModel(snapshot){
     if(BigInt(part.identified_calls)>BigInt(part.calls)||BigInt(part.operators)>BigInt(part.identified_calls))throw new Error('Identificação inconsistente.');
   }
   if(!['undated','missing_mapping'].every(field=>integer(snapshot.summary[field]))||!integer(snapshot.failed_reads))throw new Error('Integridade indisponível.');
-  const model=chartModel(snapshot.daily,snapshot.from,snapshot.to,snapshot.outbox_available);
+  const model=chartModel(snapshot.daily,snapshot.from,snapshot.to,snapshot.outbox_available,snapshot.snapshot_contract_version===2);
   for(const field of ['calls','identified_calls',...(snapshot.outbox_available?corporate:[])]){
     if(snapshot.daily.reduce((n,row)=>n+BigInt(row[field]),0n)!==BigInt(snapshot.period[field]))throw new Error('Período diverge da série diária.');
   }

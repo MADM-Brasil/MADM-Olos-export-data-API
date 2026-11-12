@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import type { PoolClient } from 'pg';
 import { columns } from './mapping.js';
 import { WorkerError } from './errors.js';
@@ -25,7 +26,16 @@ export async function assertSchema(client: PoolClient, schema: string, table: st
   if (id?.udt_name !== 'int8' || !info.sequence) throw new WorkerError('DESTINATION_ID_GENERATOR_REQUIRED');
   if (!info.constraints.some(c => c.contype === 'p' && c.definition === 'PRIMARY KEY (internal_id_olos)')) throw new WorkerError('DESTINATION_PRIMARY_KEY_REQUIRED');
   // Additional constraints/triggers can require business semantics we do not know. Audit explicitly before adapting.
-  if (info.constraints.some(c => c.contype !== 'p') || !info.metadata || info.metadata.extra_unique || info.metadata.relrowsecurity || info.metadata.triggers !== 0) throw new WorkerError('DESTINATION_CONSTRAINT_REVIEW_REQUIRED');
+  let auditedFence=false;
+  if(info.metadata?.triggers===1&&schema==='raw'&&table==='olos_calls'){
+    const trigger=(await client.query<{definition:string;tgenabled:string;prosrc:string}>(`SELECT pg_get_triggerdef(t.oid) AS definition,t.tgenabled,p.prosrc
+      FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid WHERE t.tgrelid=to_regclass($1) AND NOT t.tgisinternal
+      AND t.tgname='corporate_readoption_local_raw' AND t.tgfoid=to_regprocedure('olos_http.guard_readoption_local_raw()')`,[info.relation])).rows[0];
+    const body=readFileSync(new URL('../migrations/011_corporate_readoption_activation.sql',import.meta.url),'utf8').split('AS $raw$')[1]?.split('$raw$;')[0];
+    auditedFence=!!body&&trigger?.prosrc===body&&trigger.tgenabled==='A'&&trigger.definition===
+      'CREATE TRIGGER corporate_readoption_local_raw BEFORE INSERT OR UPDATE OF internal_id_olos ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION olos_http.guard_readoption_local_raw()';
+  }
+  if (info.constraints.some(c => c.contype !== 'p') || !info.metadata || info.metadata.extra_unique || info.metadata.relrowsecurity || (info.metadata.triggers !== 0&&!auditedFence)) throw new WorkerError('DESTINATION_CONSTRAINT_REVIEW_REQUIRED');
   for (const privilege of ['SELECT', 'INSERT', 'UPDATE']) {
     if (!(await client.query('SELECT has_table_privilege($1,$2) AS ok', [info.relation, privilege])).rows[0].ok) throw new WorkerError('DESTINATION_PRIVILEGE_REQUIRED');
   }

@@ -1,4 +1,5 @@
 import pg from 'pg';
+import type { ReportFormat } from './report-format.js';
 import { AdminReports } from './reports.js';
 import { WorkerError, errorCode, log } from '../errors.js';
 import { assertSchema } from '../schema.js';
@@ -22,7 +23,7 @@ export class AdminRepository implements SchedulerRepository {
   readonly pool: pg.Pool;
   private owner: pg.PoolClient | undefined;
   private alive = false;
-  constructor(private readonly url: string, readonly source: string, private readonly destination = { schema: 'raw', table: 'olos_calls' }) {
+  constructor(private readonly url: string, readonly source: string, private readonly destination = { schema: 'raw', table: 'olos_calls' },private readonly reportFormat?:ReportFormat) {
     this.pool = new pg.Pool({ connectionString: url, max: 4, connectionTimeoutMillis: 10000, statement_timeout: 10000 });
     this.pool.on('error', () => { this.alive = false; });
   }
@@ -189,7 +190,7 @@ export class AdminRepository implements SchedulerRepository {
     if(!this.reportReader){
       this.reportPool=new pg.Pool({connectionString:this.url,max:1,connectionTimeoutMillis:1000,statement_timeout:5000,application_name:'olos-report-reader'});
       this.reportPool.on('error',()=>log('report_reader_connection_lost',{error:'REPORT_UNAVAILABLE'}));
-      this.reportReader=new AdminReports(this.reportPool,this.source,this.destination);
+      this.reportReader=new AdminReports(this.reportPool,this.source,this.destination,undefined,this.reportFormat);
     }
     return this.reportReader;
   }

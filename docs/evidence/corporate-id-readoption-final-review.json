@@ -1,0 +1,352 @@
+{
+  "reviewed_at_utc": "2026-11-11T22:14:12.159745+00:00",
+  "repository": "/home/madm/madm/exportdata-clone/MADM-Olos-export-data-API",
+  "branch": "main",
+  "head_unchanged": "e59a998c2b26783474ff8b4f1c6695877ccfdf47",
+  "previous_evidence": {
+    "file": "docs/evidence/corporate-id-readoption.json",
+    "sha256": "c65754369422d61a20aaeba87f17b7884e552a03f014626dbc424b2c3883c33d",
+    "preserved": true
+  },
+  "verdict": {
+    "controlled_isolated_homologation_ready": true,
+    "real_madm_activation_approved": false,
+    "open_critical_defects_identified": 0,
+    "global_acceptance_complete": false
+  },
+  "actions_not_performed": [
+    "production access",
+    "real MADM migration",
+    "commit",
+    "push",
+    "deploy",
+    "worktree creation",
+    "merge",
+    "cherry-pick",
+    "historical ID remap",
+    "reports changes"
+  ],
+  "findings": [
+    {
+      "id": "R1",
+      "severity": "high",
+      "category": "integrity",
+      "status": "fixed",
+      "description": "Deferred assignment function body from migration 008 was not validated; a no-op body passed preconditions.",
+      "correction": "Pin original assignment guard body before validation/activation.",
+      "regression": "readoption rejects a changed deferred assignment function before authorizing the barrier"
+    },
+    {
+      "id": "R2",
+      "severity": "high",
+      "category": "migration integrity",
+      "status": "fixed",
+      "description": "Migration 011 dropped any CHECK mentioning state, including independent integrity rules.",
+      "correction": "Only reviewed names and exact definitions from 010/011 may be replaced; reject unknown or changed CHECKs atomically.",
+      "regression": "migration 011 refuses an unknown state CHECK without dropping integrity constraints or changing evidence"
+    },
+    {
+      "id": "R3",
+      "severity": "high",
+      "category": "operational procedure",
+      "status": "fixed",
+      "description": "Runbook selected the worker service of the default Compose while the repository Dokploy topology uses admin.",
+      "correction": "Explicit approved admin container ID, running/service-label checks, /app workdir and absolute compiled paths."
+    },
+    {
+      "id": "R4",
+      "severity": "high",
+      "category": "operational procedure",
+      "status": "fixed",
+      "description": "PGDATABASE containing a URI is a literal database name in the reproduced libpq invocation.",
+      "correction": "Explicit --dbname with password-free URI, private PGPASSFILE, secret guard and verified-TLS disposable regression."
+    }
+  ],
+  "checks": {
+    "before_integrity_fixes": {
+      "tests": [
+        100
+      ],
+      "pass": [
+        97
+      ],
+      "fail": [
+        3
+      ],
+      "skipped": [
+        0
+      ]
+    },
+    "directed_after_fixes": {
+      "tests": [
+        101
+      ],
+      "pass": [
+        101
+      ],
+      "fail": [
+        0
+      ],
+      "skipped": [
+        0
+      ],
+      "original_72_retained": true,
+      "new_review_passed_scenarios": [
+        "corporate installation times out atomically behind an existing writer and preserves calls before retry",
+        "migration 011 refuses an unknown state CHECK without dropping integrity constraints or changing evidence",
+        "readoption rejects a changed deferred assignment function before authorizing the barrier"
+      ]
+    },
+    "full_after_fixes": {
+      "tests": [
+        189
+      ],
+      "pass": [
+        181
+      ],
+      "fail": [
+        8
+      ],
+      "skipped": [
+        0
+      ]
+    },
+    "fresh_head_full_baseline": {
+      "tests": [
+        154
+      ],
+      "pass": [
+        146
+      ],
+      "fail": [
+        8
+      ],
+      "skipped": [
+        0
+      ],
+      "head": "e59a998c2b26783474ff8b4f1c6695877ccfdf47",
+      "source_method": "git archive HEAD package.json tsconfig.json tsconfig.build.json src migrations test scripts admin/public admin/migrations streamed directly into a disposable Node container; no new checkout/worktree or production exports; existing node_modules read only; package manifest and lock unchanged versus HEAD",
+      "seven_scenario_signatures_identical": true,
+      "signatures": [
+        {
+          "scenario": "history exige exclusividade com o Admin",
+          "first_exception": "TypeError [Error]: s.assertHistoryReady is not a function"
+        },
+        {
+          "scenario": "history bloqueia estados corporativos inválidos e leituras pendentes",
+          "first_exception": "TypeError [Error]: unauthorized.assertHistoryReady is not a function"
+        },
+        {
+          "scenario": "history falha remota não repete consumo após reinício",
+          "first_exception": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:"
+        },
+        {
+          "scenario": "homologation CLI confirms exactly five, remains paused, never calls OLOS and never drains a second batch",
+          "first_exception": "Error: Command failed: /usr/local/bin/node dist/main.js corporate-homologate --limit 5"
+        },
+        {
+          "scenario": "homologation CLI excludes independent source, Admin and Corporate Sync lock owners",
+          "first_exception": "AssertionError [ERR_ASSERTION]: The validation function is expected to return \"true\". Received false"
+        },
+        {
+          "scenario": "homologation holds pause against concurrent resume, blocks another CLI and permits only one attempt per instance",
+          "first_exception": "AssertionError [ERR_ASSERTION]: The validation function is expected to return \"true\". Received false"
+        },
+        {
+          "scenario": "homologation without authorization, without pause or with a structural conflict fails closed",
+          "first_exception": "AssertionError [ERR_ASSERTION]: The validation function is expected to return \"true\". Received false"
+        }
+      ]
+    },
+    "global_typecheck": {
+      "passed": false,
+      "diagnostics": 17,
+      "byte_identical_to_fresh_head_baseline": true,
+      "diagnostic_lines": [
+        "test/corporate-delivery.integration.ts(192,38): error TS2353: Object literal may only specify known properties, and 'historyCaptureAuthorized' does not exist in type '{ corporateDelivery: DeliveryConfig | undefined; databaseUrl: string; baseUrl: string; username: string; password: string; clientId: string; clientSecret: string; tlsVerify: boolean; ... 12 more ...; maxFailures: number; }'.",
+        "test/corporate-delivery.integration.ts(196,13): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(203,17): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(204,17): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(252,24): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(259,38): error TS2353: Object literal may only specify known properties, and 'historyCaptureAuthorized' does not exist in type '{ corporateDelivery: DeliveryConfig | undefined; databaseUrl: string; baseUrl: string; username: string; password: string; clientId: string; clientSecret: string; tlsVerify: boolean; ... 12 more ...; maxFailures: number; }'.",
+        "test/corporate-delivery.integration.ts(262,17): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(271,13): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(281,17): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(287,13): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(295,13): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(303,13): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(311,45): error TS2322: Type '\"history\"' is not assignable to type '\"current\" | \"previous\" | \"reread\"'.",
+        "test/corporate-delivery.integration.ts(314,13): error TS2339: Property 'assertHistoryReady' does not exist on type 'Store'.",
+        "test/corporate-delivery.integration.ts(398,26): error TS2322: Type '\"history\"' is not assignable to type '\"current\" | \"previous\" | \"reread\"'.",
+        "test/corporate-delivery.integration.ts(410,26): error TS2322: Type '\"history\"' is not assignable to type '\"current\" | \"previous\" | \"reread\"'.",
+        "test/corporate-delivery.integration.ts(427,26): error TS2322: Type '\"history\"' is not assignable to type '\"current\" | \"previous\" | \"reread\"'."
+      ]
+    },
+    "unit": {
+      "tests": [
+        142
+      ],
+      "pass": [
+        142
+      ],
+      "fail": [
+        0
+      ],
+      "skipped": [
+        0
+      ]
+    },
+    "strict_production_build": {
+      "passed": true,
+      "command": "npm run build",
+      "host_node": "24.16.0"
+    },
+    "image_build": {
+      "passed": true,
+      "command": "docker build -t olos-readoption-review:local .",
+      "image": {
+        "image": "olos-readoption-review:local",
+        "node": "v24.22.1",
+        "uid": 1000,
+        "workdir": "/app",
+        "compiled_entrypoints": true,
+        "migrations_match_source": true,
+        "administrative_commands": 7,
+        "network": "none",
+        "production_access": false,
+        "image_id": "sha256:2ccbb9b156bf0f775a2ad392d5ed4ea209247b9eb7493a7a4fcd010736279209"
+      }
+    },
+    "runbook": {
+      "bash_blocks_parsed": 16,
+      "bash_parse_passed": true,
+      "all_mutating_cli_names_exist_in_dispatcher": true,
+      "uri_guard_cases_passed": [
+        "password-free URI",
+        "reject embedded password",
+        "reject query-string password"
+      ],
+      "explicit_dbname_tls_probe_passed": true,
+      "dokploy_source_checked": "compose.dokploy.yaml",
+      "actual_dokploy_deployment_inspected": false,
+      "compiled_dispatcher_command_check": {
+        "runbook_commands_verified": 13,
+        "commands": [
+          "corporate-abort-id-readoption",
+          "corporate-activate-id-readoption",
+          "corporate-id-readoption-evidence",
+          "corporate-id-readoption-status",
+          "corporate-pause",
+          "corporate-prepare-id-readoption",
+          "corporate-quarantine-collisions",
+          "corporate-reconcile-id-readoption",
+          "corporate-recover-collision",
+          "corporate-resume",
+          "corporate-status",
+          "corporate-validate-id-readoption",
+          "corporate-verify-pending"
+        ]
+      }
+    },
+    "corporate_install_lock_timeout": {
+      "passed": true,
+      "scenario": "corporate installation times out atomically behind an existing writer and preserves calls before retry",
+      "expected_sqlstate": "55P03",
+      "configured_lock_timeout_seconds": 5,
+      "assertions": [
+        "no partial allocator schema",
+        "existing calls unchanged",
+        "retry after writer unlock preserves calls and bootstraps registry"
+      ]
+    },
+    "protected_reports_unchanged": true,
+    "git_diff_check_passed": true
+  },
+  "approved_invariants": [
+    "Transactional authority barrier fences old READ COMMITTED and REPEATABLE READ writers.",
+    "Post-barrier compatible capture persists durable admissions and never falls back to the local sequence.",
+    "Corporate ID/token reservations are unique and recovered using original operation/source identities.",
+    "Historical IDs, frozen payloads, hashes, outbox, quarantines and receipts remain preserved.",
+    "Unknown commits and remote outages keep durable evidence and recover forward without another UUID.",
+    "Schema/authority incompatibility blocks progress; quarantine remains a separate authorized selective operation."
+  ],
+  "conditions_blocking_real_activation": [
+    "DBA approval of corporate 001, exact real schema/version/function ownership and role privileges; no unknown partial namespace.",
+    "Inventory and homologation of every corporate writer, including independent generators, UPSERT/COPY/functions/replication; free-ID writes can work while reserved/used-ID attempts reject.",
+    "Approved bootstrap lock window and capacity assessment for actual history, registry indexes, WAL, int32 and durable admissions storage.",
+    "Approved Dokploy admin image/container, bindings, CA/TLS mounts, secret-file handling and connectivity from the actual psql execution environment.",
+    "Previous validated completed reversion and intact quarantine, protected new generation, reviewed digest and explicit barrier/activation authorization.",
+    "Full batch registration, persisted active evidence, remaining-pending verification and separate delivery recovery/resume authorization.",
+    "Resolution of prior global test/typecheck acceptance failures to meet the complete PRD."
+  ],
+  "limits": [
+    "No real production, WAN, OLOS retention or multi-million-row benchmark executed.",
+    "Synthetic tests do not homologate external writers or real Dokploy/DBA grants.",
+    "Owner/superuser can deliberately bypass database guards; actual roles require DBA review.",
+    "Old rejected nextval attempts can burn sequence values without creating persisted assignments.",
+    "After the barrier, only forward recovery with the same generation and a compatible binary is supported.",
+    "No new report/ingestion features, scheduler or second worker introduced."
+  ],
+  "artifact_sha256": {
+    "migrations/010_corporate_allocator_readoption.sql": "84b22c9069da8055f2919e9850d1e7181997ee5b9bda49a41ab3612d58815dd6",
+    "migrations/011_corporate_readoption_activation.sql": "b6aa847825a1046ea07bbd1cfcdffee9ca1df9c396c7b1fb2c17dc5f9c84df44",
+    "migrations/corporate/001_id_allocator.sql": "8db88f92323d4d1bc2693cba080046b02f03d7ecc5330b68aaf4e4ae399ea321",
+    "src/corporate-delivery/allocator.ts": "829ad7264843d1457a5472040b6cddd2bbd40e60d54470918273fd6631d907ec",
+    "src/corporate-delivery/allocator-contract.ts": "34dd8c10f293e7b730cf4e7b55bd80c429f28d1c6a3bee88dcaab105c5905216",
+    "src/corporate-delivery/delivery.ts": "e6b244a048f72b2c6c9c04fd3cdbaa15feb6242e37a8db01c2457683ae1c5eb6",
+    "src/corporate-delivery/legacy-sequence.ts": "64cf82c891151d5a78ce0d7132f3ae3da9837a2761bd352db475613916dfed9b",
+    "src/corporate-delivery/recovery.ts": "6dbbbc4a5874c0ee5f82409bae378941a610bc3c2aeb32e2ce0ca2a3cdc271f3",
+    "src/corporate-delivery/commands.ts": "33915b2dffba50b0f7ffc3e7aa15eacc6a830ebae6029a9f577895afcf798722",
+    "src/corporate-delivery/readoption.ts": "6da867a8093c467d6add6d57a33f4d75bc6024373802636086880e4486aea4cd",
+    "src/corporate-delivery/readoption-contract.ts": "59469a0ea92e8581287ea16165d29074eceb0e149a09ce8f2e26ec0b48ae149d",
+    "src/corporate-delivery/readoption-proof.ts": "27c00dec6a7303d568d1d8862e344d897b56a4bfade194551db935fd45589797",
+    "src/corporate-delivery/readoption-activation.ts": "40685e66c1dc1cdf5d3fb7ebc3a8c809238913debba937898fdf1c8ba5bd724d",
+    "src/corporate-delivery/readoption-command.ts": "e98814c36d6fe828633e443a530cc12f6d83893151cfeb291886b7029a7adb65",
+    "src/schema.ts": "324241791c982fee1c219d23d136e612e78084c76784afe31a53d4d8a80d0840",
+    "src/main.ts": "a51d065f5464070fb8aab9796231f227564c48be7ec6100f003b292c996c00fe",
+    "test/corporate-recovery.integration.ts": "978178c2331da09f9ddc0c7c810247b137db14c2cd81272b32b160c702c657cc",
+    "test/readoption-contract.test.ts": "3fc6af22107249da12936f8a99ea3bd4af72240a55894b0c3b0e54492f0782f3",
+    "docs/corporate-delivery/README.md": "6be5fe0816c6fb3fe76f173e921e735ca21e51da211df0c41d0e68bc0dd335c1",
+    "docs/corporate-delivery/id-allocator-readoption.md": "f742e075c44b37ec3b75da5551f4583637bb00a6f1d7545e49d33ac1cafa6064",
+    "docs/corporate-delivery/id-allocator-readoption-runbook.md": "55edee0bd6f582c47b9d6ad8c66d02cee37164c3c856f7fb6acab52cb824d74f",
+    "scripts/test-corporate-delivery.sh": "6070fd4658c35bf115081dd0185ed3b1ba640a25d3d789690bfe061fd482f0ae",
+    "docs/corporate-delivery/id-allocator-final-review.md": "8525f6de4339db6b588ff2249b4706783138ce79a0770192afe34319e7691a2f"
+  },
+  "protected_reports_sha256": {
+    "src/admin/corporate-reports.ts": "e21b391f2792f88713cd0404878350365bc16ac432f92a91249d878a20ec1b9d",
+    "src/admin/report-runtime.ts": "de8bf1b0f676c85ef81ca92619b3e7a022e7ff7133ffc7ed0853abc41ab2cb45",
+    "src/admin/report-format.ts": "069163089954026973ac8a6b3ba832967459fab3d41dc7a0347aa9e5ea6a3bec",
+    "src/admin/report-updater.ts": "2b9fdfd00f02be4c5daf18ec33fd64a08e03e09a3f573872b1204f07eacec6c6",
+    "src/admin/reports.ts": "46950df079732f0d2f6e1fc0669bebc538e21785a8bda9b244089832458c9270",
+    "src/admin/repository.ts": "685febbf8375766d273756f7df6b499bee0bd746623629d767d070cd250c2116",
+    "src/admin/main.ts": "24f799fbc482ee40fdda4e8294553915bf83189d41f51e2df42e4e4acd595848",
+    "admin/public/app.js": "b2662fa7e4c9669411765fcb7e465a7bd51436ff60df3e5172da5f2b066b4f3b",
+    "admin/public/app.js.bak-20261028-161111": "d2391a3aaea53bcccf617c185c8d1ac267a0604aac8d874653c74eb743aaf5da",
+    "admin/public/dashboard.js": "84f50f8567403cf43cb8dec8301bb9df125135f07f0f3e2b540ae4f2bcc29cc5",
+    "admin/public/index.html": "4e6c0beec889b2200ca6344cb20d86f31919e30c55ee147636537dd09fa920e4",
+    "admin/public/style.css": "9e5455582a1694424078ca0ddec8d42478e88fcb8d009fb6bce94524cc0e4caf",
+    "admin/public/style.css.bak-20261028-165222": "6d257ba19709e9bfc59f88564f8a3dc220ca004783413b5b6ec75698e7ef3502",
+    "admin/public/ui.js": "e0200631051feb5175da942a894eb049c8784d8dc9bac28ad4213f01a10d97e9"
+  },
+  "execution_log_sha256": {
+    "fresh_head_baseline": "e0d8533afe1237986530951662c5875d401a13d6f55d16336be674faadf840c9",
+    "baseline_typecheck": "2ca435309351e3a86f01e1a684e1561957008a538af294a15974dd850330f8d6",
+    "before_fixes": "cf2a972a192992a61b200f592e6f62ec710b9f821eba5995da8a527806723379",
+    "directed": "8273a2623313dfce6682afebb71c3eacc90da2de68142224a2ad675fdb510303",
+    "full_integration": "0b7238c38d1004c6693688cac0a285e47c38a14a07c9903be9f177919fd9fa06",
+    "unit": "3e00610ac53368fd9fcee016693b974385920b0a100fcb73c25fb2a44e292859",
+    "typecheck": "2ca435309351e3a86f01e1a684e1561957008a538af294a15974dd850330f8d6",
+    "build": "755e9e18fc6af7308a2926c617700d5b8a53ac03b5248e905d04a126b6e1ed90",
+    "image_build": "518560bec23ba98d7365b0026d8944951864b211c941a4268f4ce098ecdfb93d",
+    "image_check": "77a9dcc35f95033dac4015b04ccea82a5aeabe97494dc65eda920029b2b3a375",
+    "old_pgdatabase_invocation": "95c673daf77d7b7010014152936612456f24a566f7f5c5788a8a9bd8d4c94a76",
+    "explicit_dbname_invocation": "5784b2eeb24f1d25d248a309570be227efacd4bfcb097e2ccd596037a37416c9",
+    "runbook_compiled_commands": "aaaf80a0dad2847623097748ac5541c8c9a55d497fe5b30ddce08fb73c98768c"
+  },
+  "public_primary_references": [
+    "https://www.postgresql.org/docs/16/libpq-connect.html",
+    "https://www.postgresql.org/docs/16/libpq-envars.html",
+    "https://www.postgresql.org/docs/16/explicit-locking.html",
+    "https://www.postgresql.org/docs/16/sql-altertable.html"
+  ]
+}

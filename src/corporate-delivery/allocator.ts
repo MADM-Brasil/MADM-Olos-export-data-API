@@ -12,17 +12,32 @@ export interface IdAssignment { id: string; token: string | null }
 export function admissionHash(mapped: MappedRecord): string {
   return createHash('sha256').update(JSON.stringify(Object.keys(mapped).sort().map(key => [key, mapped[key as keyof MappedRecord]]))).digest('hex');
 }
+export interface AllocatorStatus {
+ state:'adopting'|'active'|'reverting'|'legacy';request_id:string;binding:string;target_table:string;contract_hash:string|null;adopted_at:Date|null;
+ reversion_request_id?:string;reversion_validated?:boolean;generation_request_id?:string;expected_contract_hash?:string;
+}
 export async function allocatorState(local: PoolClient, cfg: DeliveryConfig, source: string, target: string, fence = true) {
   if (fence) await local.query('SELECT pg_advisory_xact_lock_shared(17320914,5)');
-  const required = (await local.query("SELECT (to_jsonb(c)->>'id_allocator_required')::boolean AS required FROM olos_http.corporate_control c WHERE singleton")).rows[0]?.required;
+  const authority=(await local.query<{required:boolean|null;generation:string|null}>("SELECT (to_jsonb(c)->>'id_allocator_required')::boolean AS required,to_jsonb(c)->>'id_allocator_generation' AS generation FROM olos_http.corporate_control c WHERE singleton")).rows[0];
+  const required=authority?.required;
   if (!(await local.query("SELECT to_regclass('olos_http.corporate_id_allocator') IS NOT NULL AS present")).rows[0].present) {
     if (required) throw new SyncError('ALLOCATOR_LOCAL_STATE_MISSING');
     return undefined;
   }
   // Adoption and reversion drain in-flight admissions before switching mode.
-  const state = (await local.query('SELECT * FROM olos_http.corporate_id_allocator WHERE source_key=$1', [source])).rows[0];
+  const state = (await local.query<AllocatorStatus>('SELECT * FROM olos_http.corporate_id_allocator WHERE source_key=$1', [source])).rows[0];
   if (required && !state) throw new SyncError('ALLOCATOR_LOCAL_STATE_MISSING');
   if (state && (state.binding !== cfg.binding || state.target_table !== target)) throw new SyncError('CORPORATE_BINDING_CHANGED');
+  if(authority?.generation){
+    const generation=(await local.query<{request_id:string;state:string;binding:string;target_table:string;previous_adoption_id:string;remote_contract_hash:string;validation_digest:string|null}>(
+      'SELECT request_id,state,binding,target_table,previous_adoption_id,remote_contract_hash,validation_digest FROM olos_http.corporate_allocator_readoptions WHERE request_id=$1 AND source_key=$2',[authority.generation,source])).rows[0];
+    if(!required||!state||!generation||!generation.validation_digest||generation.binding!==cfg.binding||generation.target_table!==target
+      ||generation.previous_adoption_id!==state.request_id||!['activating','active'].includes(generation.state)
+      ||(generation.state==='activating'&&(state.contract_hash!==null||state.adopted_at!==null))
+      ||state.state!==(generation.state==='active'?'active':'adopting')||(generation.state==='active'&&state.contract_hash!==generation.remote_contract_hash))throw new SyncError('READOPTION_AUTHORITY_EVIDENCE_CHANGED');
+    state.generation_request_id=generation.request_id;state.expected_contract_hash=generation.remote_contract_hash;
+    return state;
+  }
   if (state && ['reverting','legacy'].includes(state.state)) {
     const proof = (await local.query(`SELECT request_id,state,adoption_request_id,binding,target_table,validated_at
       FROM olos_http.corporate_id_reversions WHERE source_key=$1`, [source])).rows[0];
@@ -58,7 +73,9 @@ export async function reserveIds(remote: Client, cfg: DeliveryConfig, items: Rec
     return items.map(item => {
       const row = bySource.get(item.source_id);
       if (!row || row.reserved_source_hash !== item.source_hash) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
-      return { id: integerValue(row.id, 32), token: row.token as string | null };
+      const id=integerValue(row.id,32),token:unknown=row.token;
+      if((!legacy&&(BigInt(id)<1n||token===null))||(token!==null&&(typeof token!=='string'||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(token))))throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
+      return {id,token:token as string|null};
     });
   } catch (error) { throw allocatorError(error); }
 }
@@ -86,6 +103,7 @@ export async function adoptAllocator(local: PoolClient, cfg: DeliveryConfig, sou
     const control = (await local.query('SELECT * FROM olos_http.corporate_control WHERE singleton FOR UPDATE')).rows[0];
     if (!control?.ready || control.source_key !== source || control.target_table !== target || control.binding !== cfg.binding) throw new SyncError('CORPORATE_BINDING_CHANGED');
     const previous = (await local.query('SELECT * FROM olos_http.corporate_id_allocator WHERE source_key=$1', [source])).rows[0];
+    if (control.id_allocator_generation) throw new SyncError('ALLOCATOR_ADOPTION_REVERTED');
     if (previous && (previous.request_id !== request.requestId || previous.evidence_ref !== request.evidence || previous.binding !== cfg.binding || previous.target_table !== target)) throw new SyncError('ALLOCATOR_ADOPTION_REQUEST_REUSED');
     if (previous && ['reverting','legacy'].includes(previous.state)) throw new SyncError('ALLOCATOR_ADOPTION_REVERTED');
     if (previous?.state === 'active') { await local.query('ROLLBACK'); return; }

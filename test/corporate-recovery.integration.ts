@@ -1,4 +1,12 @@
 import test from 'node:test';
+import {createServer} from 'node:http';
+import {once} from 'node:events';
+import {HttpTransport} from '../src/http.js';
+import {OlosAuthManager} from '../src/auth.js';
+import {OlosApi} from '../src/api.js';
+import {StaticCache} from '../src/cache.js';
+import {Worker} from '../src/worker.js';
+import {CorporateDelivery} from '../src/corporate-delivery/delivery.js';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -15,6 +23,9 @@ import { adoptAllocator, adoptionRequest, reserveIds } from '../src/corporate-de
 import { legacyReversionRequest, revertAllocator, type ReversionHooks } from '../src/corporate-delivery/legacy-recovery.js';
 import { lockLegacyIdSpace, nextLegacyId } from '../src/corporate-delivery/legacy-sequence.js';
 import { allocatorContract } from '../src/corporate-delivery/allocator-contract.js';
+import { validateReadoption,activateReadoption,readoptionStatus,abortReadoption } from '../src/corporate-delivery/readoption-activation.js';
+import type { ReadoptionRequest,ReadoptionActivation,ReadoptionHooks } from '../src/corporate-delivery/readoption-contract.js';
+import { prepareCorporateReadoption } from '../src/corporate-delivery/readoption.js';
 import { fixture, row as corporateRow } from './corporate-sync.fixture.js';
 
 const enabled = process.env.OLOS_DIRECT_DISPOSABLE_TEST === 'true';
@@ -90,7 +101,7 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
     return payload;
   }
   const allocationAuthorization = { OLOS_CORPORATE_ID_ALLOCATOR_CONFIRMATION: 'AUTHORIZE_CORPORATE_ID_ALLOCATOR' };
-  const allocationArgs = (request = randomUUID()) => ['--confirm-source', source, '--request-id', request, '--evidence', 'INC-ALLOCATOR'];
+  const allocationArgs = (request:string = randomUUID()) => ['--confirm-source', source, '--request-id', request, '--evidence', 'INC-ALLOCATOR'];
   const adopt = (input: string[], hooks = {}) => client(db => adoptAllocator(db, dc, source, target, adoptionRequest(input, allocationAuthorization, source), hooks));
   const allocatorMigration = async () => local.query(await readFile(new URL('../migrations/008_corporate_id_allocator.sql', import.meta.url), 'utf8'));
   const remoteAllocatorMigration = async () => remote.query(await readFile(new URL('../migrations/corporate/001_id_allocator.sql', import.meta.url), 'utf8'));
@@ -442,6 +453,477 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       const oldState = await assignments(); await adopt(input); assert.deepEqual(await assignments(), oldState);
       await assert.rejects(adopt(allocationArgs()), /REQUEST_REUSED/);
     });
+    await t.test('migration 010 registra readoção sem alterar a reversão', async () => {
+      await reset(0);
+
+      const adoption = await prepare();
+      await reversalMigration();
+      await revert(reversionArgs(adoption));
+
+      const previous = (await reversionRuns())[0]!;
+      const before = await snapshot();
+
+      const migration = await readFile(
+        new URL('../migrations/010_corporate_allocator_readoption.sql', import.meta.url),
+        'utf8'
+      );
+
+      await local.query(migration);
+
+      const requestId = randomUUID();
+
+      const insert = async (
+        id: string,
+        state: string,
+        validatedAt: string | null = null,
+        digest: string | null = null
+      ): Promise<void> => {
+        await local.query(
+          `INSERT INTO olos_http.corporate_allocator_readoptions
+           (request_id, source_key, previous_reversion_id,
+            binding, target_table, evidence_ref,
+            state, validated_at, validation_digest)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [
+            id, source, previous.request_id, dc.binding,
+            target, 'TEST-READOPTION', state, validatedAt, digest
+          ]
+        );
+      };
+
+      await insert(requestId, 'prepared');
+
+      await assert.rejects(
+        insert(randomUUID(), 'prepared'),
+        { code: '23505' }
+      );
+
+      await assert.rejects(
+        insert(randomUUID(), 'ready'),
+        { code: '23514' }
+      );
+
+      await local.query(
+        `UPDATE olos_http.corporate_allocator_readoptions
+         SET state='ready',
+             validated_at=clock_timestamp(),
+             validation_digest=$2
+         WHERE request_id=$1`,
+        [requestId, 'a'.repeat(64)]
+      );
+
+      const result = await local.query(
+        `SELECT state, validation_digest
+         FROM olos_http.corporate_allocator_readoptions
+         WHERE request_id=$1`,
+        [requestId]
+      );
+
+      assert.equal(result.rows[0]!.state, 'ready');
+      assert.equal(result.rows[0]!.validation_digest, 'a'.repeat(64));
+
+      assert.deepEqual(await snapshot(), before);
+      assert.equal((await reversionRuns())[0]!.state, 'completed');
+    });
+
+    await t.test('preparacao rejeita estados operacionais inseguros', async () => {
+      await reset(0);
+
+      const adoption = await prepare();
+      await reversalMigration();
+      await revert(reversionArgs(adoption));
+
+      const migration = await readFile(
+        new URL('../migrations/010_corporate_allocator_readoption.sql', import.meta.url),
+        'utf8'
+      );
+      await local.query(migration);
+
+      const request = {
+        source,
+        requestId: randomUUID(),
+        evidence: 'TEST-STATE-GUARD'
+      } as const;
+
+      const execute = () => client(db =>
+        prepareCorporateReadoption(db, request, dc.binding, target, dc)
+      );
+
+      await assert.rejects(
+        execute,
+        /READOPTION_REVERSAL_UNVERIFIED/
+      );
+
+      await local.query(
+        `UPDATE olos_http.corporate_id_reversions
+         SET validated_at=clock_timestamp(),
+             validation_digest=$1
+         WHERE source_key=$2`,
+        ['a'.repeat(64), source]
+      );
+
+      await local.query(
+        `UPDATE olos_http.corporate_control
+         SET paused=false WHERE singleton`
+      );
+
+      await assert.rejects(
+        execute,
+        /READOPTION_CONTROL_INVALID/
+      );
+
+      await local.query(
+        `UPDATE olos_http.corporate_control
+         SET paused=true WHERE singleton`
+      );
+
+      await assert.rejects(
+        () => client(db => prepareCorporateReadoption(
+          db,
+          { ...request, requestId: 'invalid-uuid' },
+          dc.binding,
+          target, dc
+        )),
+        /READOPTION_REQUEST_INVALID/
+      );
+
+      const result = await local.query(
+        `SELECT count(*)::integer AS total
+         FROM olos_http.corporate_allocator_readoptions`
+      );
+
+      assert.equal(result.rows[0]!.total, 0);
+      assert.equal(
+        (await local.query(
+          `SELECT state
+           FROM olos_http.corporate_id_allocator
+           WHERE source_key=$1`,
+          [source]
+        )).rows[0]!.state,
+        'legacy'
+      );
+    });
+
+    await t.test('readoção rejeita quarentena adulterada sem persistir solicitação', async () => {
+      await reset(2);
+      await insertRemote(0, { telefone: 'legacy-collision' });
+      await quarantine(args((await verify()).verification_digest));
+
+      const adoption = await prepare();
+      await reversalMigration();
+      await revert(reversionArgs(adoption));
+
+      const verification = await verify();
+      assert.equal(verification.issues.length, 0);
+      await recover(args(verification.verification_digest));
+
+      const migration = await readFile(
+        new URL('../migrations/010_corporate_allocator_readoption.sql', import.meta.url),
+        'utf8'
+      );
+      await local.query(migration);
+
+      const original = await local.query(
+        `SELECT payload_hash
+         FROM olos_http.corporate_outbox
+         WHERE source_key=$1 AND target_id=1`,
+        [source]
+      );
+
+      assert.equal(original.rowCount, 1);
+
+      // Alteração exclusivamente no PostgreSQL descartável.
+      await local.query(
+        `UPDATE olos_http.corporate_outbox
+         SET payload_hash=$1
+         WHERE source_key=$2 AND target_id=1`,
+        ['f'.repeat(64), source]
+      );
+
+      try {
+        await assert.rejects(
+          () => client(db => prepareCorporateReadoption(
+            db,
+            {
+              source,
+              requestId: randomUUID(),
+              evidence: 'TEST-TAMPERED-QUARANTINE'
+            },
+            dc.binding,
+            target,
+            dc
+          )),
+          /CORPORATE_QUARANTINE_CHANGED/
+        );
+
+        const count = await local.query<{ total: number }>(
+          `SELECT count(*)::integer AS total
+           FROM olos_http.corporate_allocator_readoptions`
+        );
+
+        assert.equal(count.rows[0]!.total, 0);
+      } finally {
+        await local.query(
+          `UPDATE olos_http.corporate_outbox
+           SET payload_hash=$1
+           WHERE source_key=$2 AND target_id=1`,
+          [original.rows[0]!.payload_hash, source]
+        );
+      }
+    });
+
+    await t.test('COMMIT incerto recupera a mesma solicitação sem duplicar', async () => {
+      await reset(0);
+
+      const adoption = await prepare();
+      await reversalMigration();
+      await revert(reversionArgs(adoption));
+
+      const verification = await verify();
+      assert.equal(verification.issues.length, 0);
+      await recover(args(verification.verification_digest));
+
+      const migration = await readFile(
+        new URL('../migrations/010_corporate_allocator_readoption.sql', import.meta.url),
+        'utf8'
+      );
+      await local.query(migration);
+
+      const request = {
+        source,
+        requestId: randomUUID(),
+        evidence: 'TEST-COMMIT-UNKNOWN'
+      } as const;
+
+      await assert.rejects(
+        () => client(async db => {
+          const uncertain = new Proxy(db, {
+            get(target, key, receiver) {
+              if (key === 'query') {
+                return async (
+                  sql: string,
+                  params?: unknown[]
+                ) => {
+                  const result = await target.query(sql, params);
+
+                  if (sql === 'COMMIT') {
+                    throw new Error('synthetic lost acknowledgement');
+                  }
+
+                  return result;
+                };
+              }
+
+              return Reflect.get(target, key, receiver);
+            }
+          });
+
+          return prepareCorporateReadoption(
+            uncertain,
+            request,
+            dc.binding,
+            target,
+            dc
+          );
+        }),
+        /READOPTION_COMMIT_UNKNOWN/
+      );
+
+      const saved = await local.query<{
+        request_id: string;
+        state: string;
+      }>(
+        `SELECT request_id, state
+         FROM olos_http.corporate_allocator_readoptions
+         WHERE source_key=$1`,
+        [source]
+      );
+
+      assert.equal(saved.rowCount, 1);
+      assert.equal(saved.rows[0]!.request_id, request.requestId);
+      assert.equal(saved.rows[0]!.state, 'prepared');
+
+      const recovered = await client(db =>
+        prepareCorporateReadoption(
+          db,
+          request,
+          dc.binding,
+          target,
+          dc
+        )
+      );
+
+      assert.deepEqual(recovered, {
+        requestId: request.requestId,
+        alreadyApplied: true
+      });
+
+      const count = await local.query<{ total: number }>(
+        `SELECT count(*)::integer AS total
+         FROM olos_http.corporate_allocator_readoptions
+         WHERE source_key=$1`,
+        [source]
+      );
+
+      assert.equal(count.rows[0]!.total, 1);
+    });
+
+    await t.test('preparacao de readoção é idempotente e preserva a reversão', async () => {
+      await reset(2);
+      await insertRemote(0, { telefone: 'legacy-collision' });
+      await quarantine(args((await verify()).verification_digest));
+
+      const adoption = await prepare();
+      await reversalMigration();
+      await revert(reversionArgs(adoption));
+
+      const verification = await verify();
+      assert.equal(verification.issues.length, 0);
+      await recover(args(verification.verification_digest));
+
+      const migration = await readFile(
+        new URL('../migrations/010_corporate_allocator_readoption.sql', import.meta.url),
+        'utf8'
+      );
+      await local.query(migration);
+
+      const beforeEntries = await entries();
+      const beforeQuarantine = await quarantineRows();
+      const beforeReversions = await reversionRuns();
+
+      const request = {
+        source,
+        requestId: randomUUID(),
+        evidence: 'TEST-READOPTION'
+      } as const;
+
+      const first = await client(db =>
+        prepareCorporateReadoption(db, request, dc.binding, target, dc)
+      );
+
+      assert.deepEqual(first, {
+        requestId: request.requestId,
+        alreadyApplied: false
+      });
+
+      // A different session holds the exclusive homologation lock.
+      // Preparation must fail without altering the persisted request.
+      await local.query(
+        'SELECT pg_advisory_lock(17320914,4)'
+      );
+
+      try {
+        await assert.rejects(
+          () => client(db =>
+            prepareCorporateReadoption(db, request, dc.binding, target, dc)
+          ),
+          /READOPTION_HOMOLOGATION_ACTIVE/
+        );
+      } finally {
+        await local.query(
+          'SELECT pg_advisory_unlock(17320914,4)'
+        );
+      }
+
+      const repeated = await client(db =>
+        prepareCorporateReadoption(db, request, dc.binding, target, dc)
+      );
+
+      assert.deepEqual(repeated, {
+        requestId: request.requestId,
+        alreadyApplied: true
+      });
+
+      await assert.rejects(
+        () => client(db =>
+          prepareCorporateReadoption(
+            db,
+            { ...request, requestId: randomUUID() },
+            dc.binding,
+            target, dc
+          )
+        ),
+        /READOPTION_REQUEST_CONFLICT/
+      );
+
+      const saved = await local.query(
+        `SELECT request_id, state, previous_reversion_id
+         FROM olos_http.corporate_allocator_readoptions
+         WHERE source_key=$1`,
+        [source]
+      );
+
+      assert.equal(saved.rowCount, 1);
+      assert.equal(saved.rows[0]!.request_id, request.requestId);
+      assert.equal(saved.rows[0]!.state, 'prepared');
+      assert.equal(
+        saved.rows[0]!.previous_reversion_id,
+        beforeReversions[0]!.request_id
+      );
+
+      assert.deepEqual(await entries(), beforeEntries);
+      assert.deepEqual(await quarantineRows(), beforeQuarantine);
+      assert.deepEqual(await reversionRuns(), beforeReversions);
+
+      const allocator = await local.query(
+        `SELECT state FROM olos_http.corporate_id_allocator
+         WHERE source_key=$1`,
+        [source]
+      );
+      assert.equal(allocator.rows[0]!.state, 'legacy');
+    });
+
+    await t.test('reativacao apos reversao permanece bloqueada sem nova transicao', async () => {
+      await reset(2);
+      await insertRemote(0, { telefone: 'legacy-collision' });
+      await quarantine(args((await verify()).verification_digest));
+
+      const original = await prepare();
+      await reversalMigration();
+      await revert(reversionArgs(original));
+
+      const beforeEntries = await entries();
+      const beforeAssignments = await assignments();
+      const beforeQuarantine = await quarantineRows();
+
+      const previous = (
+        await local.query(
+          'SELECT state, request_id FROM olos_http.corporate_id_allocator'
+        )
+      ).rows[0];
+
+      assert.equal(previous.state, 'legacy');
+
+      await remoteAllocatorMigration();
+
+      const next = allocationArgs();
+
+      await assert.rejects(
+        corporateControl(
+          cfg,
+          'corporate-prepare-id-allocator',
+          next,
+          allocationAuthorization
+        ),
+        /ALLOCATOR_ADOPTION_REQUEST_REUSED/
+      );
+
+      const current = (
+        await local.query(
+          'SELECT state, request_id FROM olos_http.corporate_id_allocator'
+        )
+      ).rows[0];
+
+      assert.deepEqual(current, previous);
+      assert.deepEqual(await entries(), beforeEntries);
+      assert.deepEqual(await assignments(), beforeAssignments);
+      assert.deepEqual(await quarantineRows(), beforeQuarantine);
+
+      const reversions = await reversionRuns();
+      assert.equal(reversions.length, 1);
+      assert.equal(reversions[0].state, 'completed');
+    });
+
     await t.test('MADM outage leaves durable captures without IDs and later materializes them once', async () => {
       await reset(0); await enableAllocator(); const saved = dc.connection.destinationUrl;
       dc.connection.destinationUrl = 'postgresql://postgres@localhost:1/madm';
@@ -879,6 +1361,398 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       await local.query('ALTER TABLE olos_http.records DROP CONSTRAINT records_target_table_target_id_key');
       const data=await admissions();await assert.rejects(revert(reversionArgs(adoption)),/LEGACY_SEQUENCE_UNSAFE/);
       assert.deepEqual(await admissions(),data);assert.equal((await reversionRuns()).length,0);
+    });
+    const activationMigration=async()=>local.query(await readFile(new URL('../migrations/011_corporate_readoption_activation.sql',import.meta.url),'utf8'));
+    async function reprepare(n=3,collision=true,backlog=true):Promise<{request:ReadoptionRequest;original:string;reversion:string}> {
+      await reset(n);
+      if(collision&&n){await insertRemote(0,{telefone:'foreign-collision'});await quarantine(args((await verify()).verification_digest));}
+      const first=await prepare();if(backlog)await stage(8990);
+      await reversalMigration();const reverse=reversionArgs(first);await revert(reverse);
+      await recover(args((await verify()).verification_digest));
+      await local.query(await readFile(new URL('../migrations/010_corporate_allocator_readoption.sql',import.meta.url),'utf8'));
+      await activationMigration();
+      const request={source,requestId:randomUUID(),evidence:'INC-READOPTION-ACTIVATION'};
+      await client(db=>prepareCorporateReadoption(db,request,dc.binding,target,dc));
+      return {request,original:first[3]!,reversion:reverse[5]!};
+    }
+    const validateReado=(request:ReadoptionRequest,hooks:ReadoptionHooks={})=>client(db=>validateReadoption(db,dc,target,request,hooks));
+    const activateReado=(request:ReadoptionActivation,hooks:ReadoptionHooks={})=>client(db=>activateReadoption(db,dc,target,request,hooks));
+    async function activationRequest(request:ReadoptionRequest,maxBatches=100):Promise<ReadoptionActivation> {
+      await validateReado(request);
+      const status=await client(db=>readoptionStatus(db,dc,target,source,request.requestId));
+      return {...request,validation:status.validation_digest!,maxBatches};
+    }
+    await t.test('readoption activates a separate generation in batches, preserves history, and reserves new corporate IDs end to end',async()=>{
+      const setup=await reprepare(),history=await snapshot(),reversions=await reversionRuns(),quarantined=await quarantineRows();
+      await remoteAllocatorMigration();const request=await activationRequest(setup.request,1);
+      let progress=await activateReado(request);assert.equal(progress.state,'activating');assert.equal(progress.completed,false);assert.equal(progress.registered,'2');
+      const oldCursor=(await snapshot()).allocator;await stage(8991);await stage(8991);
+      assert.deepEqual((await snapshot()).allocator,oldCursor);assert.equal((await admissions()).filter(a=>!a.materialized).length,1);
+      progress=await activateReado({...request,maxBatches:100});assert.equal(progress.state,'active');assert.equal(progress.registered,'4');
+      assert.equal((await local.query('SELECT request_id FROM olos_http.corporate_id_allocator')).rows[0].request_id,setup.original);
+      assert.equal((await control()).id_allocator_generation,setup.request.requestId);
+      assert.deepEqual(await entries(),history.entries);assert.deepEqual((await snapshot()).records,history.records);assert.deepEqual(await reversionRuns(),reversions);assert.deepEqual(await quarantineRows(),quarantined);
+      const receiptBefore=await entries();await store!.delivery!.tick();
+      assert.equal((await admissions()).filter(a=>!a.materialized).length,0);
+      const fresh=(await entries()).find(e=>e.source_id==='8991');assert(fresh);assert.equal(fresh.target_id,5);assert((await assignments()).find(a=>a.source_id==='8991').token);
+      assert.deepEqual((await entries()).filter(e=>e.source_id!=='8991'),receiptBefore);
+      await corporateControl(cfg,'corporate-resume');await store!.delivery!.tick();await store!.delivery!.tick();await store!.delivery!.tick();
+      assert.equal((await entries()).find(e=>e.source_id==='8991').state,'confirmed');assert.equal((await entries()).find(e=>e.target_id===1).state,'pending');assert.deepEqual(await quarantineRows(),quarantined);
+      const registry=(await remote.query('SELECT internal_id,state,source_id FROM olos_delivery_ids.registry ORDER BY internal_id')).rows;
+      assert.equal(registry.find(r=>r.internal_id===5).source_id,'8991');assert.equal(registry.find(r=>r.internal_id===5).state,'used');
+      assert.equal((await activateReado(request)).alreadyApplied,true);
+      await assert.rejects(adopt(allocationArgs(setup.original)),/ADOPTION_REVERTED|REQUEST_REUSED/);
+      await assert.rejects(client(db=>prepareCorporateReadoption(db,{...setup.request,requestId:randomUUID()},dc.binding,target,dc)),/READOPTION_REQUEST_CONFLICT/);
+    });
+    await t.test('readoption validation fails closed without remote authority and recovers the same intent when installed',async()=>{
+      const {request}=await reprepare(0,false,false),cursor=(await snapshot()).allocator;
+      await assert.rejects(validateReado(request),/REMOTE_AUTHORITY_ABSENT/);
+      let state=await client(db=>readoptionStatus(db,dc,target,source,request.requestId));assert.equal(state.state,'validating');assert.equal(state.authority.id_allocator_required,false);
+      await remoteAllocatorMigration();const activation=await activationRequest(request);await activateReado(activation);
+      assert.equal((await client(db=>readoptionStatus(db,dc,target,source,request.requestId))).state,'active');
+      const saved=dc.connection.destinationUrl;dc.connection.destinationUrl='postgresql://postgres@localhost:1/madm';
+      try{await stage(8992);await store!.delivery!.tick();assert.equal((await admissions()).filter(a=>!a.materialized).length,1);assert.deepEqual((await snapshot()).allocator,cursor);assert.equal((await entries()).length,0);}
+      finally{dc.connection.destinationUrl=saved;}
+      await store!.delivery!.tick();assert.equal((await admissions()).filter(a=>!a.materialized).length,0);assert.equal((await entries()).length,1);
+    });
+    await t.test('readoption schema is reentrant and rejects contract drift before creating an authority barrier',async()=>{
+      const {request}=await reprepare(1,false,false);await activationMigration();await remoteAllocatorMigration();
+      const input=await activationRequest(request);
+      await remote.query('ALTER TABLE raw.olos_calls DISABLE TRIGGER trg_olos_calls_reserve_internal_id');
+      await assert.rejects(activateReado(input),/CONTRACT_CHANGED|TRIGGER_REVIEW_REQUIRED/);assert.equal((await control()).id_allocator_required,false);
+      await remote.query('ALTER TABLE raw.olos_calls ENABLE ALWAYS TRIGGER trg_olos_calls_reserve_internal_id');
+      await assert.rejects(activateReado({...input,validation:'f'.repeat(64)}),/VALIDATION_CHANGED/);assert.equal((await control()).id_allocator_required,false);
+      await activateReado(input);await assert.rejects(client(db=>abortReadoption(db,dc,target,request)),/IRREVERSIBLE/);
+      await assert.rejects(local.query('UPDATE olos_http.corporate_control SET id_allocator_required=false WHERE singleton'),/IRREVERSIBLE/);
+    });
+    await t.test('aborted pre-barrier requests remain immutable history while a different generation can be prepared',async()=>{
+      const {request}=await reprepare(0,false,false);
+      assert.equal((await client(db=>abortReadoption(db,dc,target,request))).state,'aborted');
+      const next={...request,requestId:randomUUID()};await client(db=>prepareCorporateReadoption(db,next,dc.binding,target,dc));
+      assert.equal((await local.query('SELECT count(*)::integer n FROM olos_http.corporate_allocator_readoptions')).rows[0].n,2);
+      assert.equal((await client(db=>readoptionStatus(db,dc,target,source,request.requestId))).state,'aborted');
+    });
+    await t.test('an activation interrupted after remote registration retries identical reservations and checkpoints',async()=>{
+      const {request}=await reprepare(3,false,true);await remoteAllocatorMigration();const input=await activationRequest(request),history=await entries();
+      await assert.rejects(activateReado(input,{afterReserveCommit:async()=>{throw new Error('synthetic crash after corporate commit');}}),/synthetic/);
+      let state=await client(db=>readoptionStatus(db,dc,target,source,request.requestId));assert.equal(state.state,'activating');assert.equal(state.registered,'0');assert.equal((await assignments()).length,0);
+      const reserved=(await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows;
+      await stage(8993);await store!.delivery!.tick();assert.equal((await admissions()).filter(a=>!a.materialized).length,1);
+      await activateReado(input);assert.deepEqual((await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows.filter(r=>r.internal_id<=2),reserved);assert.equal((await remote.query('SELECT count(*)::integer n FROM olos_delivery_ids.registry')).rows[0].n,4);assert.deepEqual(await entries(),history);
+    });
+    await t.test('the readoption barrier fences old READ COMMITTED and REPEATABLE READ binaries, including local raw writes',async()=>{
+      const {request}=await reprepare(1,false,false);await remoteAllocatorMigration();const input=await activationRequest(request);
+      const stale=await pool.connect();await stale.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      assert.equal((await stale.query('SELECT id_allocator_required FROM olos_http.corporate_control')).rows[0].id_allocator_required,false);
+      let entered!:()=>void,release!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+      const pending=activateReado(input,{afterBarrierCommit:async()=>{entered();await gate;}});await ready;
+      try{
+        await assert.rejects(stale.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash) VALUES($1,'stale-binary',$2,777,'hash')`,[source,target]),(error:unknown)=>typeof error==='object'&&error!==null&&'code' in error&&error.code==='40001');
+        await stale.query('ROLLBACK');
+        await assert.rejects(local.query(`INSERT INTO olos_http.records(source_key,source_id,target_table,target_id,source_hash) VALUES($1,'old-binary',$2,778,'hash')`,[source,target]),/ASSIGNMENT_REQUIRED/);
+        await assert.rejects(local.query(`INSERT INTO raw.olos_calls(olos_call_id) VALUES('old-raw-binary')`),/LEGACY_GENERATION_FORBIDDEN/);
+        const cursor=(await snapshot()).allocator;await stage(8994);assert.deepEqual((await snapshot()).allocator,cursor);
+        assert.equal((await local.query("SELECT count(*)::integer n FROM olos_http.records WHERE source_id IN ('stale-binary','old-binary')")).rows[0].n,0);
+        assert.equal((await local.query('SELECT count(*)::integer n FROM raw.olos_calls')).rows[0].n,0);
+      }finally{stale.release(true);release();await pending;}
+      assert.equal((await pending).state,'active');
+      assert.equal((await admissions()).find(a=>a.source_id==='8994').allocator_generation,request.requestId);
+      await store!.delivery!.tick();assert.equal((await assignments()).find(a=>a.source_id==='8994').allocator_generation,request.requestId);
+    });
+    await t.test('concurrent readoption operations serialize while capture remains independent of remote registration',async()=>{
+      const {request}=await reprepare(2,false,false);await remoteAllocatorMigration();const input=await activationRequest(request);
+      let entered!:()=>void,release!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+      const pending=activateReado(input,{afterReserveCommit:async()=>{entered();await gate;}});await ready;
+      try{
+        await assert.rejects(activateReado(input),/READOPTION_BUSY/);
+        await assert.rejects(client(db=>prepareCorporateReadoption(db,{...request,requestId:randomUUID()},dc.binding,target,dc)),/READOPTION_BUSY/);
+        const start=performance.now();await stage(8995);assert(performance.now()-start<750);assert.equal((await admissions()).filter(a=>!a.materialized).length,1);
+      }finally{release();await pending;}
+      assert.equal((await pending).state,'active');assert.equal((await assignments()).length,2);
+    });
+    await t.test('lost local COMMIT acknowledgements at barrier, batch and activation reconcile by the same UUID',async()=>{
+      for(const loseAt of [1,2,3]){
+        const {request}=await reprepare(1,false,false);await remoteAllocatorMigration();const input=await activationRequest(request),history=await entries();let commits=0;
+        await assert.rejects(client(db=>{
+          const uncertain=new Proxy(db,{get(target,key,receiver){
+            if(key==='query')return async(sql:string,params?:unknown[])=>{const result=await target.query(sql,params);if(sql==='COMMIT'&&++commits===loseAt)throw new Error('synthetic COMMIT acknowledgement lost');return result;};
+            return Reflect.get(target,key,receiver);
+          }});
+          return activateReadoption(uncertain,dc,target,input);
+        }),/READOPTION_COMMIT_UNKNOWN/);
+        const status=await client(db=>readoptionStatus(db,dc,target,source,request.requestId,true));
+        assert.equal(status.authority.id_allocator_required,true);assert.equal(status.state,loseAt===3?'active':'activating');
+        assert.equal(status.registered,loseAt===1?'0':'1');assert.equal(status.last_error,null);assert.deepEqual(await entries(),history);
+        const recovered=await client(db=>activateReadoption(db,dc,target,input,{},true));assert.equal(recovered.state,'active');
+        assert.equal((await assignments()).length,1);assert.equal((await local.query('SELECT count(*)::integer n FROM olos_http.corporate_allocator_readoptions')).rows[0].n,1);
+      }
+    });
+    await t.test('failure before the barrier rolls back authority changes; retry captures the exact legacy cutoff',async()=>{
+      const {request}=await reprepare(1,false,false);await remoteAllocatorMigration();const input=await activationRequest(request),cursor=(await snapshot()).allocator;
+      await assert.rejects(activateReado(input,{beforeBarrierCommit:async()=>{throw new Error('synthetic barrier rollback');}}),/synthetic/);
+      assert.equal((await control()).id_allocator_required,false);assert.equal((await client(db=>readoptionStatus(db,dc,target,source,request.requestId))).state,'ready');
+      await stage(8996);assert.notDeepEqual((await snapshot()).allocator,cursor);
+      assert.equal((await activateReado(input)).registered,'2');assert.deepEqual((await entries()).map(e=>e.target_id),[1,2]);
+    });
+    await t.test('a fresh collision discovered after the barrier is explicitly quarantined before activation can complete',async()=>{
+      const {request}=await reprepare(2,false,false);await remoteAllocatorMigration();const input=await activationRequest(request);
+      await assert.rejects(activateReado(input,{afterBarrierCommit:async()=>{await insertRemote(0,{telefone:'late foreign collision'});}}),/INTERNAL_ID_COLLISION/);
+      assert.equal((await control()).id_allocator_required,true);assert.equal((await control()).blocked,true);
+      const diagnostic=await verify();assert.equal(diagnostic.issues[0]!.code,'INTERNAL_ID_COLLISION');
+      await assert.rejects(recover(args(diagnostic.verification_digest)),/READOPTION_ACTIVATION_INCOMPLETE/);
+      await quarantine(args(diagnostic.verification_digest));
+      assert.equal((await quarantineRuns())[0].readoption_request_id,request.requestId);
+      const isolated=await quarantineRows();assert.equal(isolated.length,1);
+      await activateReado(input);assert.deepEqual(await quarantineRows(),isolated);assert.equal((await entries())[0].state,'pending');
+      const valid=await verify();assert.equal(valid.issues.length,0);await recover(args(valid.verification_digest));await corporateControl(cfg,'corporate-resume');await store!.delivery!.tick();
+      assert.equal((await entries())[0].state,'pending');assert.equal((await entries())[1].state,'confirmed');
+    });
+    await t.test('frozen predecessor, quarantine, assignments and payloads cannot be modified after the barrier',async()=>{
+      const {request}=await reprepare(2,true,true);await remoteAllocatorMigration();const input=await activationRequest(request,1);await activateReado(input);
+      const history=await entries(),q=await quarantineRows(),reverse=await reversionRuns();
+      for(const sql of ["UPDATE olos_http.corporate_outbox SET payload_hash=repeat('f',64)","UPDATE olos_http.records SET target_id=target_id+1000",'DELETE FROM olos_http.corporate_id_assignments',"UPDATE olos_http.corporate_id_reversions SET validation_digest=repeat('f',64)","UPDATE olos_http.corporate_collision_quarantine SET payload_hash=repeat('f',64)","UPDATE olos_http.corporate_readoption_batches SET chain_hash=repeat('f',64)"]){
+        await assert.rejects(local.query(sql),/HISTORY_FROZEN|CORPORATE_QUARANTINE_IMMUTABLE/);
+      }
+      await assert.rejects(local.query('UPDATE olos_http.corporate_control SET id_allocator_generation=NULL,id_allocator_required=false'),/IRREVERSIBLE/);
+      await assert.rejects(local.query('DELETE FROM olos_http.corporate_control'),/IRREVERSIBLE/);
+      assert.deepEqual(await entries(),history);assert.deepEqual(await quarantineRows(),q);assert.deepEqual(await reversionRuns(),reverse);
+      await activateReado({...input,maxBatches:100});
+    });
+    await t.test('validation rejects forged predecessor validation and altered quarantine before any authority switch',async()=>{
+      const {request}=await reprepare(2,true,true);await remoteAllocatorMigration();
+      await local.query("UPDATE olos_http.corporate_id_reversions SET validation_digest=repeat('f',64)");
+      await assert.rejects(validateReado(request),/REVERSAL_UNVERIFIED/);assert.equal((await control()).id_allocator_required,false);
+      await reset(0);const second=await prepare();await reversalMigration();await revert(reversionArgs(second));
+      await local.query("UPDATE olos_http.corporate_id_reversions SET validated_at=now(),validation_digest=repeat('a',64)");
+      await local.query(await readFile(new URL('../migrations/010_corporate_allocator_readoption.sql',import.meta.url),'utf8'));await activationMigration();
+      const fake={source,requestId:randomUUID(),evidence:'FORGED-VALIDATION'};await client(db=>prepareCorporateReadoption(db,fake,dc.binding,target,dc));await remoteAllocatorMigration();
+      await assert.rejects(validateReado(fake),/REVERSAL_UNVERIFIED/);assert.equal((await control()).id_allocator_required,false);
+    });
+    await t.test('confirmed, skipped, quarantined and valid pending history retain IDs and receipts across registration',async()=>{
+      const {request}=await reprepare(3,true,true);
+      await insertRemote(1);const raw=(await remote.query('SELECT raw_olos_call_id::text FROM raw.olos_calls WHERE internal_id_olos=2')).rows[0].raw_olos_call_id;
+      await local.query("UPDATE olos_http.corporate_outbox SET state='confirmed',remote_raw_id=$1,confirmed_at=now() WHERE target_id=2",[raw]);
+      await local.query("UPDATE olos_http.corporate_outbox SET state='skipped' WHERE target_id=3");
+      const history=await entries(),quar=await quarantineRows();await remoteAllocatorMigration();await activateReado(await activationRequest(request));
+      assert.deepEqual(await entries(),history);assert.deepEqual(await quarantineRows(),quar);
+      assert.deepEqual((await assignments()).map(a=>a.target_id),history.map(e=>e.target_id));
+      const journal=(await local.query('SELECT members FROM olos_http.corporate_readoption_batches ORDER BY batch_no')).rows.flatMap(b=>b.members);
+      assert.equal(journal.find(m=>m.target_id==='2').state,'confirmed');assert.equal(journal.find(m=>m.target_id==='3').state,'skipped');assert.equal(journal.find(m=>m.target_id==='1').quarantined,true);
+    });
+    await t.test('new IDs skip occupied corporate identifiers, including sparse high IDs, without altering any sequence',async()=>{
+      const {request}=await reprepare(0,false,false);await insertForeign('1');await insertForeign('2');await insertForeign('47561749');
+      await remoteAllocatorMigration();const seq=(await snapshot()).allocator;await activateReado(await activationRequest(request));
+      await stage(8997);await stage(8998);await store!.delivery!.tick();
+      assert.deepEqual((await entries()).map(e=>e.target_id),[3,4]);assert.deepEqual((await snapshot()).allocator,seq);
+      const calls=(await remote.query('SELECT internal_id_olos FROM raw.olos_calls ORDER BY internal_id_olos')).rows;assert.deepEqual(calls.map(c=>c.internal_id_olos),[1,2,47561749]);
+      await remote.query('UPDATE olos_delivery_ids.counter SET next_candidate=2147483648');await stage(8999);await store!.delivery!.tick();
+      assert.equal((await admissions()).filter(a=>!a.materialized).length,1);assert.equal((await entries()).length,2);assert.deepEqual((await snapshot()).allocator,seq);
+    });
+    await t.test('readoption state/evidence queries are read only and do not require access to corporate credentials',async()=>{
+      const {request}=await reprepare(0,false,false);await remoteAllocatorMigration();await activateReado(await activationRequest(request));
+      const history=await snapshot();await local.query('SET default_transaction_read_only=on');
+      const saved=dc.connection.destinationUrl;dc.connection.destinationUrl='postgresql://postgres@localhost:1/madm';
+      try{const result=await client(async db=>{await db.query('SET default_transaction_read_only=on');return readoptionStatus(db,dc,target,source,request.requestId,true);});assert.equal(result.state,'active');assert.equal(result.completed,true);assert.deepEqual(await snapshot(),history);}
+      finally{dc.connection.destinationUrl=saved;await local.query('SET default_transaction_read_only=off');}
+    });
+    await t.test('a lost corporate connection after reservation and a failed batch commit preserve recoverable registration',async()=>{
+      const {request}=await reprepare(2,false,false);await remoteAllocatorMigration();const input=await activationRequest(request),history=await entries();
+      await assert.rejects(activateReado(input,{afterReserveCommit:async()=>{
+        const sessions=(await remote.query<{pid:number}>("SELECT pid FROM pg_stat_activity WHERE datname='madm' AND application_name='corporate-sync' AND pid<>pg_backend_pid() AND state='idle' AND query='COMMIT'")).rows;
+        assert.equal(sessions.length,1);await remote.query('SELECT pg_terminate_backend($1)',[sessions[0]!.pid]);throw new Error('synthetic corporate connection lost');
+      }}),/synthetic/);
+      const registry=(await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows;
+      assert.equal((await assignments()).length,0);assert.equal((await client(db=>readoptionStatus(db,dc,target,source,request.requestId))).registered,'0');
+      await assert.rejects(activateReado(input,{beforeBatchCommit:async()=>{throw new Error('synthetic local batch rollback');}}),/synthetic/);
+      assert.equal((await assignments()).length,0);assert.deepEqual((await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows,registry);
+      await activateReado(input);assert.deepEqual(await entries(),history);assert.deepEqual((await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows,registry);
+    });
+    await t.test('a restarted capture owner materializes pending reservations idempotently after active-generation connection loss',async()=>{
+      const {request}=await reprepare(0,false,false);await remoteAllocatorMigration();await activateReado(await activationRequest(request));await stage(9001);
+      const cursor=(await snapshot()).allocator;
+      await store!.delivery!.tick({afterReserveCommit:async()=>{throw new Error('synthetic materializer stopped after reservation');}});
+      const registry=(await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows;
+      assert.equal(registry.length,1);assert.equal((await assignments()).length,0);assert.equal((await admissions())[0].materialized,false);
+      await store!.close();store=new Store(cfg);await store.open();await stage(9002);await store.delivery!.tick();
+      assert.equal((await entries()).length,2);assert.equal((await admissions()).filter(a=>!a.materialized).length,0);assert.deepEqual((await snapshot()).allocator,cursor);
+      assert.deepEqual((await remote.query(`SELECT * FROM olos_delivery_ids.registry WHERE source_id='9001'`)).rows,registry);
+    });
+    await t.test('checkpoint counters, cutoff and generation identity reject tampering without remapping history',async()=>{
+      const {request}=await reprepare(3,false,false);await remoteAllocatorMigration();const input=await activationRequest(request,1);await activateReado(input);
+      const before=await entries();
+      for(const sql of ["UPDATE olos_http.corporate_allocator_readoptions SET registered_count=999",'UPDATE olos_http.corporate_allocator_readoptions SET registration_end=registration_cursor',"UPDATE olos_http.corporate_allocator_readoptions SET request_id='11111111-1111-4111-8111-111111111111'"]){await assert.rejects(local.query(sql),/REGISTRATION_CHANGED|EVIDENCE_IMMUTABLE/);}
+      await activateReado({...input,maxBatches:100});assert.deepEqual(await entries(),before);
+    });
+    await t.test('the protected CLI prepares, validates, activates, reconciles and reads evidence without taking OLOS ownership',async()=>{
+      const {request}=await reprepare(3,false,true);await remoteAllocatorMigration();
+      const base=['--confirm-source',source,'--request-id',request.requestId,'--evidence',request.evidence];
+      const cli=(command:string,input:string[],authorized=false)=>promisify(execFile)(process.execPath,['dist/main.js',command,...input],{env:{...process.env,...env,...(authorized?{OLOS_CORPORATE_READOPTION_CONFIRMATION:'AUTHORIZE_CORPORATE_ID_READOPTION',OLOS_CORPORATE_READOPTION_ACTIVATION_CONFIRMATION:'AUTHORIZE_CORPORATE_ID_READOPTION_ACTIVATION'}:{})},timeout:15000});
+      const cliError=(code:string)=>(error:unknown)=>typeof error==='object'&&error!==null&&'stdout' in error&&typeof error.stdout==='string'&&error.stdout.includes(code);
+      await assert.rejects(cli('corporate-activate-id-readoption',[...base,'--validation','a'.repeat(64)]),cliError('READOPTION_NOT_AUTHORIZED'));
+      const prepared=await cli('corporate-prepare-id-readoption',base,true);assert.match(prepared.stdout,/"state":"prepared"/);
+      await cli('corporate-validate-id-readoption',base,true);
+      const observed=await cli('corporate-id-readoption-status',base.slice(0,4));
+      const report=observed.stdout.trim().split('\n').map(line=>JSON.parse(line) as {validation_digest?:string;state?:string}).find(line=>line.state==='ready');assert(report?.validation_digest);
+      const activation=[...base,'--validation',report.validation_digest,'--max-batches','1'];
+      await assert.rejects(cli('corporate-activate-id-readoption',activation,true),cliError('READOPTION_ACTIVATION_INCOMPLETE'));
+      await stage(9003);
+      const recovered=await cli('corporate-reconcile-id-readoption',[...base,'--validation',report.validation_digest,'--max-batches','100'],true);assert.match(recovered.stdout,/"state":"active"/);
+      const evidence=await cli('corporate-id-readoption-evidence',base.slice(0,4));assert.match(evidence.stdout,/corporate_readoption_batch_evidence/);assert.doesNotMatch(evidence.stdout,/private-call|private@example|55119000|"token"|"mapped"|"payload"/);
+      assert.equal((await admissions()).filter(a=>!a.materialized).length,1);assert.equal((await control()).paused,true);
+    });
+    await t.test('an incompatible absolute registry contract blocks validation until the reviewed schema is restored',async()=>{
+      const {request}=await reprepare(0,false,false);await remoteAllocatorMigration();
+      await remote.query("ALTER TABLE olos_delivery_ids.registry DROP CONSTRAINT registry_state_check; ALTER TABLE olos_delivery_ids.registry ADD CONSTRAINT registry_state_check CHECK(state IN ('reserved','used','unexpected'))");
+      await assert.rejects(validateReado(request),/ALLOCATOR_CONTRACT_CHANGED/);assert.equal((await control()).id_allocator_required,false);
+      await remote.query("ALTER TABLE olos_delivery_ids.registry DROP CONSTRAINT registry_state_check;ALTER TABLE olos_delivery_ids.registry ADD CONSTRAINT registry_state_check CHECK(state IN ('reserved','used'))");
+      assert.equal((await validateReado(request)).state,'ready');
+    });
+    await t.test('validation intent and ready evidence survive lost COMMIT acknowledgements without a new request',async()=>{
+      for(const loseAt of [1,2]){
+        const {request}=await reprepare(1,false,true);await remoteAllocatorMigration();let commits=0;
+        await assert.rejects(client(db=>validateReadoption(new Proxy(db,{get(target,key,receiver){
+          if(key==='query')return async(sql:string,params?:unknown[])=>{const result=await target.query(sql,params);if(sql==='COMMIT'&&++commits===loseAt)throw new Error('synthetic validation commit ack lost');return result;};return Reflect.get(target,key,receiver);
+        }}),dc,target,request)),/READOPTION_COMMIT_UNKNOWN/);
+        const status=await client(db=>readoptionStatus(db,dc,target,source,request.requestId));assert.equal(status.state,loseAt===1?'validating':'ready');assert.equal(status.authority.id_allocator_required,false);
+        await validateReado(request);assert.equal((await local.query('SELECT count(*)::integer n FROM olos_http.corporate_allocator_readoptions')).rows[0].n,1);
+      }
+    });
+    await t.test('persisted materialization COMMIT acknowledgement loss never allocates another ID on retry',async()=>{
+      const {request}=await reprepare(0,false,false);await remoteAllocatorMigration();await activateReado(await activationRequest(request));await stage(9004);
+      const cursor=(await snapshot()).allocator;let fired=false;
+      const uncertainPool={async connect(){const db=await pool.connect();return new Proxy(db,{get(target,key,receiver){
+        if(key==='query')return async(sql:string,params?:unknown[])=>{const result=await target.query(sql,params);if(sql==='COMMIT'&&!fired){fired=true;throw new Error('synthetic persisted materialization commit');}return result;};return Reflect.get(target,key,receiver);
+      }});}} as unknown as pg.Pool;
+      const delivery=new CorporateDelivery(dc,source,target,uncertainPool,()=>true,()=>assert.fail('capture authority must remain alive'));
+      await delivery.tick();assert(fired);assert.equal((await admissions())[0].materialized,true);assert.equal((await entries()).length,1);
+      const registry=(await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows;
+      await store!.delivery!.tick();assert.equal((await entries()).length,1);assert.deepEqual((await remote.query('SELECT * FROM olos_delivery_ids.registry ORDER BY internal_id')).rows,registry);assert.deepEqual((await snapshot()).allocator,cursor);
+    });
+    await t.test('the existing Worker captures over loopback HTTP during activation and MADM outage, then delivers with corporate tokens',async()=>{
+      const {request}=await reprepare(1,false,false);await remoteAllocatorMigration();const input=await activationRequest(request);
+      let entered!:()=>void,release!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+      const activation=activateReado(input,{afterBarrierCommit:async()=>{entered();await gate;}});await ready;
+      let consuming=0,serverFailure:string|undefined;
+      const catalog=[{TableName:'AttemptsRawData',Columns:['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId']},
+        {TableName:'Users',Columns:['AgentId','UserName']},{TableName:'Campaign',Columns:['CampaignId','Description']},{TableName:'Disposition',Columns:['DispositionId','Description']}];
+      const server=createServer(async(req,res)=>{
+        try{
+          const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));const body=Buffer.concat(chunks).toString('utf8');
+          let value:unknown;
+          if(req.url==='/api/auth')value={access_token:'synthetic-token',token_type:'bearer',expires_in:3600};
+          else if(req.headers.authorization!=='Bearer synthetic-token'){res.writeHead(401);res.end('{}');return;}
+          else if(req.url?.endsWith('/available-tables'))value=catalog;
+          else if(req.url?.endsWith('/read-data')){
+            const table=/name="TableName"\r\n\r\n([^\r]+)/.exec(body)?.[1];
+            value=table==='Users'?[{AgentId:'7',UserName:'Private Agent'}]:table==='Campaign'?[{CampaignId:'8',Description:'Campaign'}]:table==='Disposition'?[{DispositionId:'9',Description:'Disposition'}]:undefined;
+          }else if(req.url?.endsWith('/read-data-current-day')){consuming++;value=[row(9100+consuming)];}
+          if(value===undefined)throw new Error('unrecognized synthetic HTTP request');res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify(value));
+        }catch{serverFailure='synthetic HTTP fixture failure';res.writeHead(500);res.end('{}');}
+      });
+      server.listen(0,'127.0.0.1');await once(server,'listening');const address=server.address();assert(address&&typeof address==='object');
+      const abort=new AbortController(),transport=new HttpTransport(`http://127.0.0.1:${address.port}`,1000,1048576,abort.signal);
+      const auth=new OlosAuthManager(transport.request,{username:'fixture',password:'fixture',clientId:'fixture',clientSecret:'fixture'});
+      const api=new OlosApi(transport.request,auth),worker=new Worker(store!,api,new StaticCache(api,3600000));
+      const cursor=(await snapshot()).allocator,saved=dc.connection.destinationUrl;
+      try{
+        const first=await worker.cycle();await store!.delivery!.settle();assert.equal(first.queued,1);assert.equal(consuming,1);assert.equal((await admissions()).filter(a=>!a.materialized).length,1);
+        release();await activation;
+        dc.connection.destinationUrl='postgresql://postgres@localhost:1/madm';const second=await worker.cycle();await store!.delivery!.settle();assert.equal(second.queued,1);assert.equal(consuming,2);
+        assert.equal((await admissions()).filter(a=>!a.materialized).length,2);assert.deepEqual((await snapshot()).allocator,cursor);
+        dc.connection.destinationUrl=saved;await store!.delivery!.tick();await corporateControl(cfg,'corporate-resume');await store!.delivery!.tick();await store!.delivery!.tick();
+        assert.equal((await entries()).filter(e=>e.state==='confirmed').length,3);assert.equal((await assignments()).filter(a=>!a.legacy&&a.token).length,2);assert.equal(serverFailure,undefined);
+        const captures=(await local.query("SELECT state,processed_count FROM olos_http.reads WHERE spec->>'kind'='current' ORDER BY started_at DESC LIMIT 2")).rows;
+        assert(captures.every(r=>r.state==='done'&&r.processed_count===1));assert.deepEqual((await snapshot()).allocator,cursor);
+      }finally{dc.connection.destinationUrl=saved;release();await activation;abort.abort();await transport.close();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+    });
+    await t.test('dedicated authority fence does not make legacy or active capture wait on an in-flight delivery transaction',async()=>{
+      const {request}=await reprepare(1,false,false);await corporateControl(cfg,'corporate-resume');
+      async function concurrentCapture(id:number){
+        let entered!:()=>void,release!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+        const sending=store!.delivery!.tick({afterRemoteCommit:async()=>{entered();await gate;}});await ready;
+        try{const start=performance.now();await stage(id);assert(performance.now()-start<750);}
+        finally{release();await sending;}
+      }
+      await concurrentCapture(9110);assert.equal((await entries()).length,2);assert.equal((await entries())[0].state,'confirmed');
+      await corporateControl(cfg,'corporate-pause');await remoteAllocatorMigration();await activateReado(await activationRequest(request));await corporateControl(cfg,'corporate-resume');
+      const seq=(await snapshot()).allocator;await concurrentCapture(9111);assert.equal((await admissions()).filter(a=>!a.materialized).length,1);assert.deepEqual((await snapshot()).allocator,seq);
+      await store!.delivery!.tick();assert.equal((await entries()).filter(e=>e.state==='confirmed').length,3);assert.deepEqual((await snapshot()).allocator,seq);
+    });
+    await t.test('corporate reservation skips a dense occupied prefix in one bounded attempt using the registry gap',async()=>{
+      const {request}=await reprepare(0,false,false);
+      await remote.query('INSERT INTO raw.olos_calls(internal_id_olos) SELECT n FROM generate_series(1,50000) n');
+      await remoteAllocatorMigration();await activateReado(await activationRequest(request));const seq=(await snapshot()).allocator;
+      await stage(9112);const started=performance.now();await store!.delivery!.tick();
+      assert.equal((await admissions()).filter(a=>!a.materialized).length,0);assert.equal((await entries())[0].target_id,50001);
+      assert.deepEqual((await snapshot()).allocator,seq);
+      console.log('CORPORATE_ALLOCATOR_GAP_EVIDENCE '+JSON.stringify({synthetic:true,occupied_prefix:50000,reserved_id:50001,allocation_ms:performance.now()-started}));
+    });
+    await t.test('a non-owner local administrative role activates with reviewed grants and cannot disable the authority barrier',async()=>{
+      const {request}=await reprepare(2,false,false);await remoteAllocatorMigration();
+      await local.query('CREATE ROLE readoption_local_client NOLOGIN');
+      await local.query(`GRANT USAGE ON SCHEMA raw,olos_http,corporate_sync TO readoption_local_client;
+        GRANT SELECT,INSERT,UPDATE ON ALL TABLES IN SCHEMA olos_http,corporate_sync TO readoption_local_client;
+        REVOKE INSERT,UPDATE ON olos_http.corporate_readoption_schema FROM readoption_local_client;
+        REVOKE UPDATE ON olos_http.corporate_readoption_batches FROM readoption_local_client;
+        GRANT SELECT ON raw.olos_calls TO readoption_local_client`);
+      try{
+        await client(async db=>{
+          await db.query('SET ROLE readoption_local_client');
+          assert.equal((await db.query('SELECT current_user')).rows[0].current_user,'readoption_local_client');
+          await validateReadoption(db,dc,target,request);
+          const status=await readoptionStatus(db,dc,target,source,request.requestId);
+          const activation={...request,validation:status.validation_digest!,maxBatches:10};
+          assert.equal((await activateReadoption(db,dc,target,activation)).state,'active');
+          await assert.rejects(db.query('ALTER TABLE olos_http.records DISABLE TRIGGER corporate_readoption_record_fence'),
+            (error:unknown)=>(error as {code?:string}).code==='42501');
+          await assert.rejects(db.query('UPDATE olos_http.corporate_allocation_fence SET required=false,epoch=epoch+1'),/AUTHORITY_IRREVERSIBLE/);
+          assert.equal((await readoptionStatus(db,dc,target,source,request.requestId)).completed,true);
+        });
+        const sequence=(await snapshot()).allocator;await stage(98002);await store!.delivery!.tick();
+        assert.deepEqual((await snapshot()).allocator,sequence);
+        assert.equal((await assignments()).find(a=>a.source_id==='98002')?.legacy,false);
+      }finally{await local.query('DROP OWNED BY readoption_local_client; DROP ROLE readoption_local_client');}
+    });
+    await t.test('readoption rejects a changed deferred assignment function before authorizing the barrier',async()=>{
+      const {request}=await reprepare(1,false,false);await remoteAllocatorMigration();
+      const definition=(await local.query("SELECT pg_get_functiondef('olos_http.require_corporate_id_assignment()'::regprocedure) AS definition")).rows[0].definition as string;
+      try{
+        await local.query(`CREATE OR REPLACE FUNCTION olos_http.require_corporate_id_assignment() RETURNS trigger LANGUAGE plpgsql AS $broken$ BEGIN RETURN NEW; END $broken$`);
+        await assert.rejects(validateReado(request),/READOPTION_LOCAL_CONTRACT_CHANGED/);
+        assert.equal((await control()).id_allocator_required,false);
+        assert.equal((await local.query('SELECT state FROM olos_http.corporate_allocator_readoptions WHERE request_id=$1',[request.requestId])).rows[0].state,'prepared');
+      }finally{await local.query(definition);}
+      assert.equal((await validateReado(request)).state,'ready');
+    });
+    await t.test('migration 011 refuses an unknown state CHECK without dropping integrity constraints or changing evidence',async()=>{
+      const {request}=await reprepare(1,false,false);
+      await local.query("ALTER TABLE olos_http.corporate_allocator_readoptions ADD CONSTRAINT separately_reviewed_state_guard CHECK(state<>'aborted')");
+      const before=(await local.query('SELECT * FROM olos_http.corporate_allocator_readoptions WHERE request_id=$1',[request.requestId])).rows;
+      await assert.rejects(activationMigration(),/READOPTION_LOCAL_CONTRACT_CHANGED/);await local.query('ROLLBACK');
+      assert.equal((await local.query("SELECT count(*)::int AS n FROM pg_constraint WHERE conrelid='olos_http.corporate_allocator_readoptions'::regclass AND conname='separately_reviewed_state_guard'")).rows[0].n,1);
+      assert.deepEqual((await local.query('SELECT * FROM olos_http.corporate_allocator_readoptions WHERE request_id=$1',[request.requestId])).rows,before);
+      assert.equal((await control()).id_allocator_required,false);
+      await local.query('ALTER TABLE olos_http.corporate_allocator_readoptions DROP CONSTRAINT separately_reviewed_state_guard');
+      await local.query("ALTER TABLE olos_http.corporate_allocator_readoptions DROP CONSTRAINT readoption_state_check, ADD CONSTRAINT readoption_state_check CHECK(state<>'aborted')");
+      await assert.rejects(activationMigration(),/READOPTION_LOCAL_CONTRACT_CHANGED/);await local.query('ROLLBACK');
+      assert.equal((await control()).id_allocator_required,false);
+      await local.query("ALTER TABLE olos_http.corporate_allocator_readoptions DROP CONSTRAINT readoption_state_check, ADD CONSTRAINT readoption_state_check CHECK(state IN ('prepared','validating','ready','activating','active','aborted'))");
+      await activationMigration();
+    });
+    await t.test('corporate installation times out atomically behind an existing writer and preserves calls before retry',async()=>{
+      await reset(1);await insertRemote(0);
+      const before=(await remote.query('SELECT * FROM raw.olos_calls')).rows;
+      const writer=new pg.Client({connectionString:destinationUrl.toString()});await writer.connect();
+      try{
+        await writer.query('BEGIN');await writer.query('LOCK TABLE raw.olos_calls IN ROW EXCLUSIVE MODE');
+        await assert.rejects(remoteAllocatorMigration(),(error:unknown)=>(error as {code?:string}).code==='55P03');
+        await remote.query('ROLLBACK');
+        assert.equal((await remote.query("SELECT to_regnamespace('olos_delivery_ids') IS NULL AS absent")).rows[0].absent,true);
+        assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls')).rows,before);
+        await writer.query('ROLLBACK');await remoteAllocatorMigration();
+        assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls')).rows,before);
+        assert.equal((await remote.query("SELECT count(*)::int n FROM olos_delivery_ids.registry WHERE state='used'")).rows[0].n,1);
+      }finally{await writer.query('ROLLBACK');await writer.end();}
     });
     await t.test('audit migration can be reapplied without changing the queue or evidence', async () => {
       await reset(1); await recover(args((await verify()).verification_digest)); const before = await snapshot();
