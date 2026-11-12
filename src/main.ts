@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises';
+import { writeFile,readFile } from 'node:fs/promises';
 import pg from 'pg';
 import { config } from './config.js';
 import { HttpTransport, sleep } from './http.js';
@@ -17,7 +17,7 @@ import { loadRecoveryManifest, recoveryHash } from './read-recovery.js';
 async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
-  const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','recover-spool','recovery-authorize','recovery-verify','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
+  const allowed = ['continuity-inspect','continuity-authorize','continuity-revoke','inspect-schema','check','start','admin','once','capture-once','capture-reread','recover-spool','recovery-authorize','recovery-verify','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
     'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator',...readoptionCommands];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
   const recovery = command==='recovery-authorize' ? await (async()=>{
@@ -62,6 +62,15 @@ async function main() {
       return;
     }
     if (command === 'check') { log('database_preflight_passed'); return; }
+    if(command==='continuity-inspect'){log('capture_continuity_parent',await store.inspectContinuity());return;}
+    if(command==='continuity-authorize'){
+      if(args.length!==2||args[1]!=='AUTHORIZE_CAPTURE_WITH_HISTORICAL_GAP')throw new WorkerError('CONTINUITY_CONFIRMATION_REQUIRED');
+      await store.authorizeContinuity(JSON.parse(await readFile(args[0]!,'utf8')));return;
+    }
+    if(command==='continuity-revoke'){
+      if(args.length!==1)throw new WorkerError('CONTINUITY_PARAMETERS_REQUIRED');
+      await store.revokeContinuity(args[0]!);return;
+    }
     if(command==='recover-spool'){
       if(args.length!==1)throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
       const capture=await store.recoverCaptureSpool(args[0]!);log('capture_spool_recovered',{read_id:args[0]!,response_bytes:capture.bytes});return;

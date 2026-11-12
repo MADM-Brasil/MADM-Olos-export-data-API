@@ -1,7 +1,8 @@
+import {captureContinuity,continuityParent,authorizeContinuity,continuityConsent,historicalRead} from './capture-continuity.js';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { join,basename,resolve } from 'node:path';
-import { access } from 'node:fs/promises';
+import { access,lstat } from 'node:fs/promises';
 import { type Config } from './config.js';
 import { type ReadSpec, rows, readFields } from './api.js';
 import { columns, type Cache, type MappedRecord, mapRecord } from './mapping.js';
@@ -82,6 +83,38 @@ export class Store {
     return (await this.db().query<Read>(`SELECT id,spec,state,response_body,processed_count,request_ms,started_at,error_code,received_count,
       ${this.spoolReady?'response_spool_read_id::text':'NULL::text'} AS response_spool_read_id FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at`, [this.cfg.sourceKey])).rows;
   }
+  private admitting=false;
+  private async continuityDecision(){
+    const decision=await captureContinuity(()=>this.db(),await this.unresolved(),this.cfg.sourceKey,this.target,this.captureBinding(),this.spoolReady&&this.cfg.sourceIdConfirmed);
+    if(decision.authorizationId)await this.continuityStorage();
+    return decision;
+  }
+  private async continuityStorage(){
+    if(!this.spoolReady||!this.cfg.captureSpoolDirectory)throw new WorkerError('CAPTURE_SPOOL_CONFIG_REQUIRED');
+    await prepareCaptureDirectory(this.cfg.captureSpoolDirectory,this.cfg.captureSpoolRequireMount);
+    for(const suffix of ['.json','.json.complete']){
+      try{await lstat(join(this.cfg.captureSpoolDirectory,historicalRead+suffix));}
+      catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')continue;throw error;}
+      throw new WorkerError('CONTINUITY_PARENT_HAS_FILE');
+    }
+  }
+  async capturePending(){return (await this.continuityDecision()).pending;}
+  async inspectContinuity(){
+    if(!this.spoolReady)throw new WorkerError('CAPTURE_SPOOL_CONFIG_REQUIRED');
+    return {parent_id:historicalRead,parent_hash:await continuityParent(this.db(),this.cfg.sourceKey,this.target)};
+  }
+  async authorizeContinuity(input:unknown){
+    if(!this.spoolReady||!this.cfg.sourceIdConfirmed)throw new WorkerError('CAPTURE_SPOOL_CONFIG_REQUIRED');
+    await this.continuityStorage();
+    const consent=continuityConsent(input);
+    await authorizeContinuity(this.db(),consent,this.cfg.sourceKey,this.target,this.captureBinding());
+    log('capture_continuity_authorized',{authorization_id:consent.authorizationId,parent_id:historicalRead,historical_gap:true});
+  }
+  async revokeContinuity(id:string){
+    const result=await this.db().query('UPDATE olos_http.capture_continuity SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE authorization_id=$1 AND source_key=$2 RETURNING authorization_id',[id,this.cfg.sourceKey]);
+    if(!result.rowCount)throw new WorkerError('CONTINUITY_AUTHORIZATION_NOT_FOUND');
+    log('capture_continuity_revoked',{authorization_id:id,parent_id:historicalRead});
+  }
   private captureBinding(){return fingerprint(JSON.stringify([this.cfg.sourceKey,this.target,this.cfg.ingestionBaseline??null,this.cfg.sourceTimeZone??null,this.cfg.sourceIdConfirmed,'lossless-stream-v1']));}
   private spoolIntent(read:Pick<Read,'spec'>){
     const c=read.spec.capture;
@@ -90,15 +123,30 @@ export class Store {
     return c;
   }
   async beginRead(spec: ReadSpec, recovery = false) {
+    if(this.admitting)throw new WorkerError('CAPTURE_ADMISSION_ACTIVE');
+    this.admitting=true;try{
     await this.captureReady();
-    const pending = await this.unresolved();
+    const decision=spec.kind==='current'&&!recovery?await this.continuityDecision():{pending:await this.unresolved(),authorizationId:undefined};
+    const pending=decision.pending;
     if (spec.kind==='reread' && pending.some(r=>r.state==='reading')) throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
     if (pending.some(r => r.state === 'received') || (!recovery && pending.length)) throw new WorkerError('RECOVERY_REQUIRED');
     if(this.spoolReady&&spec.kind!=='reread')await assertCaptureCapacity(this.cfg.captureSpoolDirectory!,this.cfg.captureMaxBytes);
     const id = randomUUID();
     const journal=this.spoolReady&&spec.kind!=='reread'?{...spec,capture:{version:1,storage:'spool',binding:this.captureBinding(),max_bytes:this.cfg.captureMaxBytes}}:spec;
-    await this.db().query('INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)', [id, this.cfg.sourceKey, this.target, JSON.stringify(journal)]);
+    if(decision.authorizationId)Object.assign(journal,{continuity:{authorization_id:decision.authorizationId,parent_id:historicalRead,historical_gap:true}});
+    if(decision.authorizationId){
+      const inserted=await this.db().query(`INSERT INTO olos_http.reads(id,source_key,target_table,spec)
+        SELECT $1,$2,$3,$4 FROM olos_http.capture_continuity a WHERE authorization_id=$5
+        AND source_key=$2 AND target_table=$3 AND revoked_at IS NULL AND expires_at>clock_timestamp()
+        AND EXISTS(SELECT 1 FROM olos_http.reads parent WHERE parent.id=a.parent_id
+          AND encode(sha256(convert_to(to_jsonb(parent)::text,'UTF8')),'hex')=a.parent_hash)
+        AND NOT EXISTS(SELECT 1 FROM olos_http.reads WHERE source_key=$2 AND state IN ('reading','received') AND id<>a.parent_id)`,
+        [id,this.cfg.sourceKey,this.target,JSON.stringify(journal),decision.authorizationId]);
+      if(inserted.rowCount!==1)throw new WorkerError('CONTINUITY_ADMISSION_CHANGED');
+    }else await this.db().query('INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)', [id, this.cfg.sourceKey, this.target, JSON.stringify(journal)]);
+    if(decision.authorizationId)log('capture_with_historical_gap',{read_id:id,parent_id:historicalRead,authorization_id:decision.authorizationId,historical_gap:true});
     return id;
+    }finally{this.admitting=false;}
   }
   private async recoveryAuthorization(parentId: string) {
     const parent=(await this.db().query<Read>('SELECT id,spec,state,started_at,error_code,response_body,processed_count FROM olos_http.reads WHERE id=$1 AND source_key=$2 AND target_table=$3',

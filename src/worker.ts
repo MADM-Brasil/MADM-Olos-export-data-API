@@ -80,7 +80,7 @@ export class Worker {
         if(!this.api.capture)throw new WorkerError('CAPTURE_TRANSPORT_REQUIRED');
         await this.store.recoverPublishedCaptures();
       }
-      if ((await this.store.unresolved()).length) throw new WorkerError('RECOVERY_REQUIRED');
+      if ((await this.store.capturePending()).length) throw new WorkerError('RECOVERY_REQUIRED');
       await this.api.auth.getToken();
       await this.api.validateCaptureCatalog();
       // open() holds the source lock; beginRead rechecks pending reads and commits intent.
@@ -125,7 +125,7 @@ export class Worker {
         if(spec.kind!=='reread'&&!this.api.capture)throw new WorkerError('CAPTURE_TRANSPORT_REQUIRED');
         await this.store.recoverPublishedCaptures();
       }
-      const existing = await this.store.unresolved();
+      const existing = spec.kind==='current'&&!recovery?await this.store.capturePending():await this.store.unresolved();
       if (existing.some(r => r.state === 'reading') && !recovery) throw new WorkerError('RECOVERY_REQUIRED');
       await this.initialize();
       const recovered = await this.store.drain(this.cache.value);
