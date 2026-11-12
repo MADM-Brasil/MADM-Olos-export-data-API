@@ -2,6 +2,8 @@
 
 Implementação local. Nenhum comando abaixo foi executado em produção. Não há migração nova.
 
+Este documento descreve o manifesto **v1**, para IDs conhecidos e garantias administrativas já obtidas. Para coletar evidência progressivamente sem afirmar IDs individuais antes da resposta, usar o [manifesto v2 de captura progressiva](exportdata-progressive-recovery.md). O v2 não autoriza resolver a leitura original nem presume segurança do cursor.
+
 ## Condição de segurança
 
 `read-data-current-day` recebe somente `TableName`. O código e o catálogo não comprovam uma recaptura integral nem ausência de consumo do cursor. A pesquisa pública não encontrou contrato oficial suficiente. Continuamos tratando esse POST como potencialmente consumptivo, sem retry. `RESPONSE_TOO_LARGE`, `processed_count=0`, os 8.220 registros da leitura anterior e o maior ID local **não provam o intervalo perdido**.

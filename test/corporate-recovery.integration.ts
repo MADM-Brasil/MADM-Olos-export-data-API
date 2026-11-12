@@ -128,7 +128,7 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
     await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
   }
   try {
-    for(const mode of ['quarantined legacy queue','unmaterialized admission'] as const)await t.test(`capture recovery preserves corporate receipts and quarantine with ${mode}`,async()=>{
+    for(const version of [1,2])for(const mode of ['quarantined legacy queue','unmaterialized admission'] as const)await t.test(`capture recovery v${version} preserves corporate receipts and quarantine with ${mode}`,async()=>{
       await reset(mode==='quarantined legacy queue'?2:0);
       if(mode==='quarantined legacy queue'){
         await insertRemote(0,{telefone:'5511999999999'});await quarantine(args((await verify()).verification_digest));
@@ -140,9 +140,12 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       const manifest:RecoveryManifest={version:1,sourceKey:source,targetTable:target,parentId:parent,parentStartedAt:'2026-11-12T13:00:00.000Z',date:'2026-11-12',
         evidenceRef:'SYNTHETIC-OLOS-TICKET',evidenceSha256:fingerprint('synthetic official evidence'),remoteOperationComplete:true,rereadCursorSafe:true,exactIdsConfirmed:true,
         operation:{start:'9001',end:'9001',quantity:'1',dateRead:'2026-11-12T10:00:00.123'},ranges:[{start:'9001',end:'9001',expectedIds:['9001']}]};
-      const hash=await store!.authorizeRecovery(manifest),child=await store!.beginRecoveryRead(parent,{kind:'reread',date:manifest.date,start:'9001',end:'9001'},hash);
+      const {remoteOperationComplete,rereadCursorSafe,exactIdsConfirmed,ranges,...base}=manifest;
+      const progressive={...base,version:2 as const,mode:'progressive' as const,documentationRef:'ExportDataV3-v1.1.0/re-read-data',ranges:ranges.map(({start,end})=>({start,end}))};
+      const hash=await store!.authorizeRecovery(version===1?manifest:progressive),child=await store!.beginRecoveryRead(parent,{kind:'reread',date:manifest.date,start:'9001',end:'9001'},hash);
       await store!.stage(child,JSON.stringify([row(9001)]),1);assert.equal((await store!.drain(references)).queued,1);
-      assert.equal((await store!.verifyRecovery(parent)).complete,true);
+      const report=await store!.verifyRecovery(parent);assert.equal(report.complete,version===1);
+      if(version===2){assert('coverage_complete' in report);assert.equal(report.coverage_complete,true);}
       assert.deepEqual((await entries()).filter(entry=>entry.source_id!=='9001'),queue);
       assert.deepEqual(await quarantineRows(),quarantined);assert.deepEqual(await quarantineRuns(),runs);
       assert.deepEqual(await control(),before);assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls')).rows,destination);

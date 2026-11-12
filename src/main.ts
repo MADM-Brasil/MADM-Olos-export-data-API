@@ -24,7 +24,7 @@ async function main() {
     if(args.length!==3)throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
     return loadRecoveryManifest(args[0]!,args[1]!,args[2]!,process.env.OLOS_REREAD_CONFIRMATION);
   })() : undefined;
-  if(command==='capture-reread'&&(args.length!==6||args[4]!=='--authorization'))throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
+  if(command==='capture-reread'&&(![6,7].includes(args.length)||args[4]!=='--authorization'||(args.length===7&&args[6]!=='--missing-only')))throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
   if(command==='capture-reread')recoveryHash(args[5]);
   if (readoptionAction(command)||['corporate-check','corporate-status','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator'].includes(command)) { await corporateControl(cfg, command, args); return; }
   if (command === 'start' || command === 'admin') { await runManaged(cfg, command === 'admin'); return; }
@@ -71,8 +71,10 @@ async function main() {
       log('recovery_authorized',{read_id:recovery!.parentId,authorization_hash:await store.authorizeRecovery(recovery!)});return;
     }
     if(command==='recovery-verify'){
-      if(args.length!==1)throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
-      const report=await store.verifyRecovery(args[0]!);log('recovery_coverage',report);
+      if(args.length!==1&&(args.length!==3||args[1]!=='--output'))throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
+      const report={...await store.verifyRecovery(args[0]!),verified_at:new Date().toISOString()};
+      if(args.length===3)await writeFile(args[2]!,JSON.stringify(report,null,2),{mode:0o600,flag:'wx'});
+      const {unobserved_ranges,...summary}=report;log('recovery_coverage',summary);
       if(!report.complete)process.exitCode=1;return;
     }
     if (command === 'resolve') {
@@ -117,7 +119,7 @@ async function main() {
       if (!parentId || !date || !start || !end) {
         throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
       }
-      await worker.captureReread(parentId, date, start, end, args[5]!);
+      await worker.captureReread(parentId, date, start, end, args[5]!,args.length===7);
     }
     else if (command === 'capture-once') await worker.captureOnce();
     else {

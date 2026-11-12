@@ -12,7 +12,7 @@ export function rows(raw: string): Record<string, unknown>[] {
   return value as Record<string, unknown>[];
 }
 export type ReadSpec = { kind: 'current' | 'previous' } | { kind: 'reread'; date: string; start: string; end: string;
-  recovery?: { parentId: string; authorizationHash: string } };
+  recovery?: { parentId: string; authorizationHash: string; missingOnly?: true } };
 export function readFields(spec: ReadSpec) {
   if (spec.kind !== 'reread') return { TableName: 'AttemptsRawData' };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(spec.date) || !Number.isFinite(Date.parse(spec.date)) || new Date(spec.date).toISOString().slice(0,10) !== spec.date ||

@@ -9,7 +9,7 @@ import { lockSource } from './source-lock.js';
 import { CorporateDelivery } from './corporate-delivery/delivery.js';
 import { assertNoDirectOwnership } from './corporate-sync/ownership.js';
 import { admissionHash } from './corporate-delivery/allocator.js';
-import { authorization, fingerprint, recoveryBinding, recoveryHash, recoveryManifest, type RecoveryAuthorization, type RecoveryManifest } from './read-recovery.js';
+import { authorization, fingerprint, recoveryBinding, recoveryHash, recoveryManifest, type RecoveryAuthorization, type RecoveryPlan } from './read-recovery.js';
 
 type Read = { id: string; spec: ReadSpec & { recovery_authorization?: RecoveryAuthorization }; state: string;
   started_at: Date; error_code: string|null; response_body: string | null; processed_count: number; received_count: number|null; request_ms: number | null };
@@ -82,7 +82,7 @@ export class Store {
     if(approved.manifest.parentId!==parentId||Date.parse(approved.manifest.parentStartedAt)!==parent.started_at.getTime())throw new WorkerError('RECOVERY_AUTHORIZATION_CHANGED');
     return {parent,approved};
   }
-  async authorizeRecovery(input: RecoveryManifest) {
+  async authorizeRecovery(input: RecoveryPlan) {
     if(!this.cfg.sourceIdConfirmed)throw new WorkerError('SOURCE_ID_UNIQUENESS_UNCONFIRMED');
     const manifest=recoveryManifest(input);
     if(manifest.sourceKey!==this.cfg.sourceKey||manifest.targetTable!==this.target)throw new WorkerError('RECOVERY_SOURCE_MISMATCH');
@@ -103,41 +103,51 @@ export class Store {
       commitIssued=true;await db.query('COMMIT');return approved.hash;
     }catch(error){await db.query('ROLLBACK').catch(()=>{});if(commitIssued)throw new WorkerError('RECOVERY_AUTHORIZATION_COMMIT_UNKNOWN');throw error;}
   }
-  async validateRecoveryRead(parentId: string, spec: ReadSpec, approvalHash: string) {
+  async validateRecoveryRead(parentId: string, spec: ReadSpec, approvalHash: string, missingOnly=false) {
     if (spec.kind !== 'reread') throw new WorkerError('RECOVERY_SPEC_REQUIRED');
     readFields(spec);
     const {parent,approved}=await this.recoveryAuthorization(parentId);
     if(parent.state!=='reading'||recoveryHash(approvalHash)!==approved.hash||spec.date!==approved.manifest.date||
-      !approved.manifest.ranges.some(range=>range.start===spec.start&&range.end===spec.end))throw new WorkerError('RECOVERY_OUTSIDE_AUTHORIZED_RANGE');
+      (missingOnly&&approved.manifest.version!==2)||!approved.manifest.ranges.some(range=>missingOnly
+        ? BigInt(range.start)<=BigInt(spec.start)&&BigInt(range.end)>=BigInt(spec.end)
+        : range.start===spec.start&&range.end===spec.end))throw new WorkerError('RECOVERY_OUTSIDE_AUTHORIZED_RANGE');
     const pending = await this.unresolved();
     if (pending.some(r => r.id !== parentId)) {
       throw new WorkerError('RECOVERY_REQUIRED');
     }
 
     const previous = await this.db().query(
-      "SELECT spec FROM olos_http.reads WHERE source_key=$1 AND target_table=$2 AND spec->>'kind'='reread'",
+      "SELECT id,spec,state,processed_count,received_count FROM olos_http.reads WHERE source_key=$1 AND target_table=$2 AND spec->>'kind'='reread'",
       [this.cfg.sourceKey, this.target]
     );
 
+    let precedingObservation=false;
     for (const row of previous.rows) {
       const other = row.spec;
       if (other.date !== spec.date) continue;
 
       if (BigInt(spec.start) <= BigInt(other.end) &&
           BigInt(spec.end) >= BigInt(other.start)) {
-        throw new WorkerError('RECOVERY_RANGE_OVERLAP');
+        if(!missingOnly||row.state!=='done'||other.recovery?.parentId!==parentId||other.recovery.authorizationHash!==approvalHash||other.recovery.missingOnly)throw new WorkerError('RECOVERY_RANGE_OVERLAP');
+        const body=(await this.db().query<{response_body:string}>('SELECT response_body FROM olos_http.reads WHERE id=$1 AND source_key=$2',[row.id,this.cfg.sourceKey])).rows[0]!.response_body;
+        if(Buffer.byteLength(body)>this.cfg.recoveryMaxResponseBytes)throw new WorkerError('RESPONSE_TOO_LARGE');
+        const data=rows(body);
+        if(row.processed_count!==data.length||row.received_count!==data.length)throw new WorkerError('RECOVERY_CHECKPOINT_INVALID');
+        const hashes=await this.validateRecoveryResponse(row,data,{users:new Map(),campaigns:new Map(),dispositions:new Map()},approved);
+        if([...hashes.keys()].some(id=>BigInt(id)>=BigInt(spec.start)&&BigInt(id)<=BigInt(spec.end)))throw new WorkerError('RECOVERY_RANGE_ALREADY_OBSERVED');
+        precedingObservation=true;
       }
     }
-
+    if(missingOnly&&!precedingObservation)throw new WorkerError('RECOVERY_MISSING_ONLY_REQUIRES_OBSERVATION');
   }
 
-  async beginRecoveryRead(parentId: string, spec: ReadSpec, approvalHash: string) {
+  async beginRecoveryRead(parentId: string, spec: ReadSpec, approvalHash: string, missingOnly=false) {
     await this.captureReady();
-    await this.validateRecoveryRead(parentId, spec, approvalHash);
+    await this.validateRecoveryRead(parentId, spec, approvalHash, missingOnly);
     const id = randomUUID();
     await this.db().query(
       'INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)',
-      [id, this.cfg.sourceKey, this.target, JSON.stringify({...spec,recovery:{parentId,authorizationHash:approvalHash}})]
+      [id, this.cfg.sourceKey, this.target, JSON.stringify({...spec,recovery:{parentId,authorizationHash:approvalHash,...(missingOnly?{missingOnly:true}:{})}})]
     );
     return id;
   }
@@ -196,21 +206,27 @@ export class Store {
     if(read.spec.kind!=='reread'||!read.spec.recovery)throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
     const spec=read.spec;
     const approved=approvedInput??(await this.recoveryAuthorization(spec.recovery!.parentId)).approved;
-    const range=approved.manifest.ranges.find(range=>range.start===spec.start&&range.end===spec.end);
+    const range=approved.manifest.ranges.find(range=>spec.recovery!.missingOnly&&approved.manifest.version===2
+      ? BigInt(range.start)<=BigInt(spec.start)&&BigInt(range.end)>=BigInt(spec.end)
+      : range.start===spec.start&&range.end===spec.end);
     if(approved.hash!==read.spec.recovery.authorizationHash||read.spec.date!==approved.manifest.date||!range)throw new WorkerError('RECOVERY_AUTHORIZATION_CHANGED');
-    const hashes=new Map<string,string>(),expected=new Set(range.expectedIds);
+    if(spec.recovery!.missingOnly&&approved.manifest.version!==2)throw new WorkerError('RECOVERY_AUTHORIZATION_CHANGED');
+    const expected=approved.manifest.version===1?new Set(approved.manifest.ranges.find(r=>r.start===spec.start&&r.end===spec.end)!.expectedIds):undefined;
+    const hashes=new Map<string,string>();
     for(const row of data){
       const mapped=mapRecord(row,cache,this.cfg.sourceTimeZone,!!this.delivery);
-      if(!expected.has(mapped.source_id))throw new WorkerError('RECOVERY_RESPONSE_COVERAGE_MISMATCH');
+      if(expected&&!expected.has(mapped.source_id))throw new WorkerError('RECOVERY_RESPONSE_COVERAGE_MISMATCH');
+      if(BigInt(mapped.source_id)<BigInt(spec.start)||BigInt(mapped.source_id)>BigInt(spec.end))throw new WorkerError('RECOVERY_RESPONSE_OUTSIDE_RANGE');
       if(hashes.has(mapped.source_id)&&hashes.get(mapped.source_id)!==mapped.source_hash)throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
       if(this.cfg.ingestionBaseline&&(mapped.data_ligacao===null||Date.parse(mapped.data_ligacao)<Date.parse(this.cfg.ingestionBaseline)))throw new WorkerError('RECOVERY_BASELINE_EXCLUDES_RECORD');
       hashes.set(mapped.source_id,mapped.source_hash);
     }
-    if(hashes.size!==expected.size)throw new WorkerError('RECOVERY_RESPONSE_COVERAGE_MISMATCH');
+    if(expected&&hashes.size!==expected.size)throw new WorkerError('RECOVERY_RESPONSE_COVERAGE_MISMATCH');
     if(!checkExisting)return hashes;
     // Detect conflicts across the entire child before committing its first processing batch.
-    for(let offset=0;offset<range.expectedIds.length;offset+=this.cfg.batchSize){
-      const records=await this.recoveryRecords(range.expectedIds.slice(offset,offset+this.cfg.batchSize));
+    const observed=[...hashes.keys()];
+    for(let offset=0;offset<observed.length;offset+=this.cfg.batchSize){
+      const records=await this.recoveryRecords(observed.slice(offset,offset+this.cfg.batchSize));
       if(records.some(record=>record.target_table!==this.target||record.source_hash!==hashes.get(record.source_id)))throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
       if(records.some(record=>!record.present))throw new WorkerError('RECOVERY_PERSISTENCE_DIVERGES');
     }
@@ -238,6 +254,7 @@ export class Store {
     const {parent,approved}=await this.recoveryAuthorization(parentId);
     const children=(await this.db().query<Read>("SELECT id,spec,state,processed_count,received_count FROM olos_http.reads WHERE source_key=$1 AND target_table=$2 AND spec->'recovery'->>'parentId'=$3 ORDER BY started_at,id",
       [this.cfg.sourceKey,this.target,parentId])).rows;
+    if(approved.manifest.version===2)return this.verifyProgressiveRecovery(parentId,parent,approved,children);
     let covered=0,missing=0,conflicts=0,completed=0;
     const proof:string[]=[approved.hash];
     const empty:Cache={users:new Map(),campaigns:new Map(),dispositions:new Map()};
@@ -264,7 +281,55 @@ export class Store {
     const expected=approved.manifest.ranges.reduce((n,range)=>n+range.expectedIds.length,0);
     const complete=missing===0&&conflicts===0&&covered===expected&&completed===children.length&&completed===approved.manifest.ranges.length&&pending===0;
     return {parent_id:parentId,parent_state:parent.state,complete,expected,covered,missing,conflicts,children:children.length,completed,pending,
-      verification_digest:complete?fingerprint(JSON.stringify(proof)):null};
+      verification_digest:complete?fingerprint(JSON.stringify(proof)):null,unobserved_ranges:[] as {start:string;end:string}[]};
+  }
+  private async verifyProgressiveRecovery(parentId:string,parent:Read,approved:RecoveryAuthorization,children:Read[]) {
+    if(approved.manifest.version!==2)throw new WorkerError('RECOVERY_MANIFEST_INVALID');
+    const manifest=approved.manifest,observed=new Map<string,string>(),proof=[approved.hash];
+    let completed=0,conflicts=0,covered=0,missingLocal=0;
+    const empty:Cache={users:new Map(),campaigns:new Map(),dispositions:new Map()};
+    for(const child of children){
+      if(child.state!=='done')continue;
+      const body=(await this.db().query<{response_body:string}>('SELECT response_body FROM olos_http.reads WHERE id=$1 AND source_key=$2',[child.id,this.cfg.sourceKey])).rows[0]!.response_body;
+      if(Buffer.byteLength(body)>this.cfg.recoveryMaxResponseBytes)throw new WorkerError('RESPONSE_TOO_LARGE');
+      const data=rows(body),hashes=await this.validateRecoveryResponse(child,data,empty,approved,false);
+      if(child.processed_count!==data.length||child.received_count!==data.length)continue;
+      completed++;proof.push(child.id,fingerprint(body));
+      for(const [id,hash] of hashes){
+        if(observed.has(id)&&observed.get(id)!==hash)conflicts++;
+        else observed.set(id,hash);
+      }
+    }
+    const ids=[...observed.keys()].sort((a,b)=>BigInt(a)<BigInt(b)?-1:BigInt(a)>BigInt(b)?1:0);
+    for(let offset=0;offset<ids.length;offset+=this.cfg.batchSize){
+      const batch=ids.slice(offset,offset+this.cfg.batchSize),records=new Map((await this.recoveryRecords(batch)).map(record=>[record.source_id,record]));
+      for(const id of batch){
+        const record=records.get(id);
+        if(!record)missingLocal++;
+        else if(record.source_hash!==observed.get(id)||record.target_table!==this.target)conflicts++;
+        else if(!record.present)missingLocal++;
+        else{covered++;proof.push(id,record.source_hash);}
+      }
+    }
+    // These are candidate positions from the official bounds, never asserted source IDs.
+    const gaps:{start:string;end:string}[]=[],end=BigInt(manifest.operation.end);
+    let unobserved=0;
+    for(let n=BigInt(manifest.operation.start);n<=end;n++){
+      if(observed.has(String(n)))continue;
+      unobserved++;
+      const last=gaps.at(-1);
+      if(last&&BigInt(last.end)+1n===n)last.end=String(n);else gaps.push({start:String(n),end:String(n)});
+    }
+    const pending=(await this.unresolved()).filter(read=>read.id!==parentId).length;
+    const blocks=manifest.ranges.filter(range=>children.some(child=>child.state==='done'&&child.spec.kind==='reread'&&!child.spec.recovery?.missingOnly&&child.spec.start===range.start&&child.spec.end===range.end)).length;
+    const coverageComplete=unobserved===0&&conflicts===0&&missingLocal===0&&covered===Number(manifest.operation.quantity)&&completed===children.length&&blocks===manifest.ranges.length&&pending===0;
+    // V2 authorizes evidence gathering, not assertions about completion or cursor safety.
+    // Even exhaustive observed coverage cannot resolve the uncertain original operation.
+    return {parent_id:parentId,parent_state:parent.state,complete:false,resolution_allowed:false,reconciliation_required:true,
+      expected:Number(manifest.operation.quantity),covered,missing:missingLocal,conflicts,children:children.length,completed,pending,
+      candidate_positions:Number(end-BigInt(manifest.operation.start)+1n),observed_unique:observed.size,unobserved_positions:unobserved,
+      blocks_completed:blocks,coverage_complete:coverageComplete,coverage_digest:coverageComplete?fingerprint(JSON.stringify(proof)):null,
+      verification_digest:null,unobserved_ranges:gaps};
   }
   private async persist(readId: string, input: MappedRecord[], processed: number, received: number) {
     const db = this.db();

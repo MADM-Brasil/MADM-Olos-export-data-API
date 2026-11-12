@@ -28,7 +28,7 @@ export class Worker {
   private active = false;
   private initialized = false;
   constructor(readonly store: Store, readonly api: OlosApi, readonly cache: StaticCache) {}
-  async captureReread(parentId: string, date: string, start: string, end: string, approvalHash: string) {
+  async captureReread(parentId: string, date: string, start: string, end: string, approvalHash: string, missingOnly=false) {
     if (this.active) throw new WorkerError('POLL_ALREADY_ACTIVE');
 
     const spec = { kind: 'reread' as const, date, start, end };
@@ -41,11 +41,11 @@ export class Worker {
     this.active = true;
     try {
       await this.store.ping();
-      await this.store.validateRecoveryRead(parentId, spec, approvalHash);
+      await this.store.validateRecoveryRead(parentId, spec, approvalHash, missingOnly);
       await this.api.auth.getToken();
       await this.api.validateCaptureCatalog();
 
-      const id = await this.store.beginRecoveryRead(parentId, spec, approvalHash);
+      const id = await this.store.beginRecoveryRead(parentId, spec, approvalHash, missingOnly);
       const started = performance.now();
 
       try {

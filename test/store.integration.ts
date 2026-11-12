@@ -1,6 +1,6 @@
 import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile,mkdtemp,writeFile,rm } from 'node:fs/promises';
+import { readFile,mkdtemp,writeFile,rm,stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
@@ -17,7 +17,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { fingerprint,type RecoveryManifest,type RecoveryRange } from '../src/read-recovery.js';
+import { fingerprint,type RecoveryManifest,type RecoveryRange,type ProgressiveRecoveryManifest } from '../src/read-recovery.js';
 
 const execute=promisify(execFile);
 
@@ -566,7 +566,7 @@ test('a near-budget synthetic recovery uses bounded batches and stays below the 
   console.log(JSON.stringify({test:'synthetic_scoped_reread_2000_rows',response_bytes:Buffer.byteLength(body),batch_size:s.cfg.batchSize,duration_ms:Math.round(performance.now()-start),max_rss_bytes:maxRss}));
   assert(maxRss<1536*1024*1024);
 });
-test('compiled administrative CLI authorizes, captures once, verifies and resolves using real local HTTP and PostgreSQL',async()=>{
+for(const version of [1,2])test(`compiled administrative CLI v${version} captures once and preserves its resolution policy with local HTTP and PostgreSQL`,async()=>{
   let rereads=0,current=0;
   const catalog=[{TableName:'AttemptsRawData',Columns:['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId']},
     {TableName:'Users',Columns:['AgentId','UserName']},{TableName:'Campaign',Columns:['CampaignId','Description']},{TableName:'Disposition',Columns:['DispositionId','Description']}];
@@ -589,17 +589,101 @@ test('compiled administrative CLI authorizes, captures once, verifies and resolv
     const s=await store(config(env)),p=await recoveryPlan(s,undefined,false);await s.close();stores.splice(stores.indexOf(s),1);
     const evidence=JSON.stringify([{TableName:'AttemptsRawData',PKColumnName:'AttemptsRawDataID',DateExport:'2026-11-12T00:00:00',
       PKIDStart:1,PKIDEnd:3,Quantity:3,DateRead:p.manifest.operation.dateRead}]);
-    p.manifest.evidenceSha256=fingerprint(evidence);const raw=JSON.stringify(p.manifest),mp=join(dir,'manifest.json'),ep=join(dir,'official-log.json');
+    p.manifest.evidenceSha256=fingerprint(evidence);
+    const {remoteOperationComplete,rereadCursorSafe,exactIdsConfirmed,ranges,...base}=p.manifest;
+    const progressive={...base,version:2,mode:'progressive',documentationRef:'ExportDataV3-v1.1.0/re-read-data',ranges:ranges.map(({start,end})=>({start,end}))};
+    const raw=JSON.stringify(version===1?p.manifest:progressive),mp=join(dir,'manifest.json'),ep=join(dir,'official-log.json');
     await writeFile(mp,raw,{mode:0o600});await writeFile(ep,evidence,{mode:0o600});
     const args=['recovery-authorize',mp,ep,fingerprint(raw)];
     await assert.rejects(cli(args),(error:unknown)=>typeof error==='object'&&error!==null&&'stdout' in error&&String(error.stdout).includes('RECOVERY_NOT_AUTHORIZED'));
     const approved=JSON.parse((await cli(args,true)).stdout.trim());assert.equal(approved.event,'recovery_authorized');
     const captured=await cli(['capture-reread',p.parent,'2026-11-12','1','3','--authorization',approved.authorization_hash]);
     assert.match(captured.stdout,/capture_reread_received/);
-    await cli(['recover-local']);const coverage=JSON.parse((await cli(['recovery-verify',p.parent])).stdout.trim());
-    assert.equal(coverage.complete,true);assert.equal(coverage.covered,3);
-    await cli(['resolve',p.parent,`recovery:${coverage.verification_digest}`]);assert.equal((await cli(['status'])).stdout,'');
-    assert.equal(JSON.parse((await cli(['recovery-verify',p.parent])).stdout.trim()).parent_state,'resolved');
+    await cli(['recover-local']);const output=join(dir,'audit.json');
+    let stdout='';
+    try{stdout=(await cli(['recovery-verify',p.parent,'--output',output])).stdout;}
+    catch(error){assert.equal(version,2);assert(error&&typeof error==='object'&&'stdout' in error);stdout=String(error.stdout);}
+    const coverage=JSON.parse(stdout.trim());assert.equal(coverage.complete,version===1);assert.equal(coverage.covered,3);
+    const audit=JSON.parse(await readFile(output,'utf8'));assert.deepEqual(audit.unobserved_ranges,[]);assert.equal((await stat(output)).mode&0o077,0);
+    assert(!('unobserved_ranges' in coverage));assert(audit.verified_at);
+    if(version===1){
+      await cli(['resolve',p.parent,`recovery:${coverage.verification_digest}`]);assert.equal((await cli(['status'])).stdout,'');
+      assert.equal(JSON.parse((await cli(['recovery-verify',p.parent])).stdout.trim()).parent_state,'resolved');
+    }else{
+      assert.equal(coverage.coverage_complete,true);assert.equal(coverage.resolution_allowed,false);
+      await assert.rejects(cli(['resolve',p.parent,`recovery:${coverage.coverage_digest}`]),(error:unknown)=>!!error&&typeof error==='object'&&'stdout' in error&&String(error.stdout).includes('COVERAGE_NOT_PROVEN'));
+      assert.match((await cli(['status'])).stdout,/reading/);
+    }
     assert.equal(rereads,1);assert.equal(current,0);assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
   }finally{await new Promise<void>(resolve=>http.close(()=>resolve()));await rm(dir,{recursive:true,force:true});}
+});
+
+async function progressivePlan(s:Store,ranges=[{start:'1',end:'3'}],quantity='3') {
+  const parent=await s.beginRead({kind:'current'});await s.markError(parent,'RESPONSE_TOO_LARGE');
+  await pool.query("UPDATE olos_http.reads SET started_at='2026-11-12T13:00:00Z' WHERE id=$1",[parent]);
+  const manifest:ProgressiveRecoveryManifest={version:2,sourceKey:s.cfg.sourceKey,targetTable:s.target,parentId:parent,parentStartedAt:'2026-11-12T13:00:00.000Z',date:'2026-11-12',
+    evidenceRef:'SYNTHETIC-OLOS-LOG',evidenceSha256:fingerprint('synthetic official evidence'),mode:'progressive',documentationRef:'ExportDataV3-v1.1.0/re-read-data',
+    operation:{start:ranges[0]!.start,end:ranges.at(-1)!.end,quantity,dateRead:'2026-11-12T10:00:00.123'},ranges};
+  const hash=await s.authorizeRecovery(manifest);
+  const capture=(start=ranges[0]!.start,end=ranges[0]!.end,missingOnly=false)=>s.beginRecoveryRead(parent,{kind:'reread',date:manifest.date,start,end},hash,missingOnly);
+  return {parent,manifest,hash,capture};
+}
+test('progressive recovery distinguishes raw count and extremes from exhaustive observed coverage',async()=>{
+  const s=await store(),p=await progressivePlan(s),child=await p.capture();
+  const original=(await pool.query('SELECT state,response_body,processed_count,error_code,started_at FROM olos_http.reads WHERE id=$1',[p.parent])).rows;
+  // Three rows and both official extremes still leave the interior ID unobserved.
+  await s.stage(child,JSON.stringify([row('1'),row('3'),row('1')]),1);const result=await s.drain(cache);
+  assert.equal(result.inserted,2);assert.equal(result.duplicates,1);
+  const report=await s.verifyRecovery(p.parent);assert.equal(report.complete,false);
+  assert('coverage_complete' in report);assert.equal(report.coverage_complete,false);assert.equal(report.observed_unique,2);assert.equal(report.covered,2);
+  assert.deepEqual(report.unobserved_ranges,[{start:'2',end:'2'}]);assert.equal(report.verification_digest,null);
+  await assert.rejects(p.capture('1','1',true),/RANGE_ALREADY_OBSERVED/);
+  await assert.rejects(p.capture('2','2'),/OUTSIDE_AUTHORIZED_RANGE/);
+  const supplement=await p.capture('2','2',true);await s.stage(supplement,JSON.stringify([row('2')]),1);await s.drain(cache);
+  const complete=await s.verifyRecovery(p.parent);assert('coverage_complete' in complete);assert.equal(complete.coverage_complete,true);
+  assert.equal(complete.covered,3);assert.equal(complete.complete,false);assert.equal(complete.resolution_allowed,false);assert(complete.coverage_digest);
+  await assert.rejects(s.resolve(p.parent,`recovery:${complete.coverage_digest}`),/COVERAGE_NOT_PROVEN/);
+  await assert.rejects(p.capture('2','2',true),/RANGE_OVERLAP/);
+  assert.deepEqual((await pool.query('SELECT state,response_body,processed_count,error_code,started_at FROM olos_http.reads WHERE id=$1',[p.parent])).rows,original);
+});
+test('empty progressive observations permit other planned blocks but never establish absence or resolution',async()=>{
+  const s=await store(),p=await progressivePlan(s,[{start:'1',end:'2'},{start:'3',end:'4'}],'4');
+  await assert.rejects(p.capture('1','1',true),/MISSING_ONLY_REQUIRES_OBSERVATION/);
+  const empty=await p.capture('1','2');await s.stage(empty,'[]',1);await s.drain(cache);
+  const next=await p.capture('3','4');await s.stage(next,JSON.stringify([row('3'),row('4')]),1);await s.drain(cache);
+  const supplement=await p.capture('1','2',true);await s.stage(supplement,'[]',1);await s.drain(cache);
+  const report=await s.verifyRecovery(p.parent);assert('coverage_complete' in report);assert.equal(report.coverage_complete,false);assert.equal(report.covered,2);
+  assert.deepEqual(report.unobserved_ranges,[{start:'1',end:'2'}]);assert.equal(report.complete,false);
+  await assert.rejects(p.capture('1','2',true),/RANGE_OVERLAP/);
+  await assert.rejects(s.resolve(p.parent,'unobserved positions do not prove absence'),/COVERAGE_NOT_PROVEN/);
+});
+test('a sparse observation matching official quantity and both extremes does not prove the intervening position absent',async()=>{
+  const s=await store(),p=await progressivePlan(s,[{start:'1',end:'3'}],'2'),child=await p.capture();await s.stage(child,JSON.stringify([row('1'),row('3')]),1);await s.drain(cache);
+  const report=await s.verifyRecovery(p.parent);assert('coverage_complete' in report);assert.equal(report.covered,report.expected);
+  assert.equal(report.unobserved_positions,1);assert.equal(report.coverage_complete,false);assert.equal(report.complete,false);
+  assert.deepEqual(report.unobserved_ranges,[{start:'2',end:'2'}]);
+});
+for(const failure of ['NETWORK_OR_RESPONSE_FAILURE','RESPONSE_TOO_LARGE'])test(`progressive ${failure} never triggers a second HTTP request or another block`,async()=>{
+  const s=await store(),p=await progressivePlan(s,[{start:'1',end:'1'},{start:'2',end:'3'}]);
+  const mock=fakeApi(async()=>{throw new WorkerError(failure,true);}),worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await assert.rejects(worker.captureReread(p.parent,p.manifest.date,'1','1',p.hash),/RECOVERY_REQUIRED/);
+  await assert.rejects(worker.captureReread(p.parent,p.manifest.date,'2','3',p.hash),/RECOVERY_REQUIRED/);
+  assert.equal(mock.count(),1);const read=(await s.unresolved()).find(read=>read.id!==p.parent)!;
+  assert.equal(read.state,'reading');assert.equal(read.response_body,null);assert.equal(read.processed_count,0);
+  await assert.rejects(p.capture('1','1',true),/RECOVERY_REQUIRED/);
+});
+for(const data of [[row('1'),row('4')],[row('1'),row('2'),row('1',{CallId:'changed'})]])test('progressive integrity failures preserve the body and write no processing checkpoint',async()=>{
+  const s=await store(),p=await progressivePlan(s),child=await p.capture();await s.stage(child,JSON.stringify(data),1);
+  await assert.rejects(s.drain(cache),/RESPONSE_OUTSIDE_RANGE|SOURCE_ID_CONTENT_CONFLICT/);
+  const read=(await s.unresolved()).find(read=>read.id===child)!;assert.equal(read.state,'received');assert.equal(read.processed_count,0);assert(read.response_body);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,0);
+});
+test('progressive durable observations resume after restart without recapture or premature completion',async()=>{
+  const s=await store(),p=await progressivePlan(s),child=await p.capture();await s.stage(child,JSON.stringify([row('1'),row('2'),row('3')]),1);
+  const query=s.client!.query.bind(s.client!);let lost=false;
+  s.client!.query=(async(sql:string,parameters?:unknown[])=>{const result=await query(sql,parameters);if(sql==='COMMIT'&&!lost){lost=true;throw new Error('synthetic lost processing ACK');}return result;}) as typeof query;
+  await assert.rejects(s.drain(cache));s.client!.query=query;await s.close();stores.splice(stores.indexOf(s),1);
+  const next=await store();assert.equal((await next.drain(cache)).inserted,1);assert.equal((await next.drain(cache)).inserted,0);
+  const report=await next.verifyRecovery(p.parent);assert('coverage_complete' in report);assert.equal(report.coverage_complete,true);assert.equal(report.complete,false);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
 });
