@@ -16,11 +16,12 @@ export async function createScheduledConsumer(cfg: Config,
   if (!cfg.ingestionBaseline || !cfg.sourceTimeZone) throw new WorkerError('POLLING_CONFIGURATION_REQUIRED');
   const abort = new AbortController();
   // Only unexpected database session loss aborts HTTP, never pause/stop/credentials edits.
-  const store = new Store(cfg, () => abort.abort());
+  const store = new Store(cfg, () => abort.abort(),abort.signal);
   let http: HttpTransport | undefined, worker: Worker | undefined, revision = -1;
   try {
     await store.open();
     await store.captureReady();
+    if(cfg.captureSpoolDirectory)await store.recoverPublishedCaptures();
     await assertRecoverable(store);
     const initial = await snapshot();
     if (!Object.values(initial.credentials).every(Boolean)) throw new WorkerError('OLOS_CONFIG_REQUIRED');
@@ -34,7 +35,8 @@ export async function createScheduledConsumer(cfg: Config,
       await http?.close();
       http = new HttpTransport(current.credentials.baseUrl, cfg.timeoutMs, cfg.maxResponseBytes, abort.signal, cfg.tlsVerify);
       const auth = new OlosAuthManager(http.request, current.credentials);
-      const api = new OlosApi(http.request, auth);
+      const api = new OlosApi(http.request, auth,undefined,cfg.captureSpoolDirectory
+        ?(path,fields,token,id)=>http!.captureToSpool(path,fields,token,cfg.captureSpoolDirectory!,id,cfg.captureMaxBytes,cfg.captureTimeoutMs,abort.signal):undefined);
       worker = new Worker(store, api, new StaticCache(api, cfg.cacheTtlMs));
       revision = current.revision;
     }

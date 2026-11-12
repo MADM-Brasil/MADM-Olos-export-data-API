@@ -1,26 +1,33 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { join,basename,resolve } from 'node:path';
+import { access } from 'node:fs/promises';
 import { type Config } from './config.js';
 import { type ReadSpec, rows, readFields } from './api.js';
 import { columns, type Cache, type MappedRecord, mapRecord } from './mapping.js';
-import { WorkerError } from './errors.js';
+import { WorkerError,log } from './errors.js';
 import { assertSchema, quote } from './schema.js';
 import { lockSource } from './source-lock.js';
 import { CorporateDelivery } from './corporate-delivery/delivery.js';
 import { assertNoDirectOwnership } from './corporate-sync/ownership.js';
 import { admissionHash } from './corporate-delivery/allocator.js';
 import { authorization, fingerprint, recoveryBinding, recoveryHash, recoveryManifest, type RecoveryAuthorization, type RecoveryPlan } from './read-recovery.js';
+import { prepareCaptureDirectory,verifyCaptureOnDisk,publishedCapture,assertCaptureCapacity,type CaptureResult } from './capture-spool.js';
+import { readCaptureObjects } from './capture-json-reader.js';
 
-type Read = { id: string; spec: ReadSpec & { recovery_authorization?: RecoveryAuthorization }; state: string;
+type Read = { id: string; spec: ReadSpec & { recovery_authorization?: RecoveryAuthorization; capture?:{version:1;storage:'spool';binding:string;max_bytes:number} }; state: string;
+  response_spool_read_id?:string|null;
   started_at: Date; error_code: string|null; response_body: string | null; processed_count: number; received_count: number|null; request_ms: number | null };
 export class Store {
   readonly pool: pg.Pool;
   client: pg.PoolClient | undefined;
   private sequence = '';
   private alive = false;
+  private spoolReady=false;
+  private draining=false;
   readonly target: string;
   readonly delivery: CorporateDelivery | undefined;
-  constructor(readonly cfg: Config, private readonly onDisconnect: () => void = () => {}) {
+  constructor(readonly cfg: Config, private readonly onDisconnect: () => void = () => {},private readonly signal?:AbortSignal) {
     this.target = `${quote(cfg.schema)}.${quote(cfg.table)}`;
     this.pool = new pg.Pool({ connectionString: cfg.databaseUrl, max: cfg.poolMax,
       connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000, statement_timeout: 30000,
@@ -50,6 +57,16 @@ export class Store {
     const untracked = await this.client.query(`SELECT 1 FROM ${this.target} d WHERE NOT EXISTS
       (SELECT 1 FROM olos_http.records r WHERE r.target_table=$1 AND r.target_id=d.internal_id_olos) LIMIT 1`, [this.target]);
     if (untracked.rowCount) throw new WorkerError('EXISTING_DESTINATION_REQUIRES_BASELINE');
+    if(this.cfg.captureSpoolDirectory){
+      await prepareCaptureDirectory(this.cfg.captureSpoolDirectory,this.cfg.captureSpoolRequireMount);
+      if(this.cfg.captureMaxObjectBytes>this.cfg.captureBatchBytes)throw new WorkerError('CAPTURE_OBJECT_LIMIT_EXCEEDS_BATCH');
+      if(!(await this.client.query("SELECT to_regclass('olos_http.capture_spool') IS NOT NULL AS present")).rows[0].present)throw new WorkerError('CAPTURE_SPOOL_MIGRATION_REQUIRED');
+      await this.client.query('SELECT response_spool_read_id FROM olos_http.reads LIMIT 0');
+      await this.client.query('SELECT read_id,file_name,byte_size,sha256,state,record_count,verified_at FROM olos_http.capture_spool LIMIT 0');
+      for(const privilege of ['SELECT','INSERT','UPDATE'])if(!(await this.client.query("SELECT has_table_privilege('olos_http.capture_spool',$1) AS ok",[privilege])).rows[0].ok)throw new WorkerError('CAPTURE_SPOOL_PRIVILEGE_REQUIRED');
+      if(!(await this.client.query("SELECT has_database_privilege(current_database(),'TEMP') AS ok")).rows[0].ok)throw new WorkerError('CAPTURE_VALIDATION_TEMP_REQUIRED');
+      this.spoolReady=true;
+    }
   }
   private db() {
     if (!this.client || !this.alive) throw new WorkerError('DATABASE_SESSION_LOST');
@@ -62,15 +79,25 @@ export class Store {
     return this.delivery.reconcile(this.db(), this.sequence);
   }
   async unresolved() {
-    return (await this.db().query<Read>("SELECT id,spec,state,response_body,processed_count,request_ms,started_at,error_code,received_count FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at", [this.cfg.sourceKey])).rows;
+    return (await this.db().query<Read>(`SELECT id,spec,state,response_body,processed_count,request_ms,started_at,error_code,received_count,
+      ${this.spoolReady?'response_spool_read_id::text':'NULL::text'} AS response_spool_read_id FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at`, [this.cfg.sourceKey])).rows;
+  }
+  private captureBinding(){return fingerprint(JSON.stringify([this.cfg.sourceKey,this.target,this.cfg.ingestionBaseline??null,this.cfg.sourceTimeZone??null,this.cfg.sourceIdConfirmed,'lossless-stream-v1']));}
+  private spoolIntent(read:Pick<Read,'spec'>){
+    const c=read.spec.capture;
+    if(!this.spoolReady||!this.cfg.captureSpoolDirectory)throw new WorkerError('CAPTURE_SPOOL_CONFIG_REQUIRED');
+    if(read.spec.kind==='reread'||!c||c.version!==1||c.storage!=='spool'||c.binding!==this.captureBinding()||!Number.isSafeInteger(c.max_bytes)||c.max_bytes<1||c.max_bytes>4*1024**3)throw new WorkerError('CAPTURE_INTENT_MISMATCH');
+    return c;
   }
   async beginRead(spec: ReadSpec, recovery = false) {
     await this.captureReady();
     const pending = await this.unresolved();
     if (spec.kind==='reread' && pending.some(r=>r.state==='reading')) throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
     if (pending.some(r => r.state === 'received') || (!recovery && pending.length)) throw new WorkerError('RECOVERY_REQUIRED');
+    if(this.spoolReady&&spec.kind!=='reread')await assertCaptureCapacity(this.cfg.captureSpoolDirectory!,this.cfg.captureMaxBytes);
     const id = randomUUID();
-    await this.db().query('INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)', [id, this.cfg.sourceKey, this.target, JSON.stringify(spec)]);
+    const journal=this.spoolReady&&spec.kind!=='reread'?{...spec,capture:{version:1,storage:'spool',binding:this.captureBinding(),max_bytes:this.cfg.captureMaxBytes}}:spec;
+    await this.db().query('INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)', [id, this.cfg.sourceKey, this.target, JSON.stringify(journal)]);
     return id;
   }
   private async recoveryAuthorization(parentId: string) {
@@ -153,8 +180,54 @@ export class Store {
   }
 
   async stage(id: string, body: string, requestMs: number) {
-    const result = await this.db().query("UPDATE olos_http.reads SET response_body=$2,state='received',request_ms=$3 WHERE id=$1 AND source_key=$4 AND state='reading'", [id, body, requestMs, this.cfg.sourceKey]);
+    const result = await this.db().query("UPDATE olos_http.reads SET response_body=$2,state='received',request_ms=$3 WHERE id=$1 AND source_key=$4 AND state='reading' AND NOT (spec ? 'capture')", [id, body, requestMs, this.cfg.sourceKey]);
     if (result.rowCount !== 1) throw new WorkerError('READ_STATE_CONFLICT');
+  }
+  async registerCaptureSpool(id:string,capture:CaptureResult,requestMs:number|null=null){
+    if(!this.cfg.captureSpoolDirectory||resolve(capture.path)!==join(resolve(this.cfg.captureSpoolDirectory),`${id}.json`))throw new WorkerError('CAPTURE_SPOOL_INVALID');
+    await verifyCaptureOnDisk(capture);
+    const db=this.db();let committing=false;
+    try{
+      await db.query('BEGIN');
+      const read=(await db.query<Read>('SELECT id,spec,state,response_body,response_spool_read_id FROM olos_http.reads WHERE id=$1 AND source_key=$2 AND target_table=$3 FOR UPDATE',[id,this.cfg.sourceKey,this.target])).rows[0];
+      if(!read)throw new WorkerError('UNRESOLVED_READ_NOT_FOUND');
+      const intent=this.spoolIntent(read);if(capture.bytes>intent.max_bytes)throw new WorkerError('RESPONSE_TOO_LARGE');
+      const existing=(await db.query<{file_name:string;byte_size:string;sha256:string}>('SELECT file_name,byte_size::text,sha256 FROM olos_http.capture_spool WHERE read_id=$1',[id])).rows[0];
+      if(existing){
+        if(existing.file_name!==basename(capture.path)||existing.byte_size!==String(capture.bytes)||existing.sha256!==capture.sha256||read.response_spool_read_id!==id||!['received','done'].includes(read.state)||read.response_body!==null)throw new WorkerError('CAPTURE_SPOOL_METADATA_MISMATCH');
+        await db.query('ROLLBACK');return;
+      }
+      if(read.state!=='reading'||read.response_body!==null||read.response_spool_read_id!==null)throw new WorkerError('READ_STATE_CONFLICT');
+      await db.query("INSERT INTO olos_http.capture_spool(read_id,file_name,byte_size,sha256,state) VALUES($1,$2,$3,$4,'complete')",[id,basename(capture.path),capture.bytes,capture.sha256]);
+      await db.query("UPDATE olos_http.reads SET state='received',response_spool_read_id=$1,request_ms=$3 WHERE id=$1 AND source_key=$2 AND state='reading'",[id,this.cfg.sourceKey,requestMs]);
+      committing=true;await db.query('COMMIT');
+    }catch(error){await db.query('ROLLBACK').catch(()=>{});if(committing)throw new WorkerError('CAPTURE_SPOOL_COMMIT_UNKNOWN');throw error;}
+  }
+  async inspectCaptureSpool(id:string):Promise<CaptureResult>{
+    if(!this.spoolReady||!this.cfg.captureSpoolDirectory)throw new WorkerError('CAPTURE_SPOOL_CONFIG_REQUIRED');
+    const row=(await this.db().query<Read & {file_name:string;byte_size:string;sha256:string}>(`SELECT r.id,r.spec,r.state,r.response_body,s.file_name,s.byte_size::text,s.sha256
+      FROM olos_http.reads r JOIN olos_http.capture_spool s ON s.read_id=r.response_spool_read_id
+      WHERE r.id=$1 AND r.source_key=$2 AND r.target_table=$3 AND s.read_id=r.id`,[id,this.cfg.sourceKey,this.target])).rows[0];
+    if(!row||row.file_name!==`${id}.json`||row.response_body!==null||!['received','done'].includes(row.state))throw new WorkerError('CAPTURE_SPOOL_METADATA_MISMATCH');
+    const intent=this.spoolIntent(row),capture={path:join(this.cfg.captureSpoolDirectory,row.file_name),bytes:Number(row.byte_size),sha256:row.sha256};
+    if(capture.bytes>intent.max_bytes)throw new WorkerError('CAPTURE_SPOOL_METADATA_MISMATCH');
+    await verifyCaptureOnDisk(capture);return capture;
+  }
+  async recoverCaptureSpool(id:string){
+    const read=(await this.db().query<Read>('SELECT id,spec,state FROM olos_http.reads WHERE id=$1 AND source_key=$2 AND target_table=$3',[id,this.cfg.sourceKey,this.target])).rows[0];
+    if(!read)throw new WorkerError('UNRESOLVED_READ_NOT_FOUND');
+    const intent=this.spoolIntent(read);
+    const capture=await publishedCapture(this.cfg.captureSpoolDirectory!,id,intent.max_bytes);
+    await this.registerCaptureSpool(id,capture);return capture;
+  }
+  async recoverPublishedCaptures(){
+    for(const read of await this.unresolved()){
+      if(read.state!=='reading'||!read.spec.capture)continue;
+      this.spoolIntent(read);
+      try{await access(join(this.cfg.captureSpoolDirectory!,`${read.id}.json.complete`));}
+      catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')continue;throw error;}
+      await this.recoverCaptureSpool(read.id);
+    }
   }
   async markError(id: string, code: string) {
     await this.db().query('UPDATE olos_http.reads SET error_code=$2 WHERE id=$1 AND source_key=$3', [id, code, this.cfg.sourceKey]);
@@ -163,10 +236,17 @@ export class Store {
     await this.db().query("UPDATE olos_http.reads SET state='resolved',finished_at=clock_timestamp(),error_code=$2,resolution='Authentication failed before consuming transport invocation' WHERE id=$1 AND source_key=$3 AND state='reading'", [id, code, this.cfg.sourceKey]);
   }
   async drain(cache: Cache) {
+    if(this.draining)throw new WorkerError('PERSISTENCE_ALREADY_ACTIVE');this.draining=true;
+    try{
     const total: { received: number; inserted: number; updated: number; duplicates: number; queued?: number; skipped?: number } =
       { received: 0, inserted: 0, updated: 0, duplicates: 0, ...(this.delivery ? { queued: 0, skipped: 0 } : {}) };
     for (const read of await this.unresolved()) {
       if (read.state !== 'received') continue;
+      if(read.spec.capture||read.response_spool_read_id){
+        const counts=await this.drainCaptureSpool(read,cache);
+        total.received+=counts.received;total.inserted+=counts.inserted;total.updated+=counts.updated;total.duplicates+=counts.duplicates;
+        if(this.delivery){total.queued=(total.queued??0)+(counts.queued??0);total.skipped=(total.skipped??0)+(counts.skipped??0);}continue;
+      }
       if(read.spec.kind==='reread'&&read.spec.recovery&&Buffer.byteLength(read.response_body!)>this.cfg.recoveryMaxResponseBytes)throw new WorkerError('RESPONSE_TOO_LARGE');
       const data = rows(read.response_body!);
       if(read.spec.kind==='reread'&&read.spec.recovery)await this.validateRecoveryResponse(read,data,cache);
@@ -201,6 +281,79 @@ export class Store {
       await this.db().query("UPDATE olos_http.reads SET state='done',finished_at=clock_timestamp(),received_count=$2 WHERE id=$1 AND source_key=$3 AND processed_count=$2", [read.id, data.length, this.cfg.sourceKey]);
     }
     return total;
+    }finally{this.draining=false;}
+  }
+  private async drainCaptureSpool(read:Read,cache:Cache){
+    const capture=await this.inspectCaptureSpool(read.id),db=this.db();
+    const result={received:0,inserted:0,updated:0,duplicates:0,queued:0,skipped:0};
+    const eligible=(row:MappedRecord)=>!this.cfg.ingestionBaseline||(row.data_ligacao!==null&&Date.parse(row.data_ligacao)>=Date.parse(this.cfg.ingestionBaseline));
+    let count=0,filtered=0;
+    await db.query('CREATE TEMP TABLE olos_capture_validation(source_id text PRIMARY KEY,source_hash text NOT NULL,eligible boolean NOT NULL) ON COMMIT PRESERVE ROWS');
+    try{
+      let validation:MappedRecord[]=[],validationBytes=0;
+      const validateBatch=async()=>{
+        if(!validation.length)return;
+        const unique=new Map<string,MappedRecord>();
+        for(const row of validation){if(unique.has(row.source_id)&&unique.get(row.source_id)!.source_hash!==row.source_hash)throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');unique.set(row.source_id,row);}
+        const values=[...unique.values()].map(row=>({source_id:row.source_id,source_hash:row.source_hash,eligible:eligible(row)}));
+        const registered=await db.query(`INSERT INTO pg_temp.olos_capture_validation AS c(source_id,source_hash,eligible)
+          SELECT x.source_id,x.source_hash,x.eligible FROM jsonb_to_recordset($1::jsonb) AS x(source_id text,source_hash text,eligible boolean)
+          ON CONFLICT(source_id) DO UPDATE SET source_hash=EXCLUDED.source_hash
+          WHERE c.source_hash=EXCLUDED.source_hash AND c.eligible=EXCLUDED.eligible RETURNING source_id`,[JSON.stringify(values)]);
+        if(registered.rowCount!==values.length)throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
+        for(const previous of await this.recoveryRecords([...unique.keys()])){
+          if(previous.source_hash!==unique.get(previous.source_id)!.source_hash||previous.target_table!==this.target)throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
+          if(!previous.present)throw new WorkerError('CAPTURE_PERSISTENCE_DIVERGES');
+        }
+        validation=[];validationBytes=0;
+      };
+      // No business INSERT occurs before EOF, UTF-8/JSON validity, digest and global duplicate validation.
+      for await(const item of readCaptureObjects(capture,this.cfg.captureMaxObjectBytes,this.signal)){
+        const mapped=mapRecord(item.value,cache,this.cfg.sourceTimeZone,!!this.delivery),size=Buffer.byteLength(JSON.stringify(mapped));
+        if(size>this.cfg.captureBatchBytes)throw new WorkerError('CAPTURE_BATCH_LIMIT');
+        if(validation.length&&(validation.length>=this.cfg.batchSize||validationBytes+size>this.cfg.captureBatchBytes))await validateBatch();
+        validation.push(mapped);validationBytes+=size;if(!eligible(mapped))filtered++;
+        if(++count>this.cfg.captureMaxRecords)throw new WorkerError('CAPTURE_RECORD_LIMIT');
+      }
+      await validateBatch();
+      if(read.processed_count>count)throw new WorkerError('CAPTURE_CHECKPOINT_INVALID');
+      const verified=await db.query(`UPDATE olos_http.capture_spool SET state='verified',verified_at=clock_timestamp(),record_count=$4
+        WHERE read_id=$1 AND sha256=$2 AND byte_size=$3 AND (record_count IS NULL OR record_count=$4)`,[read.id,capture.sha256,capture.bytes,count]);
+      if(verified.rowCount!==1)throw new WorkerError('CAPTURE_SPOOL_METADATA_MISMATCH');
+      log('capture_validated',{read_id:read.id,records:count,baseline_excluded:filtered,response_bytes:capture.bytes});
+      let batch:MappedRecord[]=[],batchBytes=0,checkpoint=read.processed_count;
+      const flush=async()=>{
+        if(!batch.length)return;
+        this.signal?.throwIfAborted();
+        const hashes=new Map((await db.query<{source_id:string;source_hash:string}>('SELECT source_id,source_hash FROM pg_temp.olos_capture_validation WHERE source_id=ANY($1::text[])',[batch.map(row=>row.source_id)])).rows.map(row=>[row.source_id,row.source_hash]));
+        if(batch.some(row=>hashes.get(row.source_id)!==row.source_hash))throw new WorkerError('CAPTURE_SPOOL_INTEGRITY_FAILURE');
+        const saved=await this.persist(read.id,batch.filter(eligible),checkpoint,count);
+        result.inserted+=saved.inserted;result.updated+=saved.updated;result.duplicates+=saved.duplicates;
+        if('queued' in saved)result.queued+=saved.queued??0;if('skipped' in saved)result.skipped+=saved.skipped??0;
+        batch=[];batchBytes=0;
+      };
+      for await(const item of readCaptureObjects(capture,this.cfg.captureMaxObjectBytes,this.signal)){
+        if(item.index<read.processed_count)continue;
+        const mapped=mapRecord(item.value,cache,this.cfg.sourceTimeZone,!!this.delivery),size=Buffer.byteLength(JSON.stringify(mapped));
+        if(batch.length&&(batch.length>=this.cfg.batchSize||batchBytes+size>this.cfg.captureBatchBytes))await flush();
+        batch.push(mapped);batchBytes+=size;checkpoint=item.index+1;
+      }
+      await flush();
+      // Confirm every eligible validated identity, including records before a recovered checkpoint.
+      let cursor:string|null=null;
+      for(;;){
+        const expected:{source_id:string;source_hash:string}[]=(await db.query<{source_id:string;source_hash:string}>(`SELECT source_id,source_hash FROM pg_temp.olos_capture_validation
+          WHERE eligible AND ($1::text IS NULL OR source_id>$1) ORDER BY source_id LIMIT $2`,[cursor,this.cfg.batchSize])).rows;
+        if(!expected.length)break;
+        const present=new Map((await this.recoveryRecords(expected.map(row=>row.source_id))).map(row=>[row.source_id,row]));
+        if(expected.some(row=>!present.get(row.source_id)?.present||present.get(row.source_id)!.source_hash!==row.source_hash||present.get(row.source_id)!.target_table!==this.target))throw new WorkerError('CAPTURE_PERSISTENCE_INCOMPLETE');
+        cursor=expected.at(-1)!.source_id;
+      }
+      this.signal?.throwIfAborted();
+      const done=await db.query("UPDATE olos_http.reads SET state='done',finished_at=clock_timestamp(),received_count=$2 WHERE id=$1 AND source_key=$3 AND state='received' AND processed_count=$2 AND response_spool_read_id=$1",[read.id,count,this.cfg.sourceKey]);
+      if(done.rowCount!==1)throw new WorkerError('READ_STATE_CONFLICT');
+      result.received=count;return result;
+    }finally{await db.query('DROP TABLE IF EXISTS pg_temp.olos_capture_validation').catch(()=>{});}
   }
   private async validateRecoveryResponse(read: Read, data: Record<string,unknown>[], cache: Cache, approvedInput?: RecoveryAuthorization, checkExisting=true) {
     if(read.spec.kind!=='reread'||!read.spec.recovery)throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');

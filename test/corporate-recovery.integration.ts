@@ -8,7 +8,10 @@ import {StaticCache} from '../src/cache.js';
 import {Worker} from '../src/worker.js';
 import {CorporateDelivery} from '../src/corporate-delivery/delivery.js';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile,mkdtemp,rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { captureToDisk } from '../src/capture-spool.js';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -128,6 +131,23 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
     await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
   }
   try {
+    await t.test('spooled capture preserves the nonempty quarantine, legacy queue and remote receipts',async()=>{
+      await reset(2);await insertRemote(0,{telefone:'synthetic-collision'});await quarantine(args((await verify()).verification_digest));
+      const before=await snapshot();await store!.close();store=undefined;
+      await local.query(await readFile(new URL('../migrations/012_capture_spool.sql',import.meta.url),'utf8'));
+      const directory=await mkdtemp(join(tmpdir(),'olos-quarantine-spool-'));
+      try{
+        store=new Store(config({...env,CAPTURE_SPOOL_DIRECTORY:directory}));await store.open();
+        const id=await store.beginRead({kind:'current'});
+        async function* body(){yield Buffer.from(JSON.stringify([row(9001)]));}
+        const capture=await captureToDisk(body(),directory,id,102400);await store.registerCaptureSpool(id,capture);
+        assert.equal((await store.drain(references)).queued,1);
+        const after=await snapshot();assert.deepEqual(after.entries.filter(e=>e.source_id!=='9001'),before.entries);
+        assert.deepEqual(after.quarantine,before.quarantine);assert.deepEqual(after.quarantineRuns,before.quarantineRuns);
+        assert.deepEqual(after.control,before.control);assert.deepEqual(after.remote,before.remote);assert.deepEqual(after.sequence,before.sequence);
+        assert.equal((await store.drain(references)).queued,0);
+      }finally{await store?.close();store=undefined;await rm(directory,{recursive:true,force:true});}
+    });
     for(const version of [1,2])for(const mode of ['quarantined legacy queue','unmaterialized admission'] as const)await t.test(`capture recovery v${version} preserves corporate receipts and quarantine with ${mode}`,async()=>{
       await reset(mode==='quarantined legacy queue'?2:0);
       if(mode==='quarantined legacy queue'){

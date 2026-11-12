@@ -2,6 +2,8 @@ import { parse } from 'lossless-json';
 import { OlosAuthManager } from './auth.js';
 import { AuthUnavailable, HttpError, WorkerError } from './errors.js';
 import { sleep, type Transport } from './http.js';
+import type { CaptureResult } from './capture-spool.js';
+export type CaptureTransport=(path:string,fields:Record<string,string>,token:string,readId:string)=>Promise<CaptureResult>;
 
 export function json(raw: string): unknown {
   try { return parse(raw, undefined, value => value); } catch { throw new WorkerError('JSON_INVALID'); }
@@ -21,7 +23,12 @@ export function readFields(spec: ReadSpec) {
 }
 export class OlosApi {
   constructor(private readonly request: Transport, readonly auth: OlosAuthManager,
-    private readonly wait: (ms: number) => Promise<unknown> = sleep) {}
+    private readonly wait: (ms: number) => Promise<unknown> = sleep,readonly capture?:CaptureTransport) {}
+  async readToSpool(spec:ReadSpec,readId:string):Promise<CaptureResult> {
+    if(!this.capture||spec.kind==='reread')throw new WorkerError('CAPTURE_TRANSPORT_REQUIRED');
+    let token:string;try{token=await this.auth.getToken();}catch(error){throw new AuthUnavailable(error);}
+    return this.capture(`/api/export-data/${spec.kind==='current'?'read-data-current-day':'read-data-previous-days'}`,readFields(spec),token,readId);
+  }
   async call(path: string, fields?: Record<string, string>, consuming = false): Promise<string> {
     let authRetried = false;
     for (let attempt = 0; ; attempt++) {

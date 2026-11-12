@@ -15,5 +15,6 @@ COPY --chown=node:node package*.json ./
 COPY --chown=node:node migrations ./migrations
 COPY --chown=node:node admin/public ./admin/public
 COPY --chown=node:node admin/migrations ./admin/migrations
+RUN install -d -m 0700 -o node -g node /var/lib/olos/captures
 USER node
 CMD ["node", "dist/main.js", "start"]
