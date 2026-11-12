@@ -134,16 +134,47 @@ export function logVerification(report: PendingVerification): void {
 
 export async function verifyPending(local: PoolClient, cfg: DeliveryConfig, source: string, target: string): Promise<PendingVerification> {
   let remote: Client | undefined;
+  let stage = 'local_transaction';
   try {
     await local.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    stage = 'local_state';
     const control = await state(local, cfg, source, target);
+    stage = 'remote_connection';
     remote = await connect(cfg.connection, 'destination');
+    stage = 'remote_transaction';
     await remote.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    stage = 'inspection';
     const report = await inspect(local, remote, cfg, source, target, control);
+    stage = 'remote_commit';
     await remote.query('COMMIT');
+    stage = 'local_commit';
     await local.query('COMMIT');
     return report;
-  } catch (error) { await rollback(local); if (remote) await rollback(remote); throw error; }
+  } catch (error) {
+    try {
+      const rawCode = error !== null && typeof error === 'object' && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+      const code = typeof rawCode === 'string' ? rawCode : '';
+      const sqlstate = /^[0-9A-Z]{5}$/.test(code) ? code : null;
+      const category = sqlstate
+        ? 'database'
+        : /^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)$/.test(code)
+          ? 'connection'
+          : 'runtime';
+
+      log('corporate_pending_verification_failed', {
+        stage,
+        category,
+        sqlstate
+      });
+    } catch {
+      // Diagnostic failures must not alter recovery behavior.
+    }
+    await rollback(local);
+    if (remote) await rollback(remote);
+    throw error;
+  }
   finally { if (remote) await remote.end().catch(() => {}); }
 }
 
