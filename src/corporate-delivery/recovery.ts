@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Client, PoolClient } from 'pg';
+import pg, { type Client, type PoolClient } from 'pg';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { SyncError, safeCode } from '../corporate-sync/errors.js';
 import { columns, compare, identityColumns, mapRow, RowFieldError, type Row } from '../corporate-sync/mapping.js';
@@ -154,61 +154,90 @@ export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, s
   if (request.action !== (quarantine ? 'quarantine' : 'release')) throw new SyncError('CORPORATE_RECOVERY_NOT_AUTHORIZED');
   let remote: Client | undefined;
   let commitIssued = false;
+  let stage: 'local_locks'|'state'|'quarantine'|'idempotency'|'remote_connection'|'remote_lock'|'inspection'|'insert'|'update_control'|'allocator_state'|'update_reversion'|'before_commit'|'remote_check'|'commit' = 'local_locks';
   try {
     await local.query('BEGIN');
     if (!(await local.query('SELECT pg_try_advisory_xact_lock_shared(17320914,4) AS ok')).rows[0].ok) throw new SyncError('CORPORATE_HOMOLOGATION_ACTIVE');
     await local.query('SELECT pg_advisory_xact_lock_shared(17320914,5)');
+    stage = 'state';
     const control = await state(local, cfg, source, target, true);
     if(!quarantine&&control.id_allocator_generation&&(await allocatorState(local,cfg,source,target,false))?.state==='adopting')throw new SyncError('READOPTION_ACTIVATION_INCOMPLETE');
     // Excludes capture admission and edits to the frozen queue while retaining the OLOS owner.
+    stage = 'local_locks';
     await local.query('LOCK TABLE olos_http.records,olos_http.corporate_outbox IN SHARE MODE');
     if (!(await local.query("SELECT to_regclass('olos_http.corporate_collision_recoveries') IS NOT NULL AS present")).rows[0].present) throw new SyncError('CORPORATE_RECOVERY_MIGRATION_REQUIRED');
     // Control row serializes administrative operations; table locks also stabilize membership evidence.
+    stage = 'quarantine';
     await quarantineMembers(local, cfg, source, target, new Map(control.destination_shape));
     await local.query('LOCK TABLE olos_http.corporate_collision_quarantine_runs,olos_http.corporate_collision_quarantine IN SHARE MODE');
     const auditTable = quarantine ? 'olos_http.corporate_collision_quarantine_runs' : 'olos_http.corporate_collision_recoveries';
+    stage = 'idempotency';
     const applied = (await local.query(`SELECT * FROM ${auditTable} WHERE request_id=$1`, [request.requestId])).rows[0];
     if (applied) {
       if (applied.source_key !== source || applied.target_table !== target || applied.binding !== cfg.binding || applied.verification_digest !== request.verification || applied.evidence_ref !== request.evidence) throw new SyncError('CORPORATE_RECOVERY_REQUEST_REUSED');
       await local.query('ROLLBACK');
       return { alreadyApplied: true };
     }
+    stage = 'state';
     if (!control.blocked || control.last_code !== 'INTERNAL_ID_COLLISION') throw new SyncError('CORPORATE_RECOVERY_BLOCK_MISMATCH');
+    stage = 'remote_connection';
     remote = await connect(cfg.connection, 'destination');
     // PostgreSQL disallows SHARE locks in READ ONLY transactions. This transaction performs
     // no DML/DDL and is always rolled back; SHARE excludes remote INSERT/UPDATE/DELETE/DDL.
+    stage = 'remote_lock';
     await remote.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
     await remote.query('LOCK TABLE raw.olos_calls IN SHARE MODE');
     await hooks.afterLocks?.();
+    stage = 'inspection';
     const report = await inspect(local, remote, cfg, source, target, control);
     logVerification(report);
     if (!quarantine && report.issues.length) throw new SyncError('CORPORATE_PENDING_DIVERGES');
     if (report.verification_digest !== request.verification) throw new SyncError('CORPORATE_VERIFICATION_STALE');
     if (quarantine) {
+      stage = 'quarantine';
       await isolateCollisions(local, cfg, source, target, request, control, report);
+      stage = 'state';
       const next = await state(local, cfg, source, target);
       // This second pass validates every remaining pending row. Any remaining issue keeps the block.
+      stage = 'inspection';
       logVerification(await inspect(local, remote, cfg, source, target, next));
     } else {
+      stage = 'insert';
       await local.query(`INSERT INTO olos_http.corporate_collision_recoveries
         (request_id,source_key,target_table,binding,verification_digest,evidence_ref,previous_generation,previous_code,pending_count,eligible_count,existing_count,schema_hash)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [request.requestId, source, target, cfg.binding, request.verification, request.evidence, control.generation, control.last_code,
         report.pending, report.eligible, report.existing, report.schema_hash]);
+      stage = 'update_control';
       await local.query(`UPDATE olos_http.corporate_control SET blocked=false,paused=true,last_code=NULL,failure_count=0,
         next_attempt_at=NULL,generation=generation+1,updated_at=now() WHERE singleton`);
+      stage = 'allocator_state';
       const allocation = await allocatorState(local,cfg,source,target,false);
-      if (allocation?.state === 'legacy') await local.query(`UPDATE olos_http.corporate_id_reversions SET validated_at=clock_timestamp(),validation_digest=$2
+      if (allocation?.state === 'legacy') {
+        stage = 'update_reversion';
+        await local.query(`UPDATE olos_http.corporate_id_reversions SET validated_at=clock_timestamp(),validation_digest=$2
         WHERE request_id=$1 AND state='completed'`, [allocation.reversion_request_id,request.verification]);
+      }
     }
+    stage = 'before_commit';
     await hooks.beforeLocalCommit?.();
     // Keep remote exclusion through local COMMIT. A later divergence still encounters the original delivery guards.
+    stage = 'remote_check';
     await remote.query('SELECT 1');
+    stage = 'commit';
     commitIssued = true;
     await local.query('COMMIT');
     return { alreadyApplied: false };
   } catch (error) {
     await rollback(local);
+    try {
+      // Read only an own data property, never error getters/messages/stack/cause.
+      const code = error && typeof error === 'object' ? Object.getOwnPropertyDescriptor(error,'code')?.value : undefined;
+      const sqlstate = error instanceof pg.DatabaseError && typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null;
+      const category = error instanceof pg.DatabaseError ? 'database' : error instanceof SyncError ? 'policy'
+        : typeof code === 'string' && /^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)$/.test(code) ? 'connection' : 'runtime';
+      log('corporate_collision_recovery_failed', { stage, category, sqlstate });
+    } catch { /* Diagnostics must not change rollback, error identity or COMMIT uncertainty. */ }
     if (commitIssued) throw new SyncError(quarantine ? 'CORPORATE_QUARANTINE_COMMIT_UNKNOWN' : 'CORPORATE_RECOVERY_COMMIT_UNKNOWN');
     throw error;
   } finally { if (remote) { await rollback(remote); await remote.end().catch(() => {}); } }

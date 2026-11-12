@@ -1,12 +1,46 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import pg, { type PoolClient } from 'pg';
 import { legacyReversionRequest } from '../src/corporate-delivery/legacy-recovery.js';
-import { recoveryRequest } from '../src/corporate-delivery/recovery.js';
+import { recoveryRequest,recoverCollision } from '../src/corporate-delivery/recovery.js';
+import { observeLogs,type LogEntry } from '../src/errors.js';
+import { SyncError } from '../src/corporate-sync/errors.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { config } from '../src/config.js';
 
 const authorization = { OLOS_CORPORATE_RECOVERY_CONFIRMATION: 'AUTHORIZE_CORPORATE_COLLISION_RECOVERY' };
 const args = ['--confirm-source', 'synthetic', '--verification', 'a'.repeat(64), '--request-id', '00000000-0000-4000-8000-000000000001', '--evidence', 'INC-42'];
+test('collision recovery diagnostics allow only a fixed category, stage and validated PostgreSQL SQLSTATE',async()=>{
+  const dc=config({DATABASE_URL:'postgresql://test@localhost/local',OLOS_SOURCE_KEY:'synthetic',ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:'postgresql://test@localhost/madm'}).corporateDelivery!;
+  const sensitive='PRIVATE query SELECT payload cpf phone email password postgresql://user:secret@host/db stack cause';
+  const database=(code:unknown)=>Object.assign(new pg.DatabaseError(sensitive,0,'error'),{code,detail:sensitive,hint:sensitive,where:sensitive,internalQuery:sensitive,stack:sensitive,cause:sensitive});
+  const getterError=Object.defineProperties({}, {code:{get(){throw new Error(sensitive);}},message:{get(){throw new Error(sensitive);}},toJSON:{value(){throw new Error(sensitive);}}});
+  const cases:[unknown,string,string|null][]=[
+    [database('42P01'),'database','42P01'],[database('55P03'),'database','55P03'],
+    ...['42P01\nPRIVATE','42p01','password',undefined,42].map(code=>[database(code),'database',null] as [unknown,string,null]),
+    [Object.assign(new Error(sensitive),{code:'ECONNRESET'}),'connection',null],
+    [Object.assign(new Error(sensitive),{code:'42P01'}),'runtime',null],
+    [new SyncError(sensitive),'policy',null],[sensitive,'runtime',null],[getterError,'runtime',null],
+  ];
+  for(const [failure,category,sqlstate] of cases){
+    const calls:string[]=[],events:LogEntry[]=[];
+    const local={async query(sql:string){calls.push(sql);if(sql==='ROLLBACK')return {rows:[]};throw failure;}} as unknown as PoolClient;
+    const stop=observeLogs(entry=>{if(entry.event==='corporate_collision_recovery_failed')events.push(entry);});
+    try{await assert.rejects(recoverCollision(local,dc,'synthetic','"raw"."olos_calls"',recoveryRequest(args,authorization,'synthetic')),e=>e===failure);}finally{stop();}
+    assert.deepEqual(calls,['BEGIN','ROLLBACK']);assert.equal(events.length,1);
+    assert.deepEqual(Object.keys(events[0]!).sort(),['category','event','sqlstate','stage','table','time']);
+    assert.equal(events[0]!.stage,'local_locks');assert.equal(events[0]!.category,category);assert.equal(events[0]!.sqlstate,sqlstate);
+    assert.doesNotMatch(JSON.stringify(events),/PRIVATE|payload|cpf|phone|email|password|postgresql|secret|stack|cause|00000000|INC-42/);
+  }
+});
+test('diagnostic sink failure never replaces the recovery error or skips rollback',async t=>{
+  const dc=config({DATABASE_URL:'postgresql://test@localhost/local',OLOS_SOURCE_KEY:'synthetic',ATTEMPTS_PERSISTENCE_MODE:'corporate',OLOS_CORPORATE_DATABASE_URL:'postgresql://test@localhost/madm'}).corporateDelivery!;
+  const failure=new Error('original recovery failure'),calls:string[]=[];
+  const local={async query(sql:string){calls.push(sql);if(sql==='ROLLBACK')return {rows:[]};throw failure;}} as unknown as PoolClient;
+  const mock=t.mock.method(process.stdout,'write',()=>{throw new Error('diagnostic sink unavailable');});
+  try{await assert.rejects(recoverCollision(local,dc,'synthetic','"raw"."olos_calls"',recoveryRequest(args,authorization,'synthetic')),e=>e===failure);}finally{mock.mock.restore();}
+  assert.deepEqual(calls,['BEGIN','ROLLBACK']);
+});
 test('collision recovery requires separate authorization, exact source, proof and an idempotency ID', () => {
   assert.throws(() => recoveryRequest(args, {}, 'synthetic'), /NOT_AUTHORIZED/);
   assert.throws(() => recoveryRequest(args, { OLOS_CORPORATE_WRITE_CONFIRMATION: 'AUTHORIZE_EXPORTDATA_DIRECT_DELIVERY' }, 'synthetic'), /NOT_AUTHORIZED/);

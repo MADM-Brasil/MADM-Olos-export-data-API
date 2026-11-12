@@ -16,7 +16,7 @@ import pg from 'pg';
 import { config } from '../src/config.js';
 import { Store } from '../src/store.js';
 import { columns, digest } from '../src/corporate-sync/mapping.js';
-import { observeLogs } from '../src/errors.js';
+import { observeLogs,type LogEntry } from '../src/errors.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { logVerification, recoverCollision, recoveryRequest, verifyPending, type RecoveryHooks } from '../src/corporate-delivery/recovery.js';
 import { adoptAllocator, adoptionRequest, reserveIds } from '../src/corporate-delivery/allocator.js';
@@ -127,6 +127,75 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
     await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
   }
   try {
+    await t.test('diagnostics identify local failure stages without changing rollback or exposing database details', async () => {
+      await reset(1); const input=args((await verify()).verification_digest),before=await snapshot();
+      const cases:[string,string][]=[
+        ['pg_try_advisory_xact_lock_shared','local_locks'],
+        ['SELECT * FROM olos_http.corporate_control','state'],
+        ["to_regclass('olos_http.corporate_collision_quarantine_runs')",'quarantine'],
+        ['SELECT * FROM olos_http.corporate_collision_recoveries','idempotency'],
+        ['INSERT INTO olos_http.corporate_collision_recoveries','insert'],
+        ['UPDATE olos_http.corporate_control SET blocked=false','update_control'],
+      ];
+      for(const [query,stage] of cases){
+        const failure=Object.assign(new pg.DatabaseError('PRIVATE SQL payload password',0,'error'),{code:'42501',detail:'PRIVATE phone email',where:'PRIVATE query',stack:'PRIVATE stack'});
+        const events:LogEntry[]=[],stop=observeLogs(entry=>{if(entry.event==='corporate_collision_recovery_failed')events.push(entry);});
+        try{
+          await assert.rejects(client(db=>{
+            const failing=new Proxy(db,{get(connection,key){
+              if(key==='query')return (sql:string,parameters?:unknown[])=>{if(sql.includes(query))throw failure;return connection.query(sql,parameters);};
+              return Reflect.get(connection,key);
+            }});
+            return recoverCollision(failing,dc,source,target,recoveryRequest(input,authorization,source));
+          }),error=>error===failure);
+        }finally{stop();}
+        assert.equal(events.length,1);assert.equal(events[0]!.stage,stage);assert.equal(events[0]!.category,'database');assert.equal(events[0]!.sqlstate,'42501');
+        assert.deepEqual(Object.keys(events[0]!).sort(),['category','event','sqlstate','stage','table','time']);
+        assert.doesNotMatch(JSON.stringify(events),/PRIVATE|payload|password|phone|email|stack|INC-42/);
+        assert.deepEqual(await snapshot(),before);assert.equal(await evidenceCount(),0);
+      }
+    });
+    await t.test('diagnostics distinguish remote lock timeout from connection and inspection failures',async()=>{
+      await reset(1);const input=args((await verify()).verification_digest),before=await snapshot(),events:LogEntry[]=[];
+      let lockSqlstate:string|undefined;
+      const stop=observeLogs(entry=>{if(entry.event==='corporate_collision_recovery_failed')events.push(entry);});
+      try{
+        await remote.query('BEGIN');await remote.query('LOCK TABLE raw.olos_calls IN ACCESS EXCLUSIVE MODE');
+        // The configured lock and statement deadlines are equal; either PostgreSQL cancellation may win.
+        try{await assert.rejects(recover(input),error=>{
+          if(!(error instanceof pg.DatabaseError)||!['55P03','57014'].includes(error.code??''))return false;
+          lockSqlstate=error.code;return true;
+        });}finally{await remote.query('ROLLBACK');}
+        const url=dc.connection.destinationUrl;dc.connection.destinationUrl='postgresql://postgres@localhost:1/madm';
+        try{await assert.rejects(recover(input));}finally{dc.connection.destinationUrl=url;}
+        await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN email TYPE varchar(80)');
+        await assert.rejects(recover(input),/SCHEMA_CHANGED/);
+      }finally{stop();}
+      assert.deepEqual(events.map(({stage,category,sqlstate})=>({stage,category,sqlstate})),[
+        {stage:'remote_lock',category:'database',sqlstate:lockSqlstate},
+        {stage:'remote_connection',category:'connection',sqlstate:null},
+        {stage:'inspection',category:'policy',sqlstate:null},
+      ]);
+      assert.deepEqual(await snapshot(),before);assert.equal(await evidenceCount(),0);
+    });
+    await t.test('legacy recovery identifies the reversion UPDATE failure and preserves completed history without migrations 010/011',async()=>{
+      await reset(1);const adoption=await prepare();await reversalMigration();await revert(reversionArgs(adoption));
+      const input=args((await verify()).verification_digest),before=await snapshot(),history=await reversionRuns(),batches=await reversionBatches(),events:LogEntry[]=[];
+      const failure=Object.assign(new pg.DatabaseError('PRIVATE reversion SQL credentials',0,'error'),{code:'42501',detail:'PRIVATE payload'});
+      const stop=observeLogs(entry=>{if(entry.event==='corporate_collision_recovery_failed')events.push(entry);});
+      try{
+        await assert.rejects(client(db=>{
+          const failing=new Proxy(db,{get(connection,key){
+            if(key==='query')return(sql:string,parameters?:unknown[])=>{if(sql.startsWith('UPDATE olos_http.corporate_id_reversions SET validated_at'))throw failure;return connection.query(sql,parameters);};
+            return Reflect.get(connection,key);
+          }});
+          return recoverCollision(failing,dc,source,target,recoveryRequest(input,authorization,source));
+        }),error=>error===failure);
+      }finally{stop();}
+      assert.equal(events.length,1);assert.equal(events[0]!.stage,'update_reversion');assert.equal(events[0]!.category,'database');assert.equal(events[0]!.sqlstate,'42501');
+      assert.doesNotMatch(JSON.stringify(events),/PRIVATE|credentials|payload/);
+      assert.deepEqual(await snapshot(),before);assert.deepEqual(await reversionRuns(),history);assert.deepEqual(await reversionBatches(),batches);assert.equal(await evidenceCount(),0);
+    });
     await t.test('read-only verification checks all pages, exact timestamps and existing rows without receipts or trigger effects', async () => {
       await reset(); await insertRemote(0);
       const before = await snapshot();
@@ -234,7 +303,8 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
     });
     await t.test('uncertain local COMMIT is reconciled by the same request without repeating the release', async () => {
       await reset(1); const input = args((await verify()).verification_digest);
-      await assert.rejects(client(async db => {
+      const events:LogEntry[]=[],stop=observeLogs(entry=>{if(entry.event==='corporate_collision_recovery_failed')events.push(entry);});
+      try{await assert.rejects(client(async db => {
         const ambiguous = new Proxy(db, { get(connection, key) {
           if (key === 'query') return async (sql: string, parameters?: unknown[]) => {
             const result = await connection.query(sql, parameters);
@@ -244,7 +314,9 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
           return Reflect.get(connection, key);
         } });
         return recoverCollision(ambiguous, dc, source, target, recoveryRequest(input, authorization, source));
-      }), /RECOVERY_COMMIT_UNKNOWN/);
+      }), /RECOVERY_COMMIT_UNKNOWN/);}finally{stop();}
+      assert.equal(events.length,1);assert.equal(events[0]!.stage,'commit');assert.equal(events[0]!.category,'runtime');assert.equal(events[0]!.sqlstate,null);
+      assert.doesNotMatch(JSON.stringify(events),/synthetic lost commit acknowledgement/);
       assert.equal(await evidenceCount(), 1); assert.equal((await control()).blocked, false);
       assert.deepEqual(await recover(input), { alreadyApplied: true });
     });
