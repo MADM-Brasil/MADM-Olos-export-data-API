@@ -48,6 +48,7 @@ export function config(env: NodeJS.ProcessEnv = process.env) {
     batchSize: integer('BATCH_SIZE', 500, 1, 2000),
     cacheTtlMs: integer('STATIC_CACHE_TTL_MS', 3600000, 1000, 86_400_000),
     maxResponseBytes: integer('MAX_RESPONSE_BYTES', 32 * 1024 * 1024, 1024, 256 * 1024 * 1024),
+    recoveryMaxResponseBytes: integer('RECOVERY_MAX_RESPONSE_BYTES', 8 * 1024 * 1024, 1024, 8 * 1024 * 1024),
     maxFailures: integer('MAX_RETRY_ATTEMPTS', 5, 1, 20),
   };
 }

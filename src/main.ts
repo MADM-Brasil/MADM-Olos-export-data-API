@@ -12,13 +12,20 @@ import { WorkerError, errorCode, log } from './errors.js';
 import { inspectSchema } from './schema.js';
 import { readoptionCommands,readoptionAction } from './corporate-delivery/readoption-command.js';
 import { corporateControl } from './corporate-delivery/commands.js';
+import { loadRecoveryManifest, recoveryHash } from './read-recovery.js';
 
 async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
-  const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
+  const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','recovery-authorize','recovery-verify','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
     'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator',...readoptionCommands];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
+  const recovery = command==='recovery-authorize' ? await (async()=>{
+    if(args.length!==3)throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
+    return loadRecoveryManifest(args[0]!,args[1]!,args[2]!,process.env.OLOS_REREAD_CONFIRMATION);
+  })() : undefined;
+  if(command==='capture-reread'&&(args.length!==6||args[4]!=='--authorization'))throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
+  if(command==='capture-reread')recoveryHash(args[5]);
   if (readoptionAction(command)||['corporate-check','corporate-status','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator'].includes(command)) { await corporateControl(cfg, command, args); return; }
   if (command === 'start' || command === 'admin') { await runManaged(cfg, command === 'admin'); return; }
   if (command === 'inspect-schema') {
@@ -56,8 +63,17 @@ async function main() {
     }
     if (command === 'check') { log('database_preflight_passed'); return; }
     if (command === 'status') {
-      for (const row of await store.unresolved()) log('pending_read', { read_id: row.id, state: row.state, processed: row.processed_count });
+      for (const row of await store.unresolved()) log('pending_read', { read_id: row.id, state: row.state, processed: row.processed_count,
+        started_at:row.started_at.toISOString(),error:row.error_code });
       return;
+    }
+    if(command==='recovery-authorize'){
+      log('recovery_authorized',{read_id:recovery!.parentId,authorization_hash:await store.authorizeRecovery(recovery!)});return;
+    }
+    if(command==='recovery-verify'){
+      if(args.length!==1)throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
+      const report=await store.verifyRecovery(args[0]!);log('recovery_coverage',report);
+      if(!report.complete)process.exitCode=1;return;
     }
     if (command === 'resolve') {
       if (!args[0] || !args[1]) throw new WorkerError('RESOLVE_REQUIRES_ID_AND_EVIDENCE');
@@ -69,7 +85,7 @@ async function main() {
       }
     }
     if (![cfg.baseUrl,cfg.username,cfg.password,cfg.clientId,cfg.clientSecret].every(Boolean)) throw new WorkerError('OLOS_CONFIG_REQUIRED');
-    http = new HttpTransport(cfg.baseUrl, cfg.timeoutMs, cfg.maxResponseBytes, abort.signal, cfg.tlsVerify);
+    http = new HttpTransport(cfg.baseUrl, cfg.timeoutMs, command==='capture-reread'?Math.min(cfg.maxResponseBytes,cfg.recoveryMaxResponseBytes):cfg.maxResponseBytes, abort.signal, cfg.tlsVerify);
     const auth = new OlosAuthManager(http.request, cfg);
     const api = new OlosApi(http.request, auth, ms => sleep(ms, abort.signal));
     const cache = new StaticCache(api, cfg.cacheTtlMs);
@@ -98,10 +114,10 @@ async function main() {
     }
     if (command === 'capture-reread') {
       const [parentId, date, start, end] = args;
-      if (!parentId || !date || !start || !end || args.length !== 4) {
+      if (!parentId || !date || !start || !end) {
         throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
       }
-      await worker.captureReread(parentId, date, start, end);
+      await worker.captureReread(parentId, date, start, end, args[5]!);
     }
     else if (command === 'capture-once') await worker.captureOnce();
     else {

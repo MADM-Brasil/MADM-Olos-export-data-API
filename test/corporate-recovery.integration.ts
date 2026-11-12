@@ -27,6 +27,7 @@ import { validateReadoption,activateReadoption,readoptionStatus,abortReadoption 
 import type { ReadoptionRequest,ReadoptionActivation,ReadoptionHooks } from '../src/corporate-delivery/readoption-contract.js';
 import { prepareCorporateReadoption } from '../src/corporate-delivery/readoption.js';
 import { fixture, row as corporateRow } from './corporate-sync.fixture.js';
+import { fingerprint,type RecoveryManifest } from '../src/read-recovery.js';
 
 const enabled = process.env.OLOS_DIRECT_DISPOSABLE_TEST === 'true';
 const authorization = { OLOS_CORPORATE_RECOVERY_CONFIRMATION: 'AUTHORIZE_CORPORATE_COLLISION_RECOVERY' };
@@ -127,6 +128,26 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
     await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`, columns.map(name => payload[name]));
   }
   try {
+    for(const mode of ['quarantined legacy queue','unmaterialized admission'] as const)await t.test(`capture recovery preserves corporate receipts and quarantine with ${mode}`,async()=>{
+      await reset(mode==='quarantined legacy queue'?2:0);
+      if(mode==='quarantined legacy queue'){
+        await insertRemote(0,{telefone:'5511999999999'});await quarantine(args((await verify()).verification_digest));
+      }else await enableAllocator();
+      const queue=await entries(),quarantined=await quarantineRows(),runs=await quarantineRuns(),before=await control();
+      const destination=(await remote.query('SELECT * FROM raw.olos_calls')).rows;
+      const parent=await store!.beginRead({kind:'current'});await store!.markError(parent,'RESPONSE_TOO_LARGE');
+      await local.query("UPDATE olos_http.reads SET started_at='2026-11-12T13:00:00Z' WHERE id=$1",[parent]);
+      const manifest:RecoveryManifest={version:1,sourceKey:source,targetTable:target,parentId:parent,parentStartedAt:'2026-11-12T13:00:00.000Z',date:'2026-11-12',
+        evidenceRef:'SYNTHETIC-OLOS-TICKET',evidenceSha256:fingerprint('synthetic official evidence'),remoteOperationComplete:true,rereadCursorSafe:true,exactIdsConfirmed:true,
+        operation:{start:'9001',end:'9001',quantity:'1',dateRead:'2026-11-12T10:00:00.123'},ranges:[{start:'9001',end:'9001',expectedIds:['9001']}]};
+      const hash=await store!.authorizeRecovery(manifest),child=await store!.beginRecoveryRead(parent,{kind:'reread',date:manifest.date,start:'9001',end:'9001'},hash);
+      await store!.stage(child,JSON.stringify([row(9001)]),1);assert.equal((await store!.drain(references)).queued,1);
+      assert.equal((await store!.verifyRecovery(parent)).complete,true);
+      assert.deepEqual((await entries()).filter(entry=>entry.source_id!=='9001'),queue);
+      assert.deepEqual(await quarantineRows(),quarantined);assert.deepEqual(await quarantineRuns(),runs);
+      assert.deepEqual(await control(),before);assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls')).rows,destination);
+      if(mode==='unmaterialized admission')assert.equal((await admissions()).filter(entry=>!entry.materialized).length,1);
+    });
     await t.test('diagnostics identify local failure stages without changing rollback or exposing database details', async () => {
       await reset(1); const input=args((await verify()).verification_digest),before=await snapshot();
       const cases:[string,string][]=[

@@ -1,6 +1,8 @@
 import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile,mkdtemp,writeFile,rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import pg from 'pg';
 import { Store } from '../src/store.js';
 import { config, type Config } from '../src/config.js';
@@ -15,6 +17,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { fingerprint,type RecoveryManifest,type RecoveryRange } from '../src/read-recovery.js';
 
 const execute=promisify(execFile);
 
@@ -98,12 +101,12 @@ test('advisory lock prevents a second consumer and unresolved read survives sess
 });
 test('backfill and controlled reread share dedup; unresolved original stays blocked until evidence',async()=>{
   const s=await store();await stage(s,[row('1')]);await s.drain(cache);
-  const lost=await s.beginRead({kind:'current'});
-  const recovery=await s.beginRead({kind:'reread',date:'2026-10-01',start:'1',end:'2'},true);
+  const plan=await recoveryPlan(s,[{start:'1',end:'2',expectedIds:['1','2']}]),lost=plan.parent;
+  const recovery=await plan.capture();
   await s.stage(recovery,JSON.stringify([row('1'),row('2')]),10);
   assert.deepEqual(await s.drain(cache),{received:2,inserted:1,updated:0,duplicates:1});
   await assert.rejects(s.beginRead({kind:'current'}),/RECOVERY_REQUIRED/);
-  await s.resolve(lost,'TICKET-test: completed remote operation, exact range and count verified');
+  await s.resolve(lost,`recovery:${(await s.verifyRecovery(lost)).verification_digest}`);
   await stage(s,[row('2'),row('3')],'previous');assert.equal((await s.drain(cache)).inserted,1);
 });
 test('schema fails closed for legacy ungenerated ID and required unknown field',async()=>{
@@ -390,4 +393,213 @@ test('pre-intent authentication timeout leaves no journal intent and permits a l
   await assert.rejects(worker.cycle(),/AUTH_UNAVAILABLE/);
   assert.equal((await s.unresolved()).length,0);assert.equal(mock.count(),0);
   mock.api.auth.getToken=getToken;await worker.cycle();assert.equal(mock.count(),1);
+});
+
+async function recoveryPlan(s:Store,ranges:RecoveryRange[]=[{start:'1',end:'3',expectedIds:['1','2','3']}],approve=true) {
+  const parent=await s.beginRead({kind:'current'});await s.markError(parent,'RESPONSE_TOO_LARGE');
+  await pool.query("UPDATE olos_http.reads SET started_at='2026-11-12T13:00:00Z' WHERE id=$1",[parent]);
+  const manifest:RecoveryManifest={version:1,sourceKey:s.cfg.sourceKey,targetTable:s.target,parentId:parent,parentStartedAt:'2026-11-12T13:00:00.000Z',date:'2026-11-12',
+    evidenceRef:'SYNTHETIC-OLOS-TICKET',evidenceSha256:fingerprint('synthetic official evidence'),remoteOperationComplete:true,rereadCursorSafe:true,exactIdsConfirmed:true,
+    operation:{start:ranges[0]!.start,end:ranges.at(-1)!.end,quantity:String(ranges.reduce((n,r)=>n+r.expectedIds.length,0)),dateRead:'2026-11-12T10:00:00.123'},ranges};
+  const hash=approve?await s.authorizeRecovery(manifest):fingerprint(JSON.stringify(manifest));
+  const capture=(range=ranges[0]!)=>s.beginRecoveryRead(parent,{kind:'reread',date:manifest.date,start:range.start,end:range.end},hash);
+  return {parent,manifest,hash,capture};
+}
+test('scoped rereads preserve preexisting calls, exact BigInt IDs, duplicates and complete coverage before resolution',async()=>{
+  const s=await store();await stage(s,[row('2')]);await s.drain(cache);
+  const original=(await pool.query('SELECT * FROM raw.olos_calls')).rows;
+  const ranges=[{start:'1',end:'2',expectedIds:['1','2']},{start:'9007199254740993',end:'9007199254740993',expectedIds:['9007199254740993']}];
+  const p=await recoveryPlan(s,ranges);
+  assert.equal(await s.authorizeRecovery(p.manifest),p.hash);
+  await assert.rejects(s.authorizeRecovery({...p.manifest,evidenceRef:'SYNTHETIC-OTHER'}),/AUTHORIZATION_CHANGED/);
+  await assert.rejects(s.resolve(p.parent,'unverified operator evidence'),/COVERAGE_NOT_PROVEN/);
+  await assert.rejects(s.beginRead({kind:'reread',date:p.manifest.date,start:'1',end:'2'},true),/AUTHORIZATION_REQUIRED/);
+  const first=await p.capture();await s.stage(first,JSON.stringify([row('1'),row('2'),row('1')]),1);
+  const result=await s.drain(cache);assert.equal(result.inserted,1);assert.equal(result.duplicates,2);
+  await assert.rejects(p.capture(),/RANGE_OVERLAP/);assert.equal((await s.verifyRecovery(p.parent)).complete,false);
+  const second=await p.capture(ranges[1]!);await s.stage(second,JSON.stringify([row('9007199254740993')]),1);await s.drain(cache);
+  const report=await s.verifyRecovery(p.parent);assert.equal(report.complete,true);assert.equal(report.covered,3);
+  assert.deepEqual(await s.verifyRecovery(p.parent),report);
+  await s.resolve(p.parent,`recovery:${report.verification_digest}`);
+  const parent=(await pool.query('SELECT state,response_body,processed_count,error_code FROM olos_http.reads WHERE id=$1',[p.parent])).rows[0];
+  assert.deepEqual(parent,{state:'resolved',response_body:null,processed_count:0,error_code:'RESPONSE_TOO_LARGE'});
+  assert.deepEqual((await pool.query('SELECT * FROM raw.olos_calls WHERE internal_id_olos=$1',[original[0].internal_id_olos])).rows,original);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
+});
+for(const [name,data] of [
+  ['empty',[]],['missing',[row('1')]],['unexpected',[row('1'),row('2'),row('3'),row('4')]],
+  ['conflicting duplicate',[row('1'),row('2'),row('3'),row('1',{CallId:'different'})]],
+] as const)test(`a ${name} reread response never advances a checkpoint or completes`,async()=>{
+  const s=await store(),p=await recoveryPlan(s),child=await p.capture();await s.stage(child,JSON.stringify(data),1);
+  await assert.rejects(s.drain(cache),/RECOVERY_RESPONSE_COVERAGE_MISMATCH|SOURCE_ID_CONTENT_CONFLICT/);
+  const state=(await pool.query('SELECT state,processed_count,response_body IS NOT NULL AS durable FROM olos_http.reads WHERE id=$1',[child])).rows[0];
+  assert.deepEqual(state,{state:'received',processed_count:0,durable:true});
+  assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,0);
+  assert.equal((await s.verifyRecovery(p.parent)).complete,false);
+  await assert.rejects(s.resolve(child,'discard child to resume capture'),/CHILD_RESOLUTION_FORBIDDEN/);
+});
+test('reread validates conflicts in later batches before the first write',async()=>{
+  const s=await store({ingestionBaseline:'2026-09-01T00:00:00Z'});await stage(s,[row('3')]);await s.drain(cache);
+  const p=await recoveryPlan(s),child=await p.capture();await s.stage(child,JSON.stringify([row('1'),row('2'),row('3',{CallId:'changed'})]),1);
+  await assert.rejects(s.drain(cache),/SOURCE_ID_CONTENT_CONFLICT/);
+  assert.equal((await pool.query('SELECT processed_count FROM olos_http.reads WHERE id=$1',[child])).rows[0].processed_count,0);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,1);
+});
+test('a baseline cannot silently discard any expected recovery record',async()=>{
+  const s=await store({ingestionBaseline:'2026-11-01T00:00:00Z'}),p=await recoveryPlan(s),child=await p.capture();
+  await s.stage(child,JSON.stringify([row('1'),row('2'),row('3')]),1);
+  await assert.rejects(s.drain(cache),/BASELINE_EXCLUDES_RECORD/);
+  assert.equal((await pool.query('SELECT processed_count FROM olos_http.reads WHERE id=$1',[child])).rows[0].processed_count,0);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,0);
+});
+test('reread processing resumes confirmed batches after a failed transaction and restart without losing records',async()=>{
+  const s=await store(),p=await recoveryPlan(s),child=await p.capture();await s.stage(child,JSON.stringify([row('1'),row('2'),row('3')]),1);
+  // Inject a real transaction failure after exactly one batch has committed.
+  await pool.query("CREATE FUNCTION raw.fail_recovery_count() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF (SELECT count(*) FROM raw.olos_calls)>=2 THEN RAISE EXCEPTION 'synthetic'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_recovery BEFORE INSERT ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION raw.fail_recovery_count()");
+  await assert.rejects(s.drain(cache));
+  assert.equal((await pool.query('SELECT processed_count FROM olos_http.reads WHERE id=$1',[child])).rows[0].processed_count,2);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.records')).rows[0].n,2);
+  await s.close();stores.splice(stores.indexOf(s),1);await pool.query('DROP TRIGGER fail_recovery ON raw.olos_calls');
+  const next=await store();assert.equal((await next.drain(cache)).inserted,1);
+  assert.equal((await next.drain(cache)).inserted,0);assert.equal((await next.verifyRecovery(p.parent)).complete,true);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
+});
+test('oversized reread stays uncertain across restart and never retries or resolves the child',async()=>{
+  const s=await store(),p=await recoveryPlan(s),mock=fakeApi(async()=>{throw new WorkerError('RESPONSE_TOO_LARGE');});
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await assert.rejects(worker.captureReread(p.parent,p.manifest.date,'1','3',p.hash),/RECOVERY_REQUIRED/);assert.equal(mock.count(),1);
+  const child=(await pool.query("SELECT id,state,processed_count,response_body,error_code FROM olos_http.reads WHERE id<>$1",[p.parent])).rows[0];
+  assert.equal(child.state,'reading');assert.equal(child.processed_count,0);assert.equal(child.response_body,null);assert.equal(child.error_code,'RESPONSE_TOO_LARGE');
+  await s.close();stores.splice(stores.indexOf(s),1);const next=await store();
+  await assert.rejects(next.beginRecoveryRead(p.parent,{kind:'reread',date:p.manifest.date,start:'1',end:'3'},p.hash),/RECOVERY_REQUIRED/);
+  await assert.rejects(next.resolve(child.id,'unverified retry or discard'),/CHILD_RESOLUTION_FORBIDDEN/);
+  assert.equal((await next.verifyRecovery(p.parent)).complete,false);assert.equal(mock.count(),1);
+});
+test('lost staging and batch COMMIT acknowledgements recover durable children without another HTTP request',async()=>{
+  const s=await store(),p=await recoveryPlan(s,[{start:'1',end:'2',expectedIds:['1','2']}]),mock=fakeApi(async()=>JSON.stringify([row('1'),row('2')]));
+  const stageOriginal=s.stage.bind(s);s.stage=async(...args)=>{await stageOriginal(...args);throw new Error('synthetic staging ACK loss');};
+  await assert.rejects(new Worker(s,mock.api,new StaticCache(mock.api,3600000)).captureReread(p.parent,p.manifest.date,'1','2',p.hash),/RECOVERY_REQUIRED/);
+  const query=s.client!.query.bind(s.client!);let lost=false;
+  s.client!.query=(async(sql:string,parameters?:unknown[])=>{const result=await query(sql,parameters);if(sql==='COMMIT'&&!lost){lost=true;throw new Error('synthetic COMMIT ACK loss');}return result;}) as typeof query;
+  await assert.rejects(s.drain(cache));s.client!.query=query;
+  await s.close();stores.splice(stores.indexOf(s),1);const next=await store();
+  assert.equal((await next.drain(cache)).inserted,0);assert.equal((await next.verifyRecovery(p.parent)).complete,true);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,2);assert.equal(mock.count(),1);
+});
+test('coverage detects missing destination rows and changed hashes before authorizing resolution',async()=>{
+  const s=await store(),p=await recoveryPlan(s),child=await p.capture();await s.stage(child,JSON.stringify([row('1'),row('2'),row('3')]),1);await s.drain(cache);
+  const complete=await s.verifyRecovery(p.parent);assert.equal(complete.complete,true);
+  await pool.query("UPDATE olos_http.records SET source_hash=repeat('b',64) WHERE source_id='3'");
+  assert.equal((await s.verifyRecovery(p.parent)).conflicts,1);
+  await assert.rejects(s.resolve(p.parent,`recovery:${complete.verification_digest}`),/COVERAGE_NOT_PROVEN/);
+  await pool.query('DELETE FROM raw.olos_calls WHERE internal_id_olos=(SELECT target_id FROM olos_http.records WHERE source_id=$1)',['2']);
+  assert.equal((await s.verifyRecovery(p.parent)).missing,1);
+});
+test('wrong scopes never consume and concurrent capture processes cannot share the source',async()=>{
+  const s=await store(),p=await recoveryPlan(s,[{start:'1',end:'1',expectedIds:['1']}]);
+  let release!:()=>void,entered!:()=>void;
+  const waiting=new Promise<void>(resolve=>{release=resolve;}),started=new Promise<void>(resolve=>{entered=resolve;});
+  const mock=fakeApi(async()=>{entered();await waiting;return JSON.stringify([row('1')]);});
+  const worker=new Worker(s,mock.api,new StaticCache(mock.api,3600000));
+  await assert.rejects(worker.captureReread(p.parent,'2026-10-28','1','1',p.hash),/OUTSIDE_AUTHORIZED_RANGE/);
+  await assert.rejects(worker.captureReread(p.parent,p.manifest.date,'1','1','b'.repeat(64)),/OUTSIDE_AUTHORIZED_RANGE/);assert.equal(mock.count(),0);
+  const pending=worker.captureReread(p.parent,p.manifest.date,'1','1',p.hash);await started;
+  try{
+    await assert.rejects(worker.captureReread(p.parent,p.manifest.date,'1','1',p.hash),/POLL_ALREADY_ACTIVE/);
+    const second=new Store(cfg);try{await assert.rejects(second.open(),/CONSUMER_ALREADY_ACTIVE/);}finally{await second.close();}
+  }finally{release();await pending;}
+  assert.equal(mock.count(),1);
+});
+for(const committed of [false,true])test(`uncertain first authorization COMMIT (committed=${committed}) is reusable without partial approval`,async()=>{
+  const s=await store(),p=await recoveryPlan(s,undefined,false);const query=s.client!.query.bind(s.client!);
+  s.client!.query=(async(sql:string,parameters?:unknown[])=>{
+    if(sql==='COMMIT'&&!committed)throw new Error('synthetic COMMIT transport failure');
+    const result=await query(sql,parameters);if(sql==='COMMIT')throw new Error('synthetic authorization ACK loss');return result;
+  }) as typeof query;
+  await assert.rejects(s.authorizeRecovery(p.manifest),/AUTHORIZATION_COMMIT_UNKNOWN/);s.client!.query=query;
+  assert.equal((await pool.query("SELECT spec ? 'recovery_authorization' AS approved FROM olos_http.reads WHERE id=$1",[p.parent])).rows[0].approved,committed);
+  await s.close();stores.splice(stores.indexOf(s),1);const next=await store();
+  assert.equal(await next.authorizeRecovery(p.manifest),p.hash);assert.equal((await next.verifyRecovery(p.parent)).complete,false);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM olos_http.reads')).rows[0].n,1);
+});
+test('a lost child intent acknowledgement sends no HTTP and blocks a second capture after restart',async()=>{
+  const s=await store(),p=await recoveryPlan(s),mock=fakeApi(async()=>JSON.stringify([row('1'),row('2'),row('3')]));
+  const query=s.client!.query.bind(s.client!);
+  s.client!.query=(async(sql:string,parameters?:unknown[])=>{const result=await query(sql,parameters);if(sql.startsWith('INSERT INTO olos_http.reads'))throw new Error('synthetic intent ACK loss');return result;}) as typeof query;
+  await assert.rejects(new Worker(s,mock.api,new StaticCache(mock.api,3600000)).captureReread(p.parent,p.manifest.date,'1','3',p.hash));s.client!.query=query;
+  assert.equal(mock.count(),0);await s.close();stores.splice(stores.indexOf(s),1);
+  const next=await store();await assert.rejects(next.beginRecoveryRead(p.parent,{kind:'reread',date:p.manifest.date,start:'1',end:'3'},p.hash),/RECOVERY_REQUIRED/);
+  assert.equal((await next.verifyRecovery(p.parent)).complete,false);
+  assert.equal((await pool.query("SELECT count(*)::int n FROM olos_http.reads WHERE state='reading' AND response_body IS NULL AND processed_count=0")).rows[0].n,2);
+});
+test('a lost resolution acknowledgement is reconciled by the same proof without rewriting history',async()=>{
+  const s=await store(),p=await recoveryPlan(s),child=await p.capture();await s.stage(child,JSON.stringify([row('1'),row('2'),row('3')]),1);await s.drain(cache);
+  const proof=`recovery:${(await s.verifyRecovery(p.parent)).verification_digest}`,query=s.client!.query.bind(s.client!);
+  s.client!.query=(async(sql:string,parameters?:unknown[])=>{const result=await query(sql,parameters);if(sql.startsWith("UPDATE olos_http.reads SET state='resolved'"))throw new Error('synthetic resolution ACK loss');return result;}) as typeof query;
+  await assert.rejects(s.resolve(p.parent,proof));s.client!.query=query;
+  const before=(await pool.query('SELECT * FROM olos_http.reads WHERE id=$1',[p.parent])).rows;
+  await s.close();stores.splice(stores.indexOf(s),1);const next=await store();
+  assert.equal((await next.verifyRecovery(p.parent)).parent_state,'resolved');await next.resolve(p.parent,proof);
+  assert.deepEqual((await pool.query('SELECT * FROM olos_http.reads WHERE id=$1',[p.parent])).rows,before);
+});
+test('scheduler stays blocked until verified resolution, then admits the next normal cycle',async()=>{
+  const options=managedConfig(),s=await store(options),p=await recoveryPlan(s),child=await p.capture();
+  await s.stage(child,JSON.stringify([row('1'),row('2'),row('3')]),1);await s.drain(cache);
+  await s.close();stores.splice(stores.indexOf(s),1);
+  let snapshots=0;
+  await assert.rejects(createScheduledConsumer(options,async()=>{snapshots++;throw new Error('must not authenticate');}),/RECONCILIATION_REQUIRED/);assert.equal(snapshots,0);
+  const next=await store(options),report=await next.verifyRecovery(p.parent);assert.equal(report.complete,true);
+  await next.resolve(p.parent,`recovery:${report.verification_digest}`);await next.resolve(p.parent,`recovery:${report.verification_digest}`);
+  await next.close();stores.splice(stores.indexOf(next),1);
+  const http=await simulatedOlos();
+  try{const consumer=await createScheduledConsumer(options,http.snapshot);try{await consumer.cycle();assert.equal(http.count(),1);}finally{await consumer.close();}}
+  finally{await http.close();}
+});
+test('a near-budget synthetic recovery uses bounded batches and stays below the Admin memory limit',async()=>{
+  const s=await store({batchSize:500}),ids=Array.from({length:2000},(_,i)=>String(i+1));
+  const p=await recoveryPlan(s,[{start:'1',end:'2000',expectedIds:ids}]),child=await p.capture();
+  const body=JSON.stringify(ids.map(id=>row(id,{CampaignData:'x'.repeat(3000)})));
+  assert(Buffer.byteLength(body)>6*1024*1024&&Buffer.byteLength(body)<s.cfg.recoveryMaxResponseBytes);
+  const start=performance.now();await s.stage(child,body,1);const result=await s.drain(cache);assert.equal(result.inserted,2000);
+  assert.equal((await s.verifyRecovery(p.parent)).complete,true);
+  const maxRss=process.resourceUsage().maxRSS*1024;
+  console.log(JSON.stringify({test:'synthetic_scoped_reread_2000_rows',response_bytes:Buffer.byteLength(body),batch_size:s.cfg.batchSize,duration_ms:Math.round(performance.now()-start),max_rss_bytes:maxRss}));
+  assert(maxRss<1536*1024*1024);
+});
+test('compiled administrative CLI authorizes, captures once, verifies and resolves using real local HTTP and PostgreSQL',async()=>{
+  let rereads=0,current=0;
+  const catalog=[{TableName:'AttemptsRawData',Columns:['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId']},
+    {TableName:'Users',Columns:['AgentId','UserName']},{TableName:'Campaign',Columns:['CampaignId','Description']},{TableName:'Disposition',Columns:['DispositionId','Description']}];
+  const http=createServer(async(req,res)=>{
+    for await(const _ of req){ /* consume multipart */ }
+    if(req.url==='/api/auth')res.end(JSON.stringify({access_token:'PRIVATE_FIXTURE_TOKEN',token_type:'bearer',expires_in:3600}));
+    else if(req.url?.endsWith('/available-tables'))res.end(JSON.stringify(catalog));
+    else if(req.url?.endsWith('/read-data'))res.end('[]');
+    else if(req.url?.endsWith('/re-read-data')){
+      rereads++;res.end(JSON.stringify([row('1'),row('2'),row('3')]));
+    }else{current++;res.writeHead(500);res.end();}
+  });
+  http.listen(0,'127.0.0.1');await once(http,'listening');const address=http.address();assert(address&&typeof address!=='string');
+  const dir=await mkdtemp(join(tmpdir(),'olos-recovery-cli-'));
+  const env={DATABASE_URL:url!,OLOS_SOURCE_KEY:cfg.sourceKey,SOURCE_ID_UNIQUENESS_CONFIRMED:'true',
+    OLOS_BASE_URL:`http://127.0.0.1:${address.port}`,OLOS_USERNAME:'fixture',OLOS_PASSWORD:'PRIVATE_FIXTURE_PASSWORD',OLOS_CLIENT_ID:'fixture',OLOS_CLIENT_SECRET:'PRIVATE_FIXTURE_SECRET',
+    SOURCE_TIME_ZONE:'UTC',INGESTION_BASELINE:'2026-09-01T00:00:00Z',BATCH_SIZE:'2'};
+  const cli=(args:string[],authorized=false)=>execute(process.execPath,['dist/main.js',...args],{env:{...env,...(authorized?{OLOS_REREAD_CONFIRMATION:'AUTHORIZE_EXPORTDATA_REREAD_RECOVERY'}:{})},timeout:10000});
+  try{
+    const s=await store(config(env)),p=await recoveryPlan(s,undefined,false);await s.close();stores.splice(stores.indexOf(s),1);
+    const evidence=JSON.stringify([{TableName:'AttemptsRawData',PKColumnName:'AttemptsRawDataID',DateExport:'2026-11-12T00:00:00',
+      PKIDStart:1,PKIDEnd:3,Quantity:3,DateRead:p.manifest.operation.dateRead}]);
+    p.manifest.evidenceSha256=fingerprint(evidence);const raw=JSON.stringify(p.manifest),mp=join(dir,'manifest.json'),ep=join(dir,'official-log.json');
+    await writeFile(mp,raw,{mode:0o600});await writeFile(ep,evidence,{mode:0o600});
+    const args=['recovery-authorize',mp,ep,fingerprint(raw)];
+    await assert.rejects(cli(args),(error:unknown)=>typeof error==='object'&&error!==null&&'stdout' in error&&String(error.stdout).includes('RECOVERY_NOT_AUTHORIZED'));
+    const approved=JSON.parse((await cli(args,true)).stdout.trim());assert.equal(approved.event,'recovery_authorized');
+    const captured=await cli(['capture-reread',p.parent,'2026-11-12','1','3','--authorization',approved.authorization_hash]);
+    assert.match(captured.stdout,/capture_reread_received/);
+    await cli(['recover-local']);const coverage=JSON.parse((await cli(['recovery-verify',p.parent])).stdout.trim());
+    assert.equal(coverage.complete,true);assert.equal(coverage.covered,3);
+    await cli(['resolve',p.parent,`recovery:${coverage.verification_digest}`]);assert.equal((await cli(['status'])).stdout,'');
+    assert.equal(JSON.parse((await cli(['recovery-verify',p.parent])).stdout.trim()).parent_state,'resolved');
+    assert.equal(rereads,1);assert.equal(current,0);assert.equal((await pool.query('SELECT count(*)::int n FROM raw.olos_calls')).rows[0].n,3);
+  }finally{await new Promise<void>(resolve=>http.close(()=>resolve()));await rm(dir,{recursive:true,force:true});}
 });

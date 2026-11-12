@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { type Config } from './config.js';
-import { type ReadSpec, rows } from './api.js';
+import { type ReadSpec, rows, readFields } from './api.js';
 import { columns, type Cache, type MappedRecord, mapRecord } from './mapping.js';
 import { WorkerError } from './errors.js';
 import { assertSchema, quote } from './schema.js';
 import { lockSource } from './source-lock.js';
 import { CorporateDelivery } from './corporate-delivery/delivery.js';
 import { assertNoDirectOwnership } from './corporate-sync/ownership.js';
+import { admissionHash } from './corporate-delivery/allocator.js';
+import { authorization, fingerprint, recoveryBinding, recoveryHash, recoveryManifest, type RecoveryAuthorization, type RecoveryManifest } from './read-recovery.js';
 
-type Read = { id: string; spec: ReadSpec; state: string; response_body: string | null; processed_count: number; request_ms: number | null };
+type Read = { id: string; spec: ReadSpec & { recovery_authorization?: RecoveryAuthorization }; state: string;
+  started_at: Date; error_code: string|null; response_body: string | null; processed_count: number; received_count: number|null; request_ms: number | null };
 export class Store {
   readonly pool: pg.Pool;
   client: pg.PoolClient | undefined;
@@ -59,42 +62,55 @@ export class Store {
     return this.delivery.reconcile(this.db(), this.sequence);
   }
   async unresolved() {
-    return (await this.db().query<Read>("SELECT id,spec,state,response_body,processed_count,request_ms FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at", [this.cfg.sourceKey])).rows;
+    return (await this.db().query<Read>("SELECT id,spec,state,response_body,processed_count,request_ms,started_at,error_code,received_count FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at", [this.cfg.sourceKey])).rows;
   }
   async beginRead(spec: ReadSpec, recovery = false) {
     await this.captureReady();
     const pending = await this.unresolved();
+    if (spec.kind==='reread' && pending.some(r=>r.state==='reading')) throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
     if (pending.some(r => r.state === 'received') || (!recovery && pending.length)) throw new WorkerError('RECOVERY_REQUIRED');
     const id = randomUUID();
     await this.db().query('INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)', [id, this.cfg.sourceKey, this.target, JSON.stringify(spec)]);
     return id;
   }
-  async validateRecoveryRead(parentId: string, spec: ReadSpec) {
+  private async recoveryAuthorization(parentId: string) {
+    const parent=(await this.db().query<Read>('SELECT id,spec,state,started_at,error_code,response_body,processed_count FROM olos_http.reads WHERE id=$1 AND source_key=$2 AND target_table=$3',
+      [parentId,this.cfg.sourceKey,this.target])).rows[0];
+    if(!parent||parent.spec.kind!=='current'||!['reading','resolved'].includes(parent.state)||parent.response_body!==null||parent.processed_count!==0)throw new WorkerError('ORIGINAL_READ_NOT_FOUND');
+    if(!parent.spec.recovery_authorization)throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
+    const approved=authorization(parent.spec.recovery_authorization,this.cfg);
+    if(approved.manifest.parentId!==parentId||Date.parse(approved.manifest.parentStartedAt)!==parent.started_at.getTime())throw new WorkerError('RECOVERY_AUTHORIZATION_CHANGED');
+    return {parent,approved};
+  }
+  async authorizeRecovery(input: RecoveryManifest) {
+    if(!this.cfg.sourceIdConfirmed)throw new WorkerError('SOURCE_ID_UNIQUENESS_UNCONFIRMED');
+    const manifest=recoveryManifest(input);
+    if(manifest.sourceKey!==this.cfg.sourceKey||manifest.targetTable!==this.target)throw new WorkerError('RECOVERY_SOURCE_MISMATCH');
+    const approved:RecoveryAuthorization={manifest,hash:fingerprint(JSON.stringify(manifest)),binding:recoveryBinding(this.cfg)};
+    const db=this.db();let commitIssued=false;
+    try{
+      await db.query('BEGIN');
+      const parent=(await db.query<Read>('SELECT id,spec,state,started_at,error_code,response_body,processed_count FROM olos_http.reads WHERE id=$1 AND source_key=$2 AND target_table=$3 FOR UPDATE',
+        [manifest.parentId,this.cfg.sourceKey,this.target])).rows[0];
+      if(!parent||parent.state!=='reading'||parent.spec.kind!=='current'||parent.response_body!==null||parent.processed_count!==0||
+        parent.error_code!=='RESPONSE_TOO_LARGE'||parent.started_at.getTime()!==Date.parse(manifest.parentStartedAt))throw new WorkerError('ORIGINAL_READ_NOT_FOUND');
+      if((await this.unresolved()).some(read=>read.id!==parent.id))throw new WorkerError('RECOVERY_REQUIRED');
+      if(parent.spec.recovery_authorization){
+        const existing=authorization(parent.spec.recovery_authorization,this.cfg);
+        if(existing.hash!==approved.hash)throw new WorkerError('RECOVERY_AUTHORIZATION_CHANGED');
+      }else await db.query("UPDATE olos_http.reads SET spec=spec||jsonb_build_object('recovery_authorization',$3::jsonb) WHERE id=$1 AND source_key=$2",
+        [manifest.parentId,this.cfg.sourceKey,JSON.stringify(approved)]);
+      commitIssued=true;await db.query('COMMIT');return approved.hash;
+    }catch(error){await db.query('ROLLBACK').catch(()=>{});if(commitIssued)throw new WorkerError('RECOVERY_AUTHORIZATION_COMMIT_UNKNOWN');throw error;}
+  }
+  async validateRecoveryRead(parentId: string, spec: ReadSpec, approvalHash: string) {
     if (spec.kind !== 'reread') throw new WorkerError('RECOVERY_SPEC_REQUIRED');
-
-    // Limites autorizados para a recuperação de 28/10/2026.
-    // Remover esta restrição específica após concluir a homologação.
-    const authorizedParent = '5ec94595-11a0-469b-9e1e-c4c801e0479f';
-    const authorizedDate = '2026-10-28';
-    const authorizedStart = 46671511n;
-    const authorizedEnd = 46800030n;
-
-    if (parentId !== authorizedParent ||
-        spec.date !== authorizedDate ||
-        BigInt(spec.start) < authorizedStart ||
-        BigInt(spec.end) > authorizedEnd) {
-      throw new WorkerError('RECOVERY_OUTSIDE_AUTHORIZED_RANGE');
-    }
-
+    readFields(spec);
+    const {parent,approved}=await this.recoveryAuthorization(parentId);
+    if(parent.state!=='reading'||recoveryHash(approvalHash)!==approved.hash||spec.date!==approved.manifest.date||
+      !approved.manifest.ranges.some(range=>range.start===spec.start&&range.end===spec.end))throw new WorkerError('RECOVERY_OUTSIDE_AUTHORIZED_RANGE');
     const pending = await this.unresolved();
-    const original = pending.find(r => r.id === parentId);
-
-    if (!original || original.state !== 'reading' ||
-        original.spec.kind !== 'current') {
-      throw new WorkerError('ORIGINAL_READ_NOT_FOUND');
-    }
-
-    if (pending.some(r => r.state === 'reading' && r.id !== parentId)) {
+    if (pending.some(r => r.id !== parentId)) {
       throw new WorkerError('RECOVERY_REQUIRED');
     }
 
@@ -115,13 +131,13 @@ export class Store {
 
   }
 
-  async beginRecoveryRead(parentId: string, spec: ReadSpec) {
+  async beginRecoveryRead(parentId: string, spec: ReadSpec, approvalHash: string) {
     await this.captureReady();
-    await this.validateRecoveryRead(parentId, spec);
+    await this.validateRecoveryRead(parentId, spec, approvalHash);
     const id = randomUUID();
     await this.db().query(
       'INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)',
-      [id, this.cfg.sourceKey, this.target, JSON.stringify(spec)]
+      [id, this.cfg.sourceKey, this.target, JSON.stringify({...spec,recovery:{parentId,authorizationHash:approvalHash}})]
     );
     return id;
   }
@@ -141,7 +157,9 @@ export class Store {
       { received: 0, inserted: 0, updated: 0, duplicates: 0, ...(this.delivery ? { queued: 0, skipped: 0 } : {}) };
     for (const read of await this.unresolved()) {
       if (read.state !== 'received') continue;
+      if(read.spec.kind==='reread'&&read.spec.recovery&&Buffer.byteLength(read.response_body!)>this.cfg.recoveryMaxResponseBytes)throw new WorkerError('RESPONSE_TOO_LARGE');
       const data = rows(read.response_body!);
+      if(read.spec.kind==='reread'&&read.spec.recovery)await this.validateRecoveryResponse(read,data,cache);
       total.received += data.length;
       // Validate the whole response before writing any target rows. Raw response is already durable.
       for (const row of data) {
@@ -173,6 +191,80 @@ export class Store {
       await this.db().query("UPDATE olos_http.reads SET state='done',finished_at=clock_timestamp(),received_count=$2 WHERE id=$1 AND source_key=$3 AND processed_count=$2", [read.id, data.length, this.cfg.sourceKey]);
     }
     return total;
+  }
+  private async validateRecoveryResponse(read: Read, data: Record<string,unknown>[], cache: Cache, approvedInput?: RecoveryAuthorization, checkExisting=true) {
+    if(read.spec.kind!=='reread'||!read.spec.recovery)throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
+    const spec=read.spec;
+    const approved=approvedInput??(await this.recoveryAuthorization(spec.recovery!.parentId)).approved;
+    const range=approved.manifest.ranges.find(range=>range.start===spec.start&&range.end===spec.end);
+    if(approved.hash!==read.spec.recovery.authorizationHash||read.spec.date!==approved.manifest.date||!range)throw new WorkerError('RECOVERY_AUTHORIZATION_CHANGED');
+    const hashes=new Map<string,string>(),expected=new Set(range.expectedIds);
+    for(const row of data){
+      const mapped=mapRecord(row,cache,this.cfg.sourceTimeZone,!!this.delivery);
+      if(!expected.has(mapped.source_id))throw new WorkerError('RECOVERY_RESPONSE_COVERAGE_MISMATCH');
+      if(hashes.has(mapped.source_id)&&hashes.get(mapped.source_id)!==mapped.source_hash)throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
+      if(this.cfg.ingestionBaseline&&(mapped.data_ligacao===null||Date.parse(mapped.data_ligacao)<Date.parse(this.cfg.ingestionBaseline)))throw new WorkerError('RECOVERY_BASELINE_EXCLUDES_RECORD');
+      hashes.set(mapped.source_id,mapped.source_hash);
+    }
+    if(hashes.size!==expected.size)throw new WorkerError('RECOVERY_RESPONSE_COVERAGE_MISMATCH');
+    if(!checkExisting)return hashes;
+    // Detect conflicts across the entire child before committing its first processing batch.
+    for(let offset=0;offset<range.expectedIds.length;offset+=this.cfg.batchSize){
+      const records=await this.recoveryRecords(range.expectedIds.slice(offset,offset+this.cfg.batchSize));
+      if(records.some(record=>record.target_table!==this.target||record.source_hash!==hashes.get(record.source_id)))throw new WorkerError('SOURCE_ID_CONTENT_CONFLICT');
+      if(records.some(record=>!record.present))throw new WorkerError('RECOVERY_PERSISTENCE_DIVERGES');
+    }
+    return hashes;
+  }
+  private async recoveryRecords(ids: string[]) {
+    // In corporate mode the durable destination is the frozen outbox (or an unmaterialized
+    // admission), not a new local raw row and not a remote receipt. Never trigger delivery here.
+    const present=this.delivery?`EXISTS(SELECT 1 FROM olos_http.corporate_outbox o WHERE o.source_key=r.source_key AND o.source_id=r.source_id
+      AND o.target_id=r.target_id AND o.source_hash=r.source_hash)`:`EXISTS(SELECT 1 FROM ${this.target} d WHERE d.internal_id_olos=r.target_id)`;
+    const records=(await this.db().query<{source_id:string;source_hash:string;target_table:string;present:boolean}>(
+      `SELECT r.source_id,r.source_hash,r.target_table,${present} AS present FROM olos_http.records r WHERE r.source_key=$1 AND r.source_id=ANY($2::text[])`,
+      [this.cfg.sourceKey,ids])).rows;
+    if(this.delivery&&records.length<ids.length&&(await this.db().query("SELECT to_regclass('olos_http.corporate_id_admissions') IS NOT NULL AS present")).rows[0].present){
+      const existing=new Set(records.map(record=>record.source_id));
+      const admissions=(await this.db().query<{source_id:string;source_hash:string;mapped:MappedRecord;mapped_hash:string}>(
+        'SELECT source_id,source_hash,mapped,mapped_hash FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND source_id=ANY($2::text[]) AND NOT materialized',
+        [this.cfg.sourceKey,ids.filter(id=>!existing.has(id))])).rows;
+      for(const row of admissions)records.push({source_id:row.source_id,source_hash:row.source_hash,target_table:this.target,
+        present:row.mapped.source_id===row.source_id&&row.mapped.source_hash===row.source_hash&&admissionHash(row.mapped)===row.mapped_hash});
+    }
+    return records;
+  }
+  async verifyRecovery(parentId: string) {
+    const {parent,approved}=await this.recoveryAuthorization(parentId);
+    const children=(await this.db().query<Read>("SELECT id,spec,state,processed_count,received_count FROM olos_http.reads WHERE source_key=$1 AND target_table=$2 AND spec->'recovery'->>'parentId'=$3 ORDER BY started_at,id",
+      [this.cfg.sourceKey,this.target,parentId])).rows;
+    let covered=0,missing=0,conflicts=0,completed=0;
+    const proof:string[]=[approved.hash];
+    const empty:Cache={users:new Map(),campaigns:new Map(),dispositions:new Map()};
+    for(const range of approved.manifest.ranges){
+      const matching=children.filter(child=>child.spec.kind==='reread'&&child.spec.start===range.start&&child.spec.end===range.end);
+      const child=matching[0];
+      if(matching.length!==1||!child||child.state!=='done'){missing+=range.expectedIds.length;continue;}
+      const body=(await this.db().query<{response_body:string}>('SELECT response_body FROM olos_http.reads WHERE id=$1 AND source_key=$2',[child.id,this.cfg.sourceKey])).rows[0]!.response_body;
+      if(Buffer.byteLength(body)>this.cfg.recoveryMaxResponseBytes)throw new WorkerError('RESPONSE_TOO_LARGE');
+      const data=rows(body),hashes=await this.validateRecoveryResponse(child,data,empty,approved,false);
+      if(child.processed_count!==data.length||child.received_count!==data.length){missing+=range.expectedIds.length;continue;}
+      proof.push(child.id,fingerprint(body));completed++;
+      for(let offset=0;offset<range.expectedIds.length;offset+=this.cfg.batchSize){
+        const ids=range.expectedIds.slice(offset,offset+this.cfg.batchSize);
+        const records=await this.recoveryRecords(ids);
+        const byId=new Map(records.map(record=>[record.source_id,record]));
+        for(const id of ids){
+          const record=byId.get(id);
+          if(!record||!record.present)missing++;else if(record.target_table!==this.target||record.source_hash!==hashes.get(id))conflicts++;else{covered++;proof.push(id,record.source_hash);}
+        }
+      }
+    }
+    const pending=(await this.unresolved()).filter(read=>read.id!==parentId).length;
+    const expected=approved.manifest.ranges.reduce((n,range)=>n+range.expectedIds.length,0);
+    const complete=missing===0&&conflicts===0&&covered===expected&&completed===children.length&&completed===approved.manifest.ranges.length&&pending===0;
+    return {parent_id:parentId,parent_state:parent.state,complete,expected,covered,missing,conflicts,children:children.length,completed,pending,
+      verification_digest:complete?fingerprint(JSON.stringify(proof)):null};
   }
   private async persist(readId: string, input: MappedRecord[], processed: number, received: number) {
     const db = this.db();
@@ -266,6 +358,13 @@ export class Store {
   }
   async resolve(id: string, evidence: string) {
     if (evidence.trim().length < 10) throw new WorkerError('RECONCILIATION_EVIDENCE_REQUIRED');
+    const parent=(await this.db().query<Read & {resolution:string|null}>('SELECT spec,error_code,state,resolution FROM olos_http.reads WHERE id=$1 AND source_key=$2',[id,this.cfg.sourceKey])).rows[0];
+    if(parent?.spec.kind==='reread'&&parent.spec.recovery)throw new WorkerError('RECOVERY_CHILD_RESOLUTION_FORBIDDEN');
+    if(parent?.error_code==='RESPONSE_TOO_LARGE'||parent?.spec.recovery_authorization){
+      const report=await this.verifyRecovery(id);
+      if(!report.complete||evidence!==`recovery:${report.verification_digest}`)throw new WorkerError('RECOVERY_COVERAGE_NOT_PROVEN');
+      if(parent.state==='resolved'&&parent.resolution===evidence)return;
+    }
     const result = await this.db().query("UPDATE olos_http.reads SET state='resolved',resolution=$3,finished_at=clock_timestamp() WHERE id=$1 AND source_key=$2 AND state='reading'", [id,this.cfg.sourceKey,evidence]);
     if (result.rowCount !== 1) throw new WorkerError('UNRESOLVED_READ_NOT_FOUND');
   }

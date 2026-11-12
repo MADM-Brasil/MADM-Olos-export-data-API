@@ -11,7 +11,8 @@ export function rows(raw: string): Record<string, unknown>[] {
   if (!Array.isArray(value) || value.some(r => !r || typeof r !== 'object' || Array.isArray(r))) throw new WorkerError('ARRAY_RESPONSE_REQUIRED');
   return value as Record<string, unknown>[];
 }
-export type ReadSpec = { kind: 'current' | 'previous' } | { kind: 'reread'; date: string; start: string; end: string };
+export type ReadSpec = { kind: 'current' | 'previous' } | { kind: 'reread'; date: string; start: string; end: string;
+  recovery?: { parentId: string; authorizationHash: string } };
 export function readFields(spec: ReadSpec) {
   if (spec.kind !== 'reread') return { TableName: 'AttemptsRawData' };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(spec.date) || !Number.isFinite(Date.parse(spec.date)) || new Date(spec.date).toISOString().slice(0,10) !== spec.date ||
