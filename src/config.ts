@@ -1,6 +1,5 @@
 import { WorkerError } from './errors.js';
 import { deliveryConfig } from './corporate-delivery/config.js';
-import { isAbsolute } from 'node:path';
 export function olosTlsVerify(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = env.OLOS_TLS_VERIFY ?? 'true';
   if (value !== 'true' && value !== 'false') throw new WorkerError('CONFIG_INVALID_OLOS_TLS_VERIFY');
@@ -49,14 +48,6 @@ export function config(env: NodeJS.ProcessEnv = process.env) {
     batchSize: integer('BATCH_SIZE', 500, 1, 2000),
     cacheTtlMs: integer('STATIC_CACHE_TTL_MS', 3600000, 1000, 86_400_000),
     maxResponseBytes: integer('MAX_RESPONSE_BYTES', 32 * 1024 * 1024, 1024, 256 * 1024 * 1024),
-    recoveryMaxResponseBytes: integer('RECOVERY_MAX_RESPONSE_BYTES', 8 * 1024 * 1024, 1024, 8 * 1024 * 1024),
-    captureSpoolDirectory:(()=>{const value=env.CAPTURE_SPOOL_DIRECTORY;if(value&&(!isAbsolute(value)||value.includes('\0')))throw new WorkerError('CAPTURE_DIRECTORY_INVALID');return value||undefined;})(),
-    captureSpoolRequireMount:(()=>{const v=env.CAPTURE_SPOOL_REQUIRE_MOUNT??'false';if(v!=='true'&&v!=='false')throw new WorkerError('CAPTURE_MOUNT_CONFIG_INVALID');return v==='true';})(),
-    captureMaxBytes:integer('CAPTURE_MAX_BYTES',512*1024*1024,1024,4*1024*1024*1024),
-    captureTimeoutMs:integer('CAPTURE_TIMEOUT_MS',120000,100,300000),
-    captureMaxObjectBytes:integer('CAPTURE_MAX_OBJECT_BYTES',1024*1024,1024,8*1024*1024),
-    captureBatchBytes:integer('CAPTURE_BATCH_BYTES',4*1024*1024,1024,16*1024*1024),
-    captureMaxRecords:integer('CAPTURE_MAX_RECORDS',5000000,1,2147483647),
     maxFailures: integer('MAX_RETRY_ATTEMPTS', 5, 1, 20),
   };
 }

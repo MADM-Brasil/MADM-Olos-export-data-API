@@ -1,7 +1,5 @@
 # Relatórios de Integração & Telemetria
 
-> Referência do contrato v1 (fonte local), preservada para histórico e rollback. A adoção atual do MADM e o contrato v2 estão em [corporate-reports-v2.md](corporate-reports-v2.md).
-
 Implementação na aba Relatórios existente, comparada visualmente com `~/Downloads/tela-relatorio.png`. Mantidos shell, autenticação, CSRF, fontes e tokens Forest Obsidian. Não há novo sistema de relatórios, tabela, índice, migração, dependência ou endpoint. Nenhum fonte em `src/` foi alterado.
 
 ## Fontes e definições verificadas

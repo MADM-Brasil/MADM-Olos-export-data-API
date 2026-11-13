@@ -29,7 +29,6 @@ services:
         format: raw
     volumes:
       - /opt/madm-corporate-sync/certs/madm-postgres-ca.pem:/run/secrets/madm-postgres-ca.pem:ro
-      - exportdata-captures:/var/lib/olos/captures
     command: ["node", "dist/main.js", "admin"]
     restart: unless-stopped
     init: true
@@ -52,8 +51,6 @@ services:
       DESTINATION_SCHEMA: raw
       DESTINATION_TABLE: olos_calls
       POLL_INTERVAL_MS: "120000"
-      CAPTURE_SPOOL_DIRECTORY: ${CAPTURE_SPOOL_DIRECTORY:-}
-      CAPTURE_SPOOL_REQUIRE_MOUNT: "true"
       ADMIN_ORIGIN: ${ADMIN_ORIGIN:?required}
       ADMIN_BIND: 0.0.0.0
       ADMIN_PORT: "8080"
@@ -83,4 +80,3 @@ networks:
 
 volumes:
   exportdata-postgres:
-  exportdata-captures:

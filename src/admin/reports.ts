@@ -2,10 +2,8 @@ import type { Pool, PoolClient } from 'pg';
 import { DateTime } from 'luxon';
 import { WorkerError } from '../errors.js';
 import { quote } from '../schema.js';
-import { reportCacheSeconds, reportMaxAgeSeconds, reportZone, reportPayloadLimit,
-  totalReport, reportDataHash, reportValidationKey, type ReportData } from './report-snapshot.js';
-import { legacyReportFormat, type ReportFormat } from './report-format.js';
-import { isCorporateReport } from './corporate-reports.js';
+import { reportCacheSeconds, reportMaxAgeSeconds, reportContractVersion, reportZone, reportPayloadLimit, reportContract,
+  totalReport, validateReportData, reportDataHash, validReportMetadata, reportValidationKey, type ReportData } from './report-snapshot.js';
 export { reportWhitespace, reportPlaceholder, reportCacheSeconds, reportZone } from './report-snapshot.js';
 export const reportStatementTimeoutMs = 5_000;
 export const reportReadCacheMs = 1_000;
@@ -40,44 +38,20 @@ export class AdminReports {
   private todayPending:Promise<TodayObservation>|undefined;
   private todayNext=Number.NEGATIVE_INFINITY;
   constructor(private readonly pool:Pool,private readonly source:string,
-    private readonly destination:{schema:string;table:string},private readonly now:()=>number=()=>performance.now(),private readonly format:ReportFormat=legacyReportFormat) {}
+    private readonly destination:{schema:string;table:string},private readonly now:()=>number=()=>performance.now()) {}
   async read(from:unknown,to:unknown):Promise<unknown> {
     const range=reportRange(from,to),s=await this.snapshot();
-    if(isCorporateReport(s.data))return this.corporateRead(s,range);
     const daily=s.data.days.filter(d=>d.day!==null&&d.day>=range.from&&d.day<=range.to);
     return {summary:{...s.data.summary},period:totalReport(daily,s.data.outbox_available),
       daily:daily.map(d=>({day:d.day,...totalReport([d],s.data.outbox_available)})),failed_reads:s.data.failed_reads,
       observed_at:s.data.observed_at,...range,timezone:reportZone,outbox_available:s.data.outbox_available,
       confirmation_source:'local_outbox_receipts',cache_seconds:reportCacheSeconds,...this.metadata(s)};
   }
-  private corporateRead(s:Published,range:{from:string;to:string}) {
-    const data=s.data;if(!isCorporateReport(data))throw new WorkerError('REPORT_SNAPSHOT_INVALID');
-    const local=data.operational;
-    const eligible=(d:{day:string|null})=>d.day!==null&&d.day>=range.from&&d.day<=range.to;
-    const corporateDays=data.days.filter(eligible),localDays=local.days.filter(eligible);
-    const receipts=(totals:ReturnType<typeof totalReport>)=>({confirmed:totals.confirmed,pending:totals.pending,not_queued:totals.not_queued,inconsistent:totals.inconsistent});
-    const localTotals=(totals:ReturnType<typeof totalReport>)=>({calls:totals.calls,...receipts(totals)});
-    const localByDay=new Map(localDays.map(d=>[d.day,d]));
-    const dates=[...new Set([...corporateDays,...localDays].map(d=>d.day!))].sort();
-    const corporateByDay=new Map(corporateDays.map(d=>[d.day,d]));
-    const empty=totalReport([],false);
-    const daily=dates.map(day=>({day,...(corporateByDay.has(day)?totalReport([corporateByDay.get(day)!],false):empty),
-      ...receipts(totalReport(localByDay.has(day)?[localByDay.get(day)!]:[],local.outbox_available))}));
-    return {summary:{...data.summary,...receipts(local.summary)},period:{...totalReport(corporateDays,false),...receipts(totalReport(localDays,local.outbox_available))},
-      daily,failed_reads:local.failed_reads,observed_at:data.observed_at,...range,timezone:reportZone,outbox_available:local.outbox_available,
-      calls_source:'madm.raw.olos_calls',call_identity:'raw_olos_call_id',time_basis:'corporate_call_date',
-      operator_rule:'canonical_positive_AgentId_and_identified_name_with_verified_source_payload',
-      confirmation_source:'local_outbox_receipts',corporate_observed_at:data.corporate_observed_at,
-      operational:{source:'local_records_reads_outbox_quarantine',summary:{...localTotals(local.summary),undated:local.summary.undated,missing_mapping:local.summary.missing_mapping},period:localTotals(totalReport(localDays,local.outbox_available)),
-        daily:localDays.map(d=>({day:d.day,...localTotals(totalReport([d],local.outbox_available))})),collected_today:local.today_calls,
-        failed_reads:local.failed_reads,quarantined:data.quarantined,observed_at:local.observed_at},
-      cache_seconds:reportCacheSeconds,...this.metadata(s)};
-  }
   async today() {
     const s=await this.snapshot();
     if(s.data.collection_date!==this.databaseDay(s))throw new WorkerError('REPORT_SNAPSHOT_STALE');
-    return {date:s.data.collection_date,calls:(isCorporateReport(s.data)?s.data.operational:s.data).today_calls,observed_at:s.data.observed_at,timezone:reportZone,
-      cache_seconds:reportCacheSeconds,time_basis:'first_local_persistence',identity:'source_key/source_id',...(isCorporateReport(s.data)?{observation_source:'local_records'}:{}),...this.metadata(s)};
+    return {date:s.data.collection_date,calls:s.data.today_calls,observed_at:s.data.observed_at,timezone:reportZone,
+      cache_seconds:reportCacheSeconds,time_basis:'first_local_persistence',identity:'source_key/source_id',...this.metadata(s)};
   }
   refreshToday():Promise<TodayObservation> {
     if(this.todayPending)return this.todayPending;
@@ -131,8 +105,8 @@ export class AdminReports {
   private databaseDay(s:Published) {return DateTime.fromMillis(s.checked_at+Math.max(0,this.now()-s.loaded_at)).setZone(reportZone).toISODate();}
   private metadata(s:Published) {
     const age=this.age(s);
-    return {snapshot_id:s.id,snapshot_contract_version:this.format.version,published_at:s.published_at,
-      snapshot_state:(this.format.version===2&&s.last_refresh_error!==null)||age>reportCacheSeconds||s.data.collection_date!==this.databaseDay(s)?'STALE':'READY',snapshot_age_seconds:Math.max(0,Math.floor(age)),refresh_state:s.refresh_state,last_refresh_error:s.last_refresh_error,next_refresh_at:s.next_refresh_at};
+    return {snapshot_id:s.id,snapshot_contract_version:reportContractVersion,published_at:s.published_at,
+      snapshot_state:age>reportCacheSeconds||s.data.collection_date!==this.databaseDay(s)?'STALE':'READY',snapshot_age_seconds:Math.max(0,Math.floor(age)),refresh_state:s.refresh_state,last_refresh_error:s.last_refresh_error,next_refresh_at:s.next_refresh_at};
   }
   private fresh(s:Published) {
     if(this.age(s)>reportMaxAgeSeconds)throw new WorkerError('REPORT_SNAPSHOT_STALE');
@@ -164,19 +138,19 @@ export class AdminReports {
         CASE WHEN s.id IS DISTINCT FROM $5::uuid THEN CASE WHEN octet_length(s.data::text)<=$4 THEN s.data END END AS data,
         CASE WHEN s.id IS DISTINCT FROM $5::uuid THEN octet_length(s.data::text) ELSE 0 END AS payload_bytes,s.observed_at,s.published_at,s.collection_date::text,s.data_hash,
         clock_timestamp() AS checked_at,
-        EXISTS(SELECT 1 FROM olos_http.report_snapshots other WHERE other.source_key=$1 AND other.target_table=$2 AND other.contract_version>$3) AS incompatible
+        EXISTS(SELECT 1 FROM olos_http.report_snapshots other WHERE other.source_key=$1 AND other.target_table=$2 AND other.contract_version<>$3) AS incompatible
         FROM (SELECT $1::text AS source_key,$2::text AS target_table,$3::int AS contract_version) wanted
         LEFT JOIN olos_http.report_snapshot_state k USING(source_key,target_table,contract_version)
         LEFT JOIN olos_http.report_snapshots s ON s.id=k.published_id AND s.source_key=$1 AND s.target_table=$2 AND s.contract_version=$3`,
-        [this.source,`${quote(this.destination.schema)}.${quote(this.destination.table)}`,this.format.version,reportPayloadLimit,known?.id??null])).rows[0];
+        [this.source,`${quote(this.destination.schema)}.${quote(this.destination.table)}`,reportContractVersion,reportPayloadLimit,known?.id??null])).rows[0];
       if(timedOut)throw new WorkerError('REPORT_TIMEOUT');
       if(!row)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
       if(!row.published_id)throw new WorkerError(row.incompatible?'REPORT_SNAPSHOT_INCOMPATIBLE':'REPORT_INITIALIZING');
-      if(!row.id||row.contract_version!==this.format.version||row.contract_name!==this.format.name||row.timezone!==reportZone||!row.observed_at||!row.published_at||row.payload_bytes>reportPayloadLimit)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
+      if(!row.id||row.contract_version!==reportContractVersion||row.contract_name!==reportContract||row.timezone!==reportZone||!row.observed_at||!row.published_at||row.payload_bytes>reportPayloadLimit)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
       const same=known?.id===row.id;
       if(same&&(row.data_hash!==known.data_hash||reportValidationKey(row.validation)!==known.validation_key||row.published_at.toISOString()!==known.published_at))throw new WorkerError('REPORT_SNAPSHOT_INVALID');
-      const data=same?known.data:this.format.validate(row.data),age=(row.checked_at.getTime()-row.observed_at.getTime())/1000;
-      if((!same&&(!this.format.validMetadata(row.validation,data)||row.data_hash!==reportDataHash(data)))||data.observed_at!==row.observed_at.toISOString()||data.collection_date!==row.collection_date||age< -5||row.published_at<row.observed_at||row.published_at.getTime()>row.checked_at.getTime()+5000)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
+      const data=same?known.data:validateReportData(row.data),age=(row.checked_at.getTime()-row.observed_at.getTime())/1000;
+      if((!same&&(!validReportMetadata(row.validation,data)||row.data_hash!==reportDataHash(data)))||data.observed_at!==row.observed_at.toISOString()||data.collection_date!==row.collection_date||age< -5||row.published_at<row.observed_at||row.published_at.getTime()>row.checked_at.getTime()+5000)throw new WorkerError('REPORT_SNAPSHOT_INVALID');
       return {data,id:row.id,published_at:row.published_at.toISOString(),age,checked_at:row.checked_at.getTime(),loaded_at:queryStarted,data_hash:row.data_hash!,validation_key:reportValidationKey(row.validation),refresh_state:row.refresh_status.toUpperCase(),last_refresh_error:row.last_error,next_refresh_at:row.next_attempt_at?.toISOString()??null};
     } catch(error) {
       if(timedOut)throw new WorkerError('REPORT_TIMEOUT');

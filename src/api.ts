@@ -2,8 +2,6 @@ import { parse } from 'lossless-json';
 import { OlosAuthManager } from './auth.js';
 import { AuthUnavailable, HttpError, WorkerError } from './errors.js';
 import { sleep, type Transport } from './http.js';
-import type { CaptureResult } from './capture-spool.js';
-export type CaptureTransport=(path:string,fields:Record<string,string>,token:string,readId:string)=>Promise<CaptureResult>;
 
 export function json(raw: string): unknown {
   try { return parse(raw, undefined, value => value); } catch { throw new WorkerError('JSON_INVALID'); }
@@ -13,8 +11,7 @@ export function rows(raw: string): Record<string, unknown>[] {
   if (!Array.isArray(value) || value.some(r => !r || typeof r !== 'object' || Array.isArray(r))) throw new WorkerError('ARRAY_RESPONSE_REQUIRED');
   return value as Record<string, unknown>[];
 }
-export type ReadSpec = { kind: 'current' | 'previous' } | { kind: 'reread'; date: string; start: string; end: string;
-  recovery?: { parentId: string; authorizationHash: string; missingOnly?: true } };
+export type ReadSpec = { kind: 'current' | 'previous' } | { kind: 'reread'; date: string; start: string; end: string };
 export function readFields(spec: ReadSpec) {
   if (spec.kind !== 'reread') return { TableName: 'AttemptsRawData' };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(spec.date) || !Number.isFinite(Date.parse(spec.date)) || new Date(spec.date).toISOString().slice(0,10) !== spec.date ||
@@ -23,12 +20,7 @@ export function readFields(spec: ReadSpec) {
 }
 export class OlosApi {
   constructor(private readonly request: Transport, readonly auth: OlosAuthManager,
-    private readonly wait: (ms: number) => Promise<unknown> = sleep,readonly capture?:CaptureTransport) {}
-  async readToSpool(spec:ReadSpec,readId:string):Promise<CaptureResult> {
-    if(!this.capture||spec.kind==='reread')throw new WorkerError('CAPTURE_TRANSPORT_REQUIRED');
-    let token:string;try{token=await this.auth.getToken();}catch(error){throw new AuthUnavailable(error);}
-    return this.capture(`/api/export-data/${spec.kind==='current'?'read-data-current-day':'read-data-previous-days'}`,readFields(spec),token,readId);
-  }
+    private readonly wait: (ms: number) => Promise<unknown> = sleep) {}
   async call(path: string, fields?: Record<string, string>, consuming = false): Promise<string> {
     let authRetried = false;
     for (let attempt = 0; ; attempt++) {

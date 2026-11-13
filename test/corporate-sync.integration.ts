@@ -5,8 +5,8 @@ import type { Config } from '../src/corporate-sync/config.js';
 import { lock, migrate } from '../src/corporate-sync/database.js';
 import { SyncError } from '../src/corporate-sync/errors.js';
 import { columns, type Row } from '../src/corporate-sync/mapping.js';
-import { run,deliver } from '../src/corporate-sync/worker.js';
-import { fixture, row, testConfig,shape } from './corporate-sync.fixture.js';
+import { run } from '../src/corporate-sync/worker.js';
+import { fixture, row, testConfig } from './corporate-sync.fixture.js';
 
 // Only the isolated runner can opt in. Never use DATABASE_URL or operational/corporate credentials.
 const sourceUrl = process.env.CORPORATE_SYNC_TEST_SOURCE_URL;
@@ -50,29 +50,6 @@ test('corporate-sync isolated PostgreSQL integration', { skip: !enabled }, async
     return (await source.query('SELECT generation::text, confirmed_count::text, last_confirmed_id::text, pending FROM corporate_sync.control')).rows[0];
   }
   try {
-    await t.test('manual and unknown campaigns are excluded before LIMIT without source changes or receipt increments',async()=>{
-      await reset();
-      for(const [id,name] of [['1','Ligacao Manual'],['2',' LIGACAO\u00a0MANUAL  GS '],['3',null],['4','Conventional'],['5','Ligacao Manual Extra']] as const)await insert(source,{...row(id),telefone:`synthetic-${id}`,nome_campanha_olos:name});
-      const before=(await source.query('SELECT * FROM raw.olos_calls ORDER BY internal_id_olos')).rows;
-      const one=cfg({CORPORATE_SYNC_BATCH_SIZE:'1'});for(let i=0;i<4;i++)await sync(one);
-      assert.equal(await count(destination),2);assert.equal(await count(source,'corporate_sync.receipts'),2);assert.equal((await state()).confirmed_count,'2');assert.equal((await state()).pending,null);
-      assert.deepEqual((await source.query('SELECT * FROM raw.olos_calls ORDER BY internal_id_olos')).rows,before);
-    });
-    await t.test('frozen legacy manual or unidentified batches fail without retry or silently filtering their contents',async()=>{
-      for(const name of ['Ligacao Manual','Ligacao Manual GS',null]){
-        await reset();const batch=[{...row('1'),nome_campanha_olos:name},{...row('2'),telefone:'another'}];
-        // Explicit synthetic pre-existing manifest. Never modify real pending batches.
-        const c=cfg();await source.query('INSERT INTO corporate_sync.control(singleton,binding,pending) VALUES(true,$1,$2)',[c.binding,JSON.stringify(batch)]);
-        const before=await state();let remoteAttempts=0;
-        await assert.rejects(sync(c,{beforeRemoteCommit:async()=>{remoteAttempts++;}}),name?/MANUAL_CAMPAIGN_EXCLUDED/:/CAMPAIGN_IDENTIFICATION_REQUIRED/);
-        assert.equal(remoteAttempts,0);assert.deepEqual(await state(),before);assert.equal(await count(destination),0);assert.equal(await count(source,'corporate_sync.receipts'),0);
-      }
-    });
-    await t.test('lowest corporate insertion function rejects a mixed manual batch before any INSERT',async()=>{
-      await reset();await destination.query('BEGIN');
-      try{await assert.rejects(deliver(destination,[row('1'),{...row('2'),nome_campanha_olos:'Ligacao Manual'}],shape(),cfg(),new AbortController().signal),/MANUAL_CAMPAIGN_EXCLUDED/);}finally{await destination.query('ROLLBACK');}
-      assert.equal(await count(destination),0);
-    });
     await t.test('local migration is idempotent and absent from destination', async () => {
       await reset(); await migrate(source);
       assert.equal((await destination.query("SELECT to_regclass('corporate_sync.control') AS table_name")).rows[0].table_name, null);

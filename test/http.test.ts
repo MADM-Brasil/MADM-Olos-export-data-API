@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
-import { Readable } from 'node:stream';
 import { HttpTransport, retryAfter, type Transport } from '../src/http.js';
 import { OlosApi, rows } from '../src/api.js';
 import { OlosAuthManager } from '../src/auth.js';
@@ -68,18 +67,6 @@ test('421 must not transparently replay a consuming multipart POST',async()=>{
     assert.equal(requests,1);
     assert(failure instanceof HttpError);assert.equal(failure.status,421);
   } finally {await h.close();await s.close();}
-});
-test('responses beyond 32 MiB fail closed for both declared and streamed bodies without retry',async()=>{
-  let requests=0;
-  const chunk='x'.repeat(1024*1024);
-  const s=await server((req,res)=>{
-    requests++;
-    if(req.url!.endsWith('/declared')){res.setHeader('Content-Length',33*1024*1024);res.end(chunk);return;}
-    const stream=Readable.from(Array(33).fill(chunk));res.on('close',()=>stream.destroy());stream.pipe(res);
-  });
-  const h=new HttpTransport(s.url,10000,32*1024*1024,new AbortController().signal);
-  try{for(const path of ['/declared','/streamed'])await assert.rejects(h.request(path,{TableName:'AttemptsRawData'}),/RESPONSE_TOO_LARGE/);assert.equal(requests,2);}
-  finally{await h.close();await s.close();}
 });
 test('catalog validates table/columns and rejects guessed formats',async()=>{
   const catalog=[{TableName:'AttemptsRawData',Columns:['AttemptsRawDataID','CallId','StartDate','OriginalPhoneNumber','AgentId','CampaignId','DispositionId']},{TableName:'Users',Columns:['AgentId','UserName']},{TableName:'Campaign',Columns:['CampaignId','Description']},{TableName:'Disposition',Columns:['DispositionId','Description']}];

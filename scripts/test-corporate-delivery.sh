@@ -36,11 +36,6 @@ printf 'ISOLATION_VERIFIED internal_network=true published_ports=0 temporary_pos
 docker exec "$container" createdb -U postgres olos_direct_test
 docker exec "$container" createdb -U postgres madm
 docker exec "$container" createdb -U postgres olos_admin_homolog
-# Regression for the administrative runbook: libpq expands an explicit dbname
-# URI, not a URI stored only in PGDATABASE. Synthetic credentials and verified TLS.
-test "$(docker exec "$container" psql --dbname='postgresql://postgres@localhost:5432/madm?sslmode=verify-full&sslrootcert=/tmp/test.crt' \
-  -X -At -v ON_ERROR_STOP=1 -c 'SELECT current_database()')" = madm
-printf 'RUNBOOK_DBNAME_URI_VERIFIED database=madm tls=verify-full\n'
 docker cp "$container:/tmp/test.crt" "$certs/ca.crt" >/dev/null
 chmod 755 "$certs"
 chmod 644 "$certs/ca.crt"
@@ -52,5 +47,5 @@ docker run --rm --network "container:$container" --user "$(id -u):$(id -g)" \
   -e OLOS_DIRECT_TEST_DESTINATION_URL=postgresql://postgres@localhost:5432/madm \
   -e OLOS_DIRECT_TEST_CA_FILE=/certs/ca.crt \
   -e TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/olos_admin_homolog \
-  node:24-bookworm-slim node --max-old-space-size=256 --import tsx --test --test-concurrency=1 \
-  ${OLOS_DIRECT_TEST_FILES:-test/admin.database.ts test/store.integration.ts test/corporate-delivery.integration.ts test/corporate-recovery.integration.ts test/corporate-authority.integration.ts test/corporate-authority-flow.integration.ts}
+  node:24-bookworm-slim node --import tsx --test --test-concurrency=1 \
+  test/admin.database.ts test/store.integration.ts test/corporate-delivery.integration.ts

@@ -28,7 +28,7 @@ export class Worker {
   private active = false;
   private initialized = false;
   constructor(readonly store: Store, readonly api: OlosApi, readonly cache: StaticCache) {}
-  async captureReread(parentId: string, date: string, start: string, end: string, approvalHash: string, missingOnly=false) {
+  async captureReread(parentId: string, date: string, start: string, end: string) {
     if (this.active) throw new WorkerError('POLL_ALREADY_ACTIVE');
 
     const spec = { kind: 'reread' as const, date, start, end };
@@ -41,11 +41,11 @@ export class Worker {
     this.active = true;
     try {
       await this.store.ping();
-      await this.store.validateRecoveryRead(parentId, spec, approvalHash, missingOnly);
+      await this.store.validateRecoveryRead(parentId, spec);
       await this.api.auth.getToken();
       await this.api.validateCaptureCatalog();
 
-      const id = await this.store.beginRecoveryRead(parentId, spec, approvalHash, missingOnly);
+      const id = await this.store.beginRecoveryRead(parentId, spec);
       const started = performance.now();
 
       try {
@@ -76,22 +76,13 @@ export class Worker {
     this.active = true;
     try {
       await this.store.ping();
-      if(this.store.cfg.captureSpoolDirectory){
-        if(!this.api.capture)throw new WorkerError('CAPTURE_TRANSPORT_REQUIRED');
-        await this.store.recoverPublishedCaptures();
-      }
-      if ((await this.store.capturePending()).length) throw new WorkerError('RECOVERY_REQUIRED');
+      if ((await this.store.unresolved()).length) throw new WorkerError('RECOVERY_REQUIRED');
       await this.api.auth.getToken();
       await this.api.validateCaptureCatalog();
       // open() holds the source lock; beginRead rechecks pending reads and commits intent.
       const id = await this.store.beginRead({ kind: 'current' });
       const start = performance.now();
       try {
-        if(this.store.cfg.captureSpoolDirectory){
-          const captured=await this.api.readToSpool({kind:'current'},id),requestMs=Math.round(performance.now()-start);
-          await this.store.registerCaptureSpool(id,captured,requestMs);
-          log('capture_received',{read_id:id,state:'received',response_bytes:captured.bytes,request_ms:requestMs,storage:'spool'});return id;
-        }
         const body = await this.api.captureCurrentDayOnce();
         const requestMs = Math.round(performance.now() - start);
         const persistStart = performance.now();
@@ -121,11 +112,7 @@ export class Worker {
       readFields(spec);
       await this.store.ping();
       await this.store.captureReady();
-      if(this.store.cfg.captureSpoolDirectory){
-        if(spec.kind!=='reread'&&!this.api.capture)throw new WorkerError('CAPTURE_TRANSPORT_REQUIRED');
-        await this.store.recoverPublishedCaptures();
-      }
-      const existing = spec.kind==='current'&&!recovery?await this.store.capturePending():await this.store.unresolved();
+      const existing = await this.store.unresolved();
       if (existing.some(r => r.state === 'reading') && !recovery) throw new WorkerError('RECOVERY_REQUIRED');
       await this.initialize();
       const recovered = await this.store.drain(this.cache.value);
@@ -140,19 +127,10 @@ export class Worker {
       const id = await this.store.beginRead(spec, recovery);
       const start = performance.now();
       try {
-        const streamed=!!this.store.cfg.captureSpoolDirectory&&spec.kind!=='reread';
-        let requestMs:number;
-        let persistStart:number;
-        if(streamed){
-          const captured=await this.api.readToSpool(spec,id);requestMs=Math.round(performance.now()-start);
-          persistStart=performance.now();
-          await this.store.registerCaptureSpool(id,captured,requestMs);
-        }else{
         const body = await this.api.read(spec);
-        requestMs = Math.round(performance.now() - start);
-        persistStart=performance.now();
+        const requestMs = Math.round(performance.now() - start);
+        const persistStart = performance.now();
         await this.store.stage(id, body, requestMs);
-        }
         const counts = await this.store.drain(this.cache.value);
         const report: CycleReport = { read_id: id, ...counts, request_ms: requestMs,
           persistence_ms: Math.round(performance.now() - persistStart), duration_ms: Math.round(performance.now() - start) };

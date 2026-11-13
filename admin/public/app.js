@@ -1,4 +1,4 @@
-import {date,count,dayLabel,defaultRange,reportFields,reportCsv,safeEvents,eventLines,renderDashboardChart,renderDashboardMetrics,renderTerminal,chartRange,chartModel,chartCompact,chartPercent,reportWindow,reportQuickRange,reportModel,reportStale} from './ui.js';
+import {date,count,dayLabel,defaultRange,reportFields,reportCsv,safeEvents,eventLines,renderDashboardChart,renderDashboardMetrics,renderTerminal,chartRange,chartModel,chartCompact,chartPercent,reportWindow,reportQuickRange,reportModel} from './ui.js';
 import {ServerClock,brasiliaDay,statusLabels,renderToday,renderCountdown,newerTodayObservation,retryAfterMs,todayRefreshState} from './dashboard.js';
 /** @returns {any} */
 const $=id=>document.getElementById(id);
@@ -166,7 +166,7 @@ function clearChart(){
   $('calls-chart').textContent='Série diária indisponível.';
 }
 function clearMetrics(){chartSnapshot=null;chartCache.clear();$('metrics-error').textContent='';$('chart-period').textContent='';for(const id of ['calls','identified','confirmed','pending','errors'])$('metric-'+id).textContent='—';$('metrics-observed').textContent='Indicadores indisponíveis';clearChart();}
-function resetReports(){$('report-window').textContent='Janela ainda não observada';reportIntegrityAt=null;reportRevision++;reportPreset='30';reportFailed=false;reportBusy=false;syncReportPresets();$('report-day-dialog').close();$('report-form').setAttribute('aria-busy','false');chartDays=7;chartFlights.clear();chartOpen=false;$('chart-toggle').setAttribute('aria-expanded','false');$('chart-panel').classList.remove('is-open');$('chart-body').inert=true;$('chart-body').setAttribute('aria-hidden','true');$('chart-status').textContent='';$('integrity-details').replaceChildren();reportData=null;reportPage=0;table('report-rows',[]);$('report-summary').replaceChildren();$('report-page').textContent='Sem dados';$('report-prev').disabled=true;$('report-next').disabled=true;$('report-status').textContent='Selecione um período.';$('export-report').disabled=true;clearMetrics();clearReportPeriod();for(const id of ['report-undated','report-missing','report-divergent','report-quarantined','report-local-undated'])$(id).textContent='—';reportObservation();syncChartFilters();}
+function resetReports(){$('report-window').textContent='Janela ainda não observada';reportIntegrityAt=null;reportRevision++;reportPreset='30';reportFailed=false;reportBusy=false;syncReportPresets();$('report-day-dialog').close();$('report-form').setAttribute('aria-busy','false');chartDays=7;chartFlights.clear();chartOpen=false;$('chart-toggle').setAttribute('aria-expanded','false');$('chart-panel').classList.remove('is-open');$('chart-body').inert=true;$('chart-body').setAttribute('aria-hidden','true');$('chart-status').textContent='';$('integrity-details').replaceChildren();reportData=null;reportPage=0;table('report-rows',[]);$('report-summary').replaceChildren();$('report-page').textContent='Sem dados';$('report-prev').disabled=true;$('report-next').disabled=true;$('report-status').textContent='Selecione um período.';$('export-report').disabled=true;clearMetrics();clearReportPeriod();for(const id of ['report-undated','report-missing','report-divergent'])$(id).textContent='—';reportObservation();syncChartFilters();}
 function syncChartFilters(){
   document.querySelectorAll('[data-chart-days]').forEach(button=>button.setAttribute('aria-pressed',String(Number(button.getAttribute('data-chart-days'))===chartDays)));
   $('chart-range-badge').textContent=chartDays===1?'Hoje':`Histórico ${chartDays}D`;
@@ -189,7 +189,7 @@ async function dashboardReport(){
   if(!logged||!chartOpen)return;
   const range=selectedChartRange(),key=chartKey(range),cached=chartCache.get(key);
   syncChartFilters();
-  if(cached&&performance.now()-cached.at<(cached.snapshot.cache_seconds??300)*1000){chartSnapshot=cached.snapshot;$('chart-source').textContent=chartSnapshot.calls_source||'PostgreSQL local · contrato v1';$('chart-status').textContent=`${reportStale(chartSnapshot,clock.now())?'Série desatualizada · ':''}Snapshot ${date(chartSnapshot.observed_at)}`;paintChart();return;}
+  if(cached&&performance.now()-cached.at<(cached.snapshot.cache_seconds??300)*1000){chartSnapshot=cached.snapshot;$('chart-status').textContent=`Snapshot ${date(chartSnapshot.observed_at)}`;paintChart();return;}
   if(chartFlights.has(key))return chartFlights.get(key);
   if(!chartSnapshot||chartKey(chartSnapshot)!==key){chartSnapshot=null;clearChart();}
   $('chart-status').textContent='Consultando série…';
@@ -200,7 +200,7 @@ async function dashboardReport(){
       if(snapshot.from!==range.from||snapshot.to!==range.to)throw new Error('CHART_RANGE_MISMATCH');
       rememberChart(snapshot);
       if(key!==chartKey(selectedChartRange())||!chartOpen)return;
-      chartSnapshot=snapshot;$('chart-status').textContent=`${reportStale(snapshot,clock.now())?'Série desatualizada · ':''}Snapshot ${date(snapshot.observed_at)}`;$('chart-source').textContent=snapshot.calls_source||'PostgreSQL local · contrato v1';paintChart();
+      chartSnapshot=snapshot;$('chart-status').textContent=`Snapshot ${date(snapshot.observed_at)}`;paintChart();
     }catch{
       if(logged&&epoch===sessionEpoch&&key===chartKey(selectedChartRange())){
         $('chart-status').textContent=chartSnapshot?'Série desatualizada · última observação preservada.':'Série indisponível. Tente novamente ao expandir.';
@@ -236,14 +236,14 @@ function setReportPreset(value,load=true){
   $('report-from').value=range.from;$('report-to').value=range.to;
   if(load)void loadReport();
 }
-function reportIsStale(snapshot){return reportStale(snapshot,clock.now(),reportFailed);}
+function reportIsStale(snapshot){const age=clock.now()-Date.parse(snapshot.observed_at);return reportFailed||age>(snapshot.cache_seconds??300)*1000||age< -5000;}
 function reportObservation(){
-  if(reportIntegrityAt)$('metrics-observed').textContent=`Chamadas e operação · snapshot ${date(reportIntegrityAt)} · cache ${reportIntegrityCache} s${reportIsStale(reportData||{observed_at:reportIntegrityAt,cache_seconds:reportIntegrityCache})?' · desatualizado':''}`;
+  if(reportIntegrityAt)$('metrics-observed').textContent=`Histórico completo da origem · snapshot ${date(reportIntegrityAt)} · cache ${reportIntegrityCache} s${reportIsStale({observed_at:reportIntegrityAt,cache_seconds:reportIntegrityCache})?' · desatualizado':''}`;
   if(!reportData){$('report-observation-state').textContent=reportBusy?'Consultando':'Sem observação válida';$('report-observation-state').dataset.state='UNKNOWN';$('report-snapshot').textContent='Snapshot do período indisponível';return;}
   const stale=reportIsStale(reportData);
   $('report-observation-state').textContent=stale?'Observação desatualizada':reportData.outbox_available?'Snapshot observado':'Observação parcial · sem outbox';
   $('report-observation-state').dataset.state=stale?'PAUSED':'UNKNOWN';
-  $('report-snapshot').textContent=`${date(reportData.observed_at)} · Brasília · ${reportData.calls_source||'fonte local v1'}`;
+  $('report-snapshot').textContent=`${date(reportData.observed_at)} · Brasília · não comprova conexão corporativa`;
 }
 function clearReportPeriod(){
   for(const id of ['metric-calls','metric-identified','metric-operators','metric-confirmed','metric-pending'])$(id).textContent='—';
@@ -270,7 +270,7 @@ function renderReport(){
     }tr.append(actions);$('report-rows').append(tr);
   }
   const first=total?reportPage*pageSize+1:0,last=Math.min(total,(reportPage+1)*pageSize);
-  $('report-page').textContent=total?`Página ${reportPage+1} de ${maxPage+1} · ${first}–${last} de ${total} dias observados`:'Nenhuma chamada neste período';
+  $('report-page').textContent=total?`Página ${reportPage+1} de ${maxPage+1} · ${first}–${last} de ${total} dias com chamadas`:'Nenhuma chamada neste período';
   $('report-prev').disabled=reportPage===0;$('report-next').disabled=reportPage===maxPage;
 }
 function paintReportChart(){
@@ -280,7 +280,7 @@ function paintReportChart(){
   $('report-chart-status').textContent=reportData.outbox_available?'Confirmações atribuídas à data da ligação; não são volume diário de despacho.':'Outbox indisponível: série corporativa omitida; não equivale a zero confirmações.';
   reportPaintWidth=$('report-chart').clientWidth;
 }
-async function loadReport(automatic=false){
+async function loadReport(){
   if(!logged)return;
   let range;
   try{range=reportWindow($('report-from').value,$('report-to').value);}catch(error){invalidateReport();$('report-status').textContent=error.message;return;}
@@ -288,19 +288,19 @@ async function loadReport(automatic=false){
   const revision=++reportRevision,epoch=sessionEpoch;
   if(reportData&&(reportData.from!==range.from||reportData.to!==range.to)){reportData=null;clearReportPeriod();}
   reportBusy=true;reportFailed=false;$('apply-report').disabled=true;$('export-report').disabled=true;$('report-form').setAttribute('aria-busy','true');
-  $('report-window').textContent=`${dayLabel(range.from)} — ${dayLabel(range.to)} · ${range.days} dias corridos · aguardando observação`;$('report-status').textContent='Consultando agregados persistidos…';$('report-summary').replaceChildren();reportObservation();
+  $('report-window').textContent=`${dayLabel(range.from)} — ${dayLabel(range.to)} · ${range.days} dias corridos · aguardando observação`;$('report-status').textContent='Consultando snapshot local…';$('report-summary').replaceChildren();reportObservation();
   try{
     const r=await api(reportUrl(range.from,range.to));if(!logged||epoch!==sessionEpoch||revision!==reportRevision)return;
     if(r.from!==range.from||r.to!==range.to)throw new Error('O snapshot não corresponde ao filtro selecionado.');
-    reportModel(r);reportData=r;reportIntegrityAt=r.observed_at;reportIntegrityCache=r.cache_seconds??300;if(!automatic)reportPage=0;renderDashboardMetrics($,r,true);
-    $('report-undated').textContent=count(r.summary.undated);$('report-missing').textContent=count(r.summary.missing_mapping);$('report-divergent').textContent=count(r.summary.inconsistent);$('report-quarantined').textContent=count(r.operational?.quarantined);$('report-local-undated').textContent=count(r.operational?.summary.undated);$('report-source').textContent=r.calls_source||'PostgreSQL local · contrato v1';$('report-calls-definition').textContent=r.snapshot_contract_version===2?'Linhas corporativas no período · inclui ID interno nulo':'Identidades de origem locais no período · contrato v1';
+    reportModel(r);reportData=r;reportIntegrityAt=r.observed_at;reportIntegrityCache=r.cache_seconds??300;reportPage=0;renderDashboardMetrics($,r,true);
+    $('report-undated').textContent=count(r.summary.undated);$('report-missing').textContent=count(r.summary.missing_mapping);$('report-divergent').textContent=count(r.summary.inconsistent);
     $('report-identification').textContent=BigInt(r.period.calls)?`${chartPercent(BigInt(r.period.identified_calls),BigInt(r.period.calls))} no mesmo período`:'Sem chamadas no período';
-    $('metrics-observed').textContent=`Chamadas e operação · snapshot ${date(r.observed_at)} · cache ${r.cache_seconds??300} s`;
-    describe('integrity-details',[['Registros sem data de chamada',count(r.summary.undated)],['Chamadas sem vínculo de identidade validado',count(r.summary.missing_mapping)],['Recibos divergentes',count(r.summary.inconsistent)]]);
+    $('metrics-observed').textContent=`Histórico completo da origem · snapshot ${date(r.observed_at)} · cache ${r.cache_seconds??300} s`;
+    describe('integrity-details',[['Registros sem data de chamada',count(r.summary.undated)],['Mappings sem registro local',count(r.summary.missing_mapping)],['Recibos divergentes',count(r.summary.inconsistent)]]);
     const selected=selectedChartRange();if(r.from===selected.from&&r.to===selected.to){rememberChart(r);chartSnapshot=r;}
     $('report-window').textContent=`${dayLabel(r.from)} — ${dayLabel(r.to)} · ${range.days} dias corridos`;
-    $('report-status').textContent=`Snapshot ${date(r.observed_at)} · Brasília · cache de até ${r.cache_seconds??300} s${r.outbox_available?'':' · recibos locais indisponíveis'}${r.last_refresh_error?' · atualização automática falhou; última geração preservada':''}.`;
-    for(const [label,value]of [['Chamadas',r.period.calls],['Com operador',r.period.identified_calls],['Operadores distintos no período',r.period.operators],['Confirmações MADM (recibos)',r.period.confirmed]]){const span=document.createElement('span');span.textContent=`${label}: ${count(value)}`;$('report-summary').append(span);}
+    $('report-status').textContent=`Snapshot ${date(r.observed_at)} · Brasília · cache de até ${r.cache_seconds??300} s${r.outbox_available?'':' · métricas corporativas indisponíveis'}.`;
+    for(const [label,value]of [['Chamadas únicas',r.period.calls],['Com operador',r.period.identified_calls],['Operadores distintos no período',r.period.operators],['Confirmações MADM (recibos)',r.period.confirmed]]){const span=document.createElement('span');span.textContent=`${label}: ${count(value)}`;$('report-summary').append(span);}
     renderReport();paintReportChart();$('export-report').disabled=!r.daily.length;
   }catch(error){
     if(logged&&epoch===sessionEpoch&&revision===reportRevision){
@@ -317,7 +317,7 @@ function exportReportRows(rows,from,to){
   if(!reportData)return;
   let url;
   try{
-    url=URL.createObjectURL(new Blob([reportCsv(rows,reportData.snapshot_contract_version)],{type:'text/csv;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download=`olos-chamadas-${from}-${to}.csv`;link.click();
+    url=URL.createObjectURL(new Blob([reportCsv(rows)],{type:'text/csv;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download=`olos-chamadas-${from}-${to}.csv`;link.click();
     $('report-status').textContent=`CSV gerado do snapshot ${date(reportData.observed_at)} · ${rows.length} dias${reportIsStale(reportData)?' · observação desatualizada':''}.`;
   }catch{$('report-status').textContent='Não foi possível gerar o CSV. O snapshot permanece disponível.';}
   finally{if(url)setTimeout(()=>URL.revokeObjectURL(url),1000);}
@@ -332,10 +332,10 @@ $('report-rows').addEventListener('click',event=>{
   const row=reportData.daily.find(entry=>entry.day===button.getAttribute('data-report-day'));if(!row)return;
   if(button.getAttribute('data-report-action')==='export'){exportReportRows([row],row.day,row.day);return;}
   $('report-day-title').textContent=`Detalhe de ${dayLabel(row.day)}`;$('report-day-snapshot').textContent=`Snapshot ${date(reportData.observed_at)} · Brasília${reportIsStale(reportData)?' · desatualizado':''}`;
-  describe('report-day-details',reportFields.filter(field=>field!=='day').map(field=>[({calls:'Chamadas',identified_calls:'Com operador',operators:'Operadores distintos',confirmed:'Recibos confirmados',pending:'Outbox pendente',inconsistent:'Recibos divergentes',not_queued:'Sem outbox',with_cpf:'Com CPF',with_email:'Com e-mail'})[field],count(row[field])]));
+  describe('report-day-details',reportFields.filter(field=>field!=='day').map(field=>[({calls:'Coletadas',identified_calls:'Com operador',operators:'Operadores distintos',confirmed:'Recibos confirmados',pending:'Outbox pendente',inconsistent:'Recibos divergentes',not_queued:'Sem outbox',with_cpf:'Com CPF',with_email:'Com e-mail'})[field],count(row[field])]));
   $('report-day-dialog').showModal();
 });
 $('report-day-close').addEventListener('click',()=>$('report-day-dialog').close());
 
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&logged){void refresh();if(currentPage==='dashboard')void refreshToday();if(currentPage==='reports')void loadReport(true);}});
-api('/session').then(enter).catch(()=>showLogin());setInterval(refresh,2000);setInterval(()=>{if(logged&&currentPage==='dashboard'){void refreshToday();if(chartOpen)void dashboardReport();}else if(logged&&currentPage==='reports'&&!reportBusy){void loadReport(true);}},30000);setInterval(tick,1000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&logged){void refresh();if(currentPage==='dashboard')void refreshToday();}});
+api('/session').then(enter).catch(()=>showLogin());setInterval(refresh,2000);setInterval(()=>{if(logged&&currentPage==='dashboard'){void refreshToday();if(chartOpen)void dashboardReport();}},30000);setInterval(tick,1000);

@@ -20,7 +20,6 @@ import { assertNoDirectOwnership } from '../src/corporate-sync/ownership.js';
 import { corporateControl } from '../src/corporate-delivery/commands.js';
 import { corporateHomologation } from '../src/corporate-delivery/homologation.js';
 import { SyncError } from '../src/corporate-sync/errors.js';
-import { campaignAdmissionSql,campaignPolicyCode } from '../src/corporate-sync/campaign-policy.js';
 import { fixture } from './corporate-sync.fixture.js';
 
 const enabled = process.env.OLOS_DIRECT_DISPOSABLE_TEST === 'true';
@@ -57,9 +56,9 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     OLOS_CORPORATE_BATCH_SIZE: '500', OLOS_CORPORATE_BACKOFF_MS: '1', OLOS_CORPORATE_TIMEOUT_MS: '2000', ...extra });
   async function open(cfg = makeConfig()) { const s = new Store(cfg); stores.push(s); await s.open(); return s; }
   async function close(s: Store) { stores.splice(stores.indexOf(s), 1); await s.close(); }
-  async function stage(s: Store, rows: unknown[],references=cache) {
+  async function stage(s: Store, rows: unknown[]) {
     const id = await s.beginRead({ kind: 'current' }); await s.stage(id, JSON.stringify(rows), 1);
-    return s.drain(references);
+    return s.drain(cache);
   }
   async function count(db: pg.Client, table: string): Promise<number> { return Number((await db.query(`SELECT count(*)::text AS n FROM ${table}`)).rows[0].n); }
   async function reset(n = 2) {
@@ -71,8 +70,6 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     await local.query(await readFile(new URL('../migrations/corporate-sync/001_control.sql', import.meta.url), 'utf8'));
     await local.query(await readFile(new URL('../migrations/002_corporate_delivery.sql', import.meta.url), 'utf8'));
     await local.query(await readFile(new URL('../migrations/003_corporate_outbox_skipped.sql', import.meta.url), 'utf8'));
-    await local.query(await readFile(new URL('../migrations/005_corporate_campaign_policy.sql', import.meta.url), 'utf8'));
-    await local.query(await readFile(new URL('../migrations/007_corporate_collision_quarantine.sql', import.meta.url), 'utf8'));
     await remote.query(fixture(false));
     await remote.query('ALTER TABLE raw.olos_calls ALTER COLUMN raw_olos_call_id RESTART WITH 8000000000');
     const legacy = new Store(config(base)); await legacy.open();
@@ -113,70 +110,6 @@ test('direct corporate delivery in disposable PostgreSQL with verified TLS', { s
     });
   }
   try {
-    await t.test('manual campaign policy SQL matches JS including Unicode spaces and unknown names',async()=>{
-      const admission=campaignAdmissionSql('$1::text',2);
-      for(const name of ['Ligacao Manual',' LIGACAO  MANUAL gs ','Ligacao\u00a0Manual\ufeff','\tLigacao\u2003Manual\nGS','Campaign','Ligacao Manual Extra','',null,'\u00a0']){
-        const allowed=(await local.query(`SELECT ${admission.sql} AS allowed`,[name,...admission.parameters])).rows[0].allowed===true;
-        assert.equal(allowed,campaignPolicyCode(name)===null,String(name));
-      }
-    });
-    await t.test('manual campaigns are durably skipped, raw reads preserved and ordinary AgentStatus 9 calls delivered idempotently',async()=>{
-      await reset();const s=await ready();
-      const references={...cache,campaigns:new Map([['81','Ligacao Manual'],['82',' \tLIGACAO\u00a0MANUAL  GS '],['83','Campaign']])};
-      const input=[record(710001,{CampaignId:'81'}),record(710002,{CampaignId:'82'}),record(710003,{CampaignId:'83',AgentStatus:'9'}),record(710004,{CampaignId:'84'})];
-      const result=await stage(s,input,references);assert.equal(result.skipped,2);assert.equal(result.queued,2);
-      const blocked=(await outbox()).filter(e=>e.delivery_policy_code==='MANUAL_CAMPAIGN_EXCLUDED');assert.equal(blocked.length,2);assert(blocked.every(e=>e.state==='skipped'&&e.remote_raw_id===null&&e.confirmed_at===null));
-      const unknown=(await outbox()).find(e=>e.source_id==='710004');assert.equal(unknown.delivery_policy_code,'CAMPAIGN_IDENTIFICATION_REQUIRED');assert.equal(unknown.state,'pending');assert.equal(unknown.payload.nome_campanha_olos,null);
-      const read=(await local.query('SELECT state,processed_count,response_body FROM olos_http.reads ORDER BY started_at DESC LIMIT 1')).rows[0];assert.equal(read.state,'done');assert.equal(read.processed_count,4);assert.deepEqual(JSON.parse(read.response_body),input);
-      await s.delivery!.tick();assert.equal(await destinationCount(),3);assert.equal((await control()).confirmed_count,'3');
-      const preserved=await outbox();const reread=await s.beginRead({kind:'reread',date:'2026-10-01',start:'710001',end:'710004'});await s.stage(reread,JSON.stringify(input),1);const again=await s.drain(references);assert.equal(again.duplicates,4);await s.delivery!.tick();
-      assert.deepEqual(await outbox(),preserved);assert.equal((await control()).confirmed_count,'3');assert.equal(await destinationCount(),3);
-      await close(s);
-    });
-    await t.test('old manual pending rows remain byte-for-byte intact and cannot starve eligible calls before LIMIT',async()=>{
-      await reset();const s=await ready(makeConfig(2,{OLOS_CORPORATE_BATCH_SIZE:'1'}));
-      const references={...cache,campaigns:new Map([['81','Ligacao Manual'],['82','Ligacao Manual GS'],['83','Campaign']])};
-      await stage(s,[record(720001,{CampaignId:'81'}),record(720002,{CampaignId:'82'}),record(720003,{CampaignId:'83'})],references);
-      // Disposable fixture models pending entries created by the old policy.
-      await local.query("UPDATE olos_http.corporate_outbox SET state='pending',delivery_policy_code=NULL WHERE source_id IN ('720001','720002')");
-      const previous=(await outbox()).filter(e=>e.source_id==='720001'||e.source_id==='720002');
-      for(let i=0;i<3;i++)await s.delivery!.tick();
-      assert.deepEqual((await outbox()).filter(e=>e.source_id==='720001'||e.source_id==='720002'),previous);
-      assert.equal(await destinationCount(),3);const state=await control();assert.equal(state.confirmed_count,'3');assert.equal(state.failure_count,0);assert.equal(state.blocked,false);assert.equal(state.last_code,null);
-      await close(s);
-    });
-    await t.test('one-shot selected/homologation batch containing manual campaign fails without changing receipts, selection or counters',async()=>{
-      for(const campaign of ['Ligacao Manual GS',null]){
-      const cfg=await pausedQueue(2);const entry=(await outbox()).find(e=>e.state==='pending');
-      const payload={...entry.payload,nome_campanha_olos:campaign};
-      await local.query('UPDATE olos_http.corporate_outbox SET payload=$2,payload_hash=$3 WHERE source_id=$1',[entry.source_id,payload,digest(payload)]);
-      const before=await outbox(),state=await control(),corporate=await destinationCount();const s=await open(cfg);
-      await assert.rejects(s.delivery!.homologate(s.client!,2,homologationEnv.OLOS_CORPORATE_HOMOLOGATION_CONFIRMATION,new AbortController().signal),campaign?/MANUAL_CAMPAIGN_EXCLUDED/:/CAMPAIGN_IDENTIFICATION_REQUIRED/);
-      await s.ping();assert.deepEqual(await outbox(),before);assert.deepEqual(await control(),state);assert.equal(await destinationCount(),corporate);await close(s);
-      }
-    });
-    await t.test('possibly committed old manual pending delivery never gets reinserted, rewritten, discarded or counted as confirmed',async()=>{
-      await reset();const s=await ready();await stage(s,[record(730001,{CampaignId:'81'})],{...cache,campaigns:new Map([['81','Ligacao Manual']])});
-      const entry=(await outbox()).find(e=>e.source_id==='730001');
-      await remote.query(`INSERT INTO raw.olos_calls(${columns.join(',')}) VALUES(${columns.map((_,i)=>`$${i+1}`).join(',')})`,columns.map(name=>entry.payload[name]));
-      await local.query("UPDATE olos_http.corporate_outbox SET state='pending',delivery_policy_code=NULL WHERE source_id='730001'");
-      const before=await outbox(),state=await control(),existing=(await remote.query('SELECT * FROM raw.olos_calls ORDER BY internal_id_olos')).rows;
-      await s.delivery!.tick();await s.delivery!.tick();assert.deepEqual(await outbox(),before);assert.deepEqual(await control(),state);assert.deepEqual((await remote.query('SELECT * FROM raw.olos_calls ORDER BY internal_id_olos')).rows,existing);await close(s);
-    });
-    await t.test('campaign policy migration is idempotent and never backfills old rows or changes frozen hashes',async()=>{
-      await reset();const initialized=await ready();await close(initialized);const before=await outbox();const migration=await readFile(new URL('../migrations/005_corporate_campaign_policy.sql',import.meta.url),'utf8');
-      await local.query(migration);await local.query(migration);assert.deepEqual(await outbox(),before);
-      await assert.rejects(local.query("UPDATE olos_http.corporate_outbox SET delivery_policy_code='MANUAL_CAMPAIGN_EXCLUDED' WHERE state='confirmed'"),/corporate_outbox_delivery_policy_check/);assert.deepEqual(await outbox(),before);
-      await local.query('ALTER TABLE olos_http.corporate_outbox DROP COLUMN delivery_policy_code');
-      const s=new Store(makeConfig());try{await assert.rejects(s.open(),/CORPORATE_CAMPAIGN_POLICY_MIGRATION_REQUIRED/);}finally{await s.close();}
-      await local.query(migration);assert.equal(await destinationCount(),2);
-    });
-    await t.test('a missing campaign ID retains the existing identity guard and the complete received response',async()=>{
-      await reset();const s=await ready(),before=await outbox(),state=await control();const input=[record(740001,{CampaignId:null})];
-      await assert.rejects(stage(s,input),/REQUIRED_VALUE_MISSING/);
-      const pending=await s.unresolved();assert.equal(pending.length,1);assert.equal(pending[0]!.state,'received');assert.equal(pending[0]!.processed_count,0);assert.deepEqual(JSON.parse(pending[0]!.response_body!),input);
-      assert.deepEqual(await outbox(),before);assert.deepEqual(await control(),state);assert.equal(await destinationCount(),2);await close(s);
-    });
     await t.test('history exige exclusividade com o Admin', async () => {
       const cfg = await pausedQueue();
 

@@ -1,4 +1,4 @@
-import { writeFile,readFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import pg from 'pg';
 import { config } from './config.js';
 import { HttpTransport, sleep } from './http.js';
@@ -10,23 +10,15 @@ import { Worker } from './worker.js';
 import { runManaged } from './admin/main.js';
 import { WorkerError, errorCode, log } from './errors.js';
 import { inspectSchema } from './schema.js';
-import { readoptionCommands,readoptionAction } from './corporate-delivery/readoption-command.js';
 import { corporateControl } from './corporate-delivery/commands.js';
-import { loadRecoveryManifest, recoveryHash } from './read-recovery.js';
 
 async function main() {
   const cfg = config();
   const [command = 'check', ...args] = process.argv.slice(2);
-  const allowed = ['continuity-inspect','continuity-authorize','continuity-revoke','inspect-schema','check','start','admin','once','capture-once','capture-reread','recover-spool','recovery-authorize','recovery-verify','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
-    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator',...readoptionCommands];
+  const allowed = ['inspect-schema','check','start','admin','once','capture-once','capture-reread','previous','reread','log-read','recover-local','resolve','status','reconcile-names',
+    'corporate-check','corporate-status','corporate-reconcile','corporate-pause','corporate-resume','corporate-deliver-once'];
   if (!allowed.includes(command)) throw new WorkerError('COMMAND_INVALID');
-  const recovery = command==='recovery-authorize' ? await (async()=>{
-    if(args.length!==3)throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
-    return loadRecoveryManifest(args[0]!,args[1]!,args[2]!,process.env.OLOS_REREAD_CONFIRMATION);
-  })() : undefined;
-  if(command==='capture-reread'&&(![6,7].includes(args.length)||args[4]!=='--authorization'||(args.length===7&&args[6]!=='--missing-only')))throw new WorkerError('RECOVERY_AUTHORIZATION_REQUIRED');
-  if(command==='capture-reread')recoveryHash(args[5]);
-  if (readoptionAction(command)||['corporate-check','corporate-status','corporate-pause','corporate-resume','corporate-verify-pending','corporate-recover-collision','corporate-quarantine-collisions','corporate-adopt-id-allocator','corporate-prepare-id-allocator','corporate-revert-id-allocator'].includes(command)) { await corporateControl(cfg, command, args); return; }
+  if (['corporate-check','corporate-status','corporate-pause','corporate-resume'].includes(command)) { await corporateControl(cfg, command); return; }
   if (command === 'start' || command === 'admin') { await runManaged(cfg, command === 'admin'); return; }
   if (command === 'inspect-schema') {
     const pool = new pg.Pool({ connectionString: cfg.databaseUrl, max: 1, connectionTimeoutMillis: 10000, statement_timeout: 10000 });
@@ -48,7 +40,7 @@ async function main() {
   const stop = () => abort.abort();
   process.once('SIGTERM', stop); process.once('SIGINT', stop);
   let databaseDisconnected = false;
-  const store = new Store(cfg, () => { databaseDisconnected = true; stop(); },abort.signal);
+  const store = new Store(cfg, () => { databaseDisconnected = true; stop(); });
   let http: HttpTransport | undefined;
   try {
     await store.open();
@@ -62,33 +54,9 @@ async function main() {
       return;
     }
     if (command === 'check') { log('database_preflight_passed'); return; }
-    if(command==='continuity-inspect'){log('capture_continuity_parent',await store.inspectContinuity());return;}
-    if(command==='continuity-authorize'){
-      if(args.length!==2||args[1]!=='AUTHORIZE_CAPTURE_WITH_HISTORICAL_GAP')throw new WorkerError('CONTINUITY_CONFIRMATION_REQUIRED');
-      await store.authorizeContinuity(JSON.parse(await readFile(args[0]!,'utf8')));return;
-    }
-    if(command==='continuity-revoke'){
-      if(args.length!==1)throw new WorkerError('CONTINUITY_PARAMETERS_REQUIRED');
-      await store.revokeContinuity(args[0]!);return;
-    }
-    if(command==='recover-spool'){
-      if(args.length!==1)throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
-      const capture=await store.recoverCaptureSpool(args[0]!);log('capture_spool_recovered',{read_id:args[0]!,response_bytes:capture.bytes});return;
-    }
     if (command === 'status') {
-      for (const row of await store.unresolved()) log('pending_read', { read_id: row.id, state: row.state, processed: row.processed_count,
-        started_at:row.started_at.toISOString(),error:row.error_code });
+      for (const row of await store.unresolved()) log('pending_read', { read_id: row.id, state: row.state, processed: row.processed_count });
       return;
-    }
-    if(command==='recovery-authorize'){
-      log('recovery_authorized',{read_id:recovery!.parentId,authorization_hash:await store.authorizeRecovery(recovery!)});return;
-    }
-    if(command==='recovery-verify'){
-      if(args.length!==1&&(args.length!==3||args[1]!=='--output'))throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
-      const report={...await store.verifyRecovery(args[0]!),verified_at:new Date().toISOString()};
-      if(args.length===3)await writeFile(args[2]!,JSON.stringify(report,null,2),{mode:0o600,flag:'wx'});
-      const {unobserved_ranges,...summary}=report;log('recovery_coverage',summary);
-      if(!report.complete)process.exitCode=1;return;
     }
     if (command === 'resolve') {
       if (!args[0] || !args[1]) throw new WorkerError('RESOLVE_REQUIRES_ID_AND_EVIDENCE');
@@ -100,10 +68,9 @@ async function main() {
       }
     }
     if (![cfg.baseUrl,cfg.username,cfg.password,cfg.clientId,cfg.clientSecret].every(Boolean)) throw new WorkerError('OLOS_CONFIG_REQUIRED');
-    http = new HttpTransport(cfg.baseUrl, cfg.timeoutMs, command==='capture-reread'?Math.min(cfg.maxResponseBytes,cfg.recoveryMaxResponseBytes):cfg.maxResponseBytes, abort.signal, cfg.tlsVerify);
+    http = new HttpTransport(cfg.baseUrl, cfg.timeoutMs, cfg.maxResponseBytes, abort.signal, cfg.tlsVerify);
     const auth = new OlosAuthManager(http.request, cfg);
-    const api = new OlosApi(http.request, auth, ms => sleep(ms, abort.signal),cfg.captureSpoolDirectory
-      ?(path,fields,token,id)=>http!.captureToSpool(path,fields,token,cfg.captureSpoolDirectory!,id,cfg.captureMaxBytes,cfg.captureTimeoutMs,abort.signal):undefined);
+    const api = new OlosApi(http.request, auth, ms => sleep(ms, abort.signal));
     const cache = new StaticCache(api, cfg.cacheTtlMs);
     const worker = new Worker(store, api, cache);
 
@@ -130,10 +97,10 @@ async function main() {
     }
     if (command === 'capture-reread') {
       const [parentId, date, start, end] = args;
-      if (!parentId || !date || !start || !end) {
+      if (!parentId || !date || !start || !end || args.length !== 4) {
         throw new WorkerError('RECOVERY_PARAMETERS_REQUIRED');
       }
-      await worker.captureReread(parentId, date, start, end, args[5]!,args.length===7);
+      await worker.captureReread(parentId, date, start, end);
     }
     else if (command === 'capture-once') await worker.captureOnce();
     else {

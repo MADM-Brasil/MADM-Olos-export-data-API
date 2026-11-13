@@ -1,7 +1,5 @@
 # Relatórios: snapshots persistidos (contrato v1)
 
-> Referência do contrato v1 (fonte local), preservada para histórico e rollback. A adoção atual do MADM e o contrato v2 estão em [corporate-reports-v2.md](corporate-reports-v2.md).
-
 Implementação local, com PostgreSQL descartável. Nenhuma ação em produção. O histórico da tentativa SQL anterior está em [reports-performance.md](reports-performance.md).
 
 ## Arquitetura e exatidão
