@@ -18,6 +18,18 @@ Antes de congelar o payload, uma identidade já existente no MADM bloqueia a atr
 
 O matching e o INSERT agora ocorrem sob `SHARE ROW EXCLUSIVE`, antes da primeira consulta que estabeleça o snapshot SERIALIZABLE. Esse lock também exclui INSERT/UPDATE/DELETE/COPY de escritores que não usam os advisory locks do worker. O PostgreSQL verifica o privilégio de lock; sua ausência bloqueia com `CORPORATE_ALLOCATION_LOCK_PRIVILEGE_REQUIRED`.
 
+## Diferenças em relação à Corporate Authority v2
+
+| Aspecto | Corporate Authority v2 | Recuperação desta branch |
+| --- | --- | --- |
+| Novos IDs | Reserva corporativa persistida antes da materialização | Candidatos da sequência local, consultados no MADM; exclusividade efetiva no INSERT com UNIQUE |
+| Estruturas no MADM | Registry, funções e trigger de reserva | Nenhuma estrutura nova ou alteração de `raw.olos_calls` |
+| Conflito posterior à escolha do ID | Autoridade remota protege a reserva, dentro de seu contrato | Transação bloqueia a divergência; candidato local não representa reserva remota |
+| Histórico local | Geração/assignments de autoridade | Vínculos existentes preservados; 015 só aceita predecessor legacy comprovado e sem assignments |
+| Falta de conectividade | Admissions podem aguardar a autoridade | Novos registros permanecem no journal até a consulta de alocação funcionar |
+
+Esta branch parte de `1e062ff`, sem incorporar a implementação v2 de `3227bcb`. Os módulos antigos de adoção/reversão continuam legíveis para auditoria, mas a transição 015 impede ativar outra geração no estado recuperado. Sua tabela de evidência é exclusivamente local e não reserva IDs no MADM.
+
 ## COMMIT incerto e evidências
 
 Um COMMIT remoto incerto sempre bloqueia a entrega. O lote exato de source_ids fica em `corporate_control.delivery_uncertain_ids`; seus payloads e IDs permanecem congelados. Reinício não remove o bloqueio. `corporate-resume` verifica explicitamente esse lote sob lock remoto e exige correspondência integral e COMMIT reconhecido da verificação. Essa verificação não cria recibos. A entrega normal revalida os mesmos IDs antes de confirmar localmente.
@@ -57,6 +69,30 @@ O marcador de candidato protege contra execução acidental do binário antigo; 
 4. Se o ACK da migration se perder, abrir nova sessão, conferir `corporate_legacy_recovery`, os contratos e as guardas. Reaplicar a mesma 015 enquanto pausado é idempotente. Não remover objetos para forçar reaplicação.
 5. Publicar separadamente esta branch, mantendo o processo pausado. Executar `corporate-status`, `corporate-check` e `corporate-verify-pending` pelos comandos existentes. A checagem corporativa usa lock transacional, mas não altera dados. Comparar os snapshots históricos. Se houver bloqueio por colisão, usar a recuperação existente com o digest efetivamente verificado, preservando a quarentena.
 6. Autorizar `corporate-resume` apenas após as conferências. Retomar scheduler pelo controle existente, monitorando confirmações, pendências, bloqueios, latência do lock e capacidade da sequência.
+
+## Critérios objetivos para liberar Corporate Delivery
+
+A aprovação dos testes isolados permite revisão/publicação da branch; não comprova as condições reais de implantação. Todas as condições abaixo precisam de evidência registrada por um operador autorizado antes da liberação:
+
+1. Imagem identificada pelo commit da correção, Node 24 e PostgreSQL 16 homologados; contratos locais 010/011/014 compatíveis e 015 aplicada integralmente. `corporate-status` e a abertura do worker aceitam as guardas canônicas sem drift. Uma 015 abortada não autoriza contornar suas pré-condições.
+2. Source, binding, target e reversão validada correspondem ao snapshot aprovado. Nenhuma geração ativa, assignment remoto ou admission pendente foi descartada para viabilizar a transição.
+3. Comparação antes/depois demonstra os mesmos IDs, hashes e recibos históricos e os mesmos membros da quarentena. Contagens são reconciliadas com o snapshot atual; os números fornecidos no chamado não são usados como atualização manual de contadores.
+4. O índice UNIQUE parcial corporativo está válido e pronto; TLS, schema, identidade composta e privilégio de lock são aceitos por `corporate-check`. Não há autoridade remota instalada. Privilégio insuficiente mantém o bloqueio; não conceder privilégios indiscriminadamente para contorná-lo.
+5. A verificação das pendências não encontra divergência nos itens que serão admitidos. Toda quarentena permanece excluída. COMMITs incertos têm prova exata do lote e reconciliação explícita concluída; manifesto ausente, linha ausente ou ambiguidade mantém o bloqueio. Uma retomada explicitamente autorizada pode realizar a verificação prevista no código; não se limpa `last_code` ou o manifesto por SQL manual.
+6. Um ensaio representativo com os escritores externos demonstra aquisição do lock e conclusão dos lotes dentro dos timeouts configurados, sem sobrescrita, falso recibo ou duplicação no replay. O operador registra os limites de latência/vazão aceitos; sem esse ensaio, a compatibilidade dos escritores permanece não comprovada.
+7. Após qualquer recuperação explícita necessária, o controle está pronto, sem bloqueio e sem backoff pendente. A passagem de `paused=true` para operação exige autorização operacional separada. **Esta entrega não executa `corporate-resume`.**
+
+## Critérios objetivos para liberar o scheduler
+
+A liberação do scheduler é independente do commit/push e só ocorre com autorização operacional específica:
+
+1. Todos os critérios de Delivery acima foram atendidos, e uma entrega controlada de quantidade previamente aprovada comprovou correspondência entre linhas remotas, confirmações da outbox e recibos, com replay sem novas inserções.
+2. Journal, spool e checkpoints foram conferidos, com espaço disponível e nenhum processamento local pendente que impeça nova captura segundo a política existente. Não há leitura ambígua nova, recovery obrigatório ou perda de ownership. Uma exceção histórica só é válida sob a autorização de continuidade já existente, válida e restrita à sua origem/parent; aceitar uma lacuna não comprova segurança do cursor remoto.
+3. Existe um único owner da origem; não há worker antigo, coletor paralelo ou tarefa administrativa incompatível. A identificação da imagem e do serviço na VPS foi conferida pelo operador, sem criar outra instância coletora.
+4. MADM e OLOS têm conectividade/TLS/configuração validados pelo procedimento operacional autorizado. A dependência nova do drain em relação ao MADM foi aceita e dimensionada; falha de alocação não é resolvida repetindo uma chamada OLOS ambígua.
+5. Há monitoramento de leituras pendentes, avanço dos checkpoints, espaço de spool, idade da outbox, confirmações, colisões, COMMIT desconhecido, capacidade int32 e tempo de lock. Os critérios de interrupção estão definidos: nova ambiguidade de captura, divergência de identidade/recibo, perda de owner ou drift de contrato impedem a continuidade; indisponibilidade do MADM deixa o drain pendente sem descartar dados.
+
+Nenhuma dessas condições reais foi verificada nesta execução, pois VPS e bancos reais estão fora da autorização. O scheduler permanece STOPPED; não se presume que delivery pausado ou um build aprovado autorizem sua retomada.
 
 ## Reversão operacional
 
