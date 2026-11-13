@@ -59,6 +59,8 @@ O marcador de candidato protege contra execução acidental do binário antigo; 
 
 ## Implantação futura — não executada
 
+Comandos, resultados esperados, snapshots e critérios de interrupção: [procedimento operacional 015](legacy-recovery-015-operations.md).
+
 1. Manter scheduler STOPPED e Corporate Delivery pausado. Parar o processo para excluir transações em voo; confirmar locks e COMMITs pendentes. Inventariar os escritores do MADM e homologar contenção/timeout e privilégio do lock. Confirmar ausência de autoridade remota.
 2. Fazer backup local atual, além do backup anterior à 014, incluindo spool, journals, receipts, outbox, quarentenas e reversões. Registrar contagens e hashes dos vínculos; os números informados não substituem a conferência local.
 3. Em janela autorizada, aplicar **somente no PostgreSQL local**:

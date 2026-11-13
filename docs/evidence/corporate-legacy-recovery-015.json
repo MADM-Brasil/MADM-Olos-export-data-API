@@ -81,5 +81,39 @@
     "network_mode": "none",
     "published_ports": 0,
     "disposable_container_auto_remove": true
+  },
+  "deployment_procedure_validation": {
+    "implementation_base": "4788bab703bb008c10ceb8d4801dbd45225f0d6c",
+    "production_code_and_migrations_unchanged": true,
+    "tests": {
+      "passed": 150,
+      "failed": 0,
+      "skipped": 0,
+      "includes_test_parent_groups": true,
+      "log_sha256": "162fada5340896a9b1b09629e05490a5a60eb0785887c111a7429222c29ffac0"
+    },
+    "added_scenario": "015 rejects an existing assignment and preserves its row, receipts, quarantine, controls, trigger definitions and function definitions",
+    "preservation": "Positive transition over 010/011/014 preserves existing records, frozen outbox, receipts, empty assignments, quarantine and reversion evidence; nonempty assignments block transition",
+    "build": "passed",
+    "typecheck": {
+      "preexisting_diagnostics": 17,
+      "new_diagnostics": 0,
+      "byte_identical_to_baseline": true
+    },
+    "runbook_checks": {
+      "bash_blocks_parsed": 7,
+      "snapshot_tables": 16,
+      "repeated_snapshot_equal": true,
+      "compiled_runtime_check": "LOCAL_015_CONTRACT_OK"
+    },
+    "isolation": {
+      "postgres": "16",
+      "node": "24",
+      "network_mode": "none",
+      "published_ports": 0,
+      "real_database_access": false
+    },
+    "production_commands_executed": false,
+    "runbook": "docs/corporate-delivery/legacy-recovery-015-operations.md"
   }
 }

@@ -40,6 +40,8 @@ test('legacy delivery recovery uses existing UNIQUE with no corporate DDL and pr
  const snapshot=async()=>({records:(await db.query('SELECT * FROM olos_http.records WHERE source_id IN (\'1\',\'2\',\'3\') ORDER BY source_id')).rows,
   confirmed:(await db.query("SELECT * FROM olos_http.corporate_outbox WHERE source_id='1'")).rows,
   quarantine:(await db.query('SELECT * FROM olos_http.corporate_collision_quarantine')).rows,
+  receipts:(await db.query('SELECT * FROM corporate_sync.receipts ORDER BY internal_id_olos')).rows,
+  assignments:(await db.query('SELECT * FROM olos_http.corporate_id_assignments ORDER BY source_key,source_id')).rows,
   reversions:(await db.query('SELECT * FROM olos_http.corporate_id_reversions')).rows,
   reversionBatches:(await db.query('SELECT * FROM olos_http.corporate_id_reversion_batches')).rows,
   remote:(await remote.query('SELECT to_jsonb(d) d FROM raw.olos_calls d WHERE olos_call_id IN ($1,$2,$3) ORDER BY internal_id_olos',[record(1).CallId,'somebody-elses-call','external-ambiguous'])).rows});
@@ -245,6 +247,21 @@ test('legacy delivery recovery uses existing UNIQUE with no corporate DDL and pr
     }
     await writer.query('COMMIT');await rejection;assert(blocked);
    }finally{await waiting.query('ROLLBACK');await writer.query('ROLLBACK');await waiting.end();await writer.end();}
+  });
+  await t.test('015 refuses an existing assignment without changing it, receipts, quarantine or guards',async()=>{
+   await store!.delivery!.pause(db);
+   await db.query(`INSERT INTO olos_http.corporate_id_assignments(source_key,source_id,target_id,source_hash,binding,token,legacy)
+     SELECT source_key,source_id,target_id,source_hash,$1,NULL,true FROM olos_http.records WHERE source_key=$2 AND source_id='1'`,[dc.binding,source]);
+   const saved=await snapshot();assert.equal(saved.assignments.length,1);
+   const guardSnapshot=async()=>(await db.query(`SELECT t.tgrelid::regclass::text AS relation,t.tgname,t.tgenabled,
+     pg_get_triggerdef(t.oid) AS trigger_definition,pg_get_functiondef(t.tgfoid) AS function_definition
+     FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+     WHERE NOT t.tgisinternal AND n.nspname IN ('olos_http','raw') ORDER BY relation,t.tgname`)).rows;
+   const guards=await guardSnapshot(),control=(await db.query('SELECT * FROM olos_http.corporate_control')).rows;
+   try{await assert.rejects(migration('015_corporate_legacy_recovery.sql'),/LEGACY_RECOVERY_TRANSITION_NOT_READY/);}
+   finally{await db.query('ROLLBACK');}
+   assert.deepEqual(await snapshot(),saved);assert.deepEqual(await guardSnapshot(),guards);
+   assert.deepEqual((await db.query('SELECT * FROM olos_http.corporate_control')).rows,control);
   });
  }finally{await store?.close();db.release(true);await pool.end();await remote.end();await rm(dir,{recursive:true,force:true});}
 });
