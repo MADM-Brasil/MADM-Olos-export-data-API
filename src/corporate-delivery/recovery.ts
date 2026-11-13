@@ -247,7 +247,7 @@ export async function recoverCollision(local: PoolClient, cfg: DeliveryConfig, s
       if (allocation?.state === 'legacy') {
         stage = 'update_reversion';
         await local.query(`UPDATE olos_http.corporate_id_reversions SET validated_at=clock_timestamp(),validation_digest=$2
-        WHERE request_id=$1 AND state='completed'`, [allocation.reversion_request_id,request.verification]);
+        WHERE request_id=$1 AND state='completed' AND validated_at IS NULL`, [allocation.reversion_request_id,request.verification]);
       }
     }
     stage = 'before_commit';

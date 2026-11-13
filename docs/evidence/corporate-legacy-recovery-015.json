@@ -1,0 +1,60 @@
+{
+  "base": "1e062ff",
+  "branch": "fix/corporate-legacy-recovery",
+  "main_unchanged": "3227bcb",
+  "validation": {
+    "build": "passed, Node 24.16.0",
+    "typecheck": {
+      "passed": false,
+      "preexisting_diagnostics": 17,
+      "new_diagnostics": 0,
+      "byte_identical_to_baseline": true
+    },
+    "postgres_and_units": {
+      "node": "24.22.1",
+      "postgres": "16.15",
+      "passed": 149,
+      "failed": 0,
+      "skipped": 0,
+      "includes_test_parent_groups": true,
+      "files": [
+        "test/corporate-legacy-recovery.integration.ts",
+        "test/corporate-recovery.integration.ts",
+        "test/corporate-delivery.test.ts",
+        "test/corporate-recovery.test.ts",
+        "test/corporate-sync.test.ts"
+      ],
+      "log_sha256": "128d1dff33bd65ba601acb95149fcf9fe375f563d3d8cfdc3e00ec3d96487f33"
+    },
+    "transition_final": {
+      "passed": 15,
+      "failed": 0,
+      "skipped": 0,
+      "log_sha256": "b1aaa328f32d42bd631d989a1e71b880fd5c1b1b8596072033818703b7536c27"
+    },
+    "diff_check": "passed"
+  },
+  "isolation": {
+    "new_disposable_container": true,
+    "network_mode": "none",
+    "published_ports": 0,
+    "real_olos_requests": 0,
+    "production_access": false
+  },
+  "initial_environment_failures": [
+    "Shell runner Docker socket permission denied; equivalent direct Docker commands succeeded with network none.",
+    "Host unit CLI subprocess failed; all 25 unit tests passed in the isolated Node 24 container."
+  ],
+  "test_updates": [
+    "Previously expected legacy materialization of occupied ID now verifies skipped occupied ID and preserved corporate row.",
+    "Legacy allocation while remote authority exists now blocks before freezing ID and preserves journal for existing recovery."
+  ],
+  "deployment_constraints": [
+    "Apply only local 015 after its verified preconditions; do not reapply 014.",
+    "No corporate DDL or authority installation required.",
+    "Corporate table lock privileges and writer contention require homologation.",
+    "New materialization requires corporate read availability; journal/checkpoint preservation tested.",
+    "External writers can occupy a candidate before delivery; block without remap, overwrite or false receipt.",
+    "Unknown COMMIT without exact acknowledged remote evidence remains blocked."
+  ]
+}

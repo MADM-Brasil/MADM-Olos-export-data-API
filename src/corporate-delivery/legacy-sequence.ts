@@ -1,4 +1,4 @@
-import type { PoolClient } from 'pg';
+import type { Client, PoolClient } from 'pg';
 import { log } from '../errors.js';
 import { SyncError } from '../corporate-sync/errors.js';
 import { integerValue } from '../corporate-sync/mapping.js';
@@ -90,4 +90,28 @@ export async function nextLegacyId(local: PoolClient, sequence: string, target: 
   // Recheck the actual value, independently of any forecast or unexpected competing nextval caller.
   await assertLegacyIdFree(local,scopes,target,id);
   return id;
+}
+
+// A candidate is not a reservation. Final ownership is established only by the
+// corporate UNIQUE index at INSERT. Never change an already frozen mapping.
+export async function nextAvailableLegacyId(local: PoolClient, remote: Client, sequence: string, target: string, scopes: Scope[]): Promise<string> {
+  const meta = (await local.query<{cycle:boolean;increment:string}>(
+    'SELECT seqcycle AS cycle,seqincrement::text AS increment FROM pg_sequence WHERE seqrelid=$1::regclass',[sequence])).rows[0];
+  if (!meta || meta.cycle || BigInt(meta.increment)<=0n) unsafe('SEQUENCE_METADATA_UNSUPPORTED');
+  const first=await nextLegacyId(local,sequence,target,scopes);
+  if(!(await remote.query('SELECT 1 FROM raw.olos_calls WHERE internal_id_olos=$1',[first])).rowCount)return first;
+  // Bounded batches avoid one WAN round trip per occupied historical ID. Sequence
+  // gaps are intentional; no setval, MAX+1, cursor inference or historical remap.
+  for (let batch=0;batch<256;batch++) {
+    const candidates=(await local.query<{id:string}>(
+      'SELECT nextval($1::regclass)::text AS id FROM generate_series(1,256)',[sequence])).rows.map(row=>integerValue(row.id,32));
+    if(candidates.some(id=>BigInt(id)<1n))unsafe('SEQUENCE_CAPACITY_NOT_PROVEN');
+    const used=new Set((await remote.query<{id:string}>(
+      'SELECT internal_id_olos::text AS id FROM raw.olos_calls WHERE internal_id_olos=ANY($1::integer[])',[candidates])).rows.map(row=>row.id));
+    for(const id of candidates){
+      if(used.has(id)||await occupied(local,scopes,target,id,id,'1'))continue;
+      return id;
+    }
+  }
+  throw new SyncError('ALLOCATOR_CANDIDATE_SCAN_LIMIT');
 }

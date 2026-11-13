@@ -1,3 +1,4 @@
+import { assertLegacyRecoverySchema } from './legacy-transition.js';
 import { assertReadoptionSchema } from './readoption-proof.js';
 import { randomUUID } from 'node:crypto';
 import type { Client, Pool, PoolClient } from 'pg';
@@ -7,9 +8,9 @@ import { columns, digest, quote, type Row, type Shape } from '../corporate-sync/
 import { log } from '../errors.js';
 import type { MappedRecord } from '../mapping.js';
 import { assertHomologationAuthorization, type DeliveryConfig } from './config.js';
-import { corporateSchema, freeze, deliveryPayload, matches, uniqueIdentities } from './contract.js';
+import { corporateSchema, freeze, deliveryPayload, matches, uniqueIdentities, matchCandidates, lockCorporateCalls } from './contract.js';
 import { allocatorState, assertLegacyRemote, admissionHash, reserveIds, allocatorError, type IdAssignment, type AllocatorHooks } from './allocator.js';
-import { lockLegacyIdSpace, nextLegacyId } from './legacy-sequence.js';
+import { lockLegacyIdSpace, nextAvailableLegacyId } from './legacy-sequence.js';
 import { pendingAdmission } from './selection.js';
 import { notQuarantined, quarantineMembers } from './quarantine.js';
 import { eligibleOperator } from './operator-eligibility.js';
@@ -39,6 +40,7 @@ export class CorporateDelivery {
     try { await local.query('SELECT delivery_policy_code FROM olos_http.corporate_outbox LIMIT 0'); }
     catch(error){if((error as {code?:string}).code==='42703')throw new SyncError('CORPORATE_CAMPAIGN_POLICY_MIGRATION_REQUIRED');throw error;}
     if((await local.query("SELECT to_regclass('olos_http.corporate_readoption_schema') IS NOT NULL AS present")).rows[0].present)await assertReadoptionSchema(local);
+    await assertLegacyRecoverySchema(local);
     const state = (await local.query('SELECT source_key,target_table,binding FROM olos_http.corporate_control WHERE singleton')).rows[0];
     if (state && (state.source_key !== this.source || state.target_table !== this.target || state.binding !== this.cfg.binding)) throw new SyncError('CORPORATE_BINDING_CHANGED');
   }
@@ -69,7 +71,8 @@ export class CorporateDelivery {
     const state = await this.state(local);
     const remote = await connect(this.cfg.connection, 'destination');
     try {
-      await remote.query('BEGIN READ ONLY');
+      await remote.query('BEGIN');
+      await lockCorporateCalls(remote);
       const contract = await corporateSchema(remote, this.cfg, false);
       const allocator = await allocatorState(local, this.cfg, this.source, this.target);
       if (allocator?.state === 'legacy') await assertLegacyRemote(remote);
@@ -97,11 +100,33 @@ export class CorporateDelivery {
       if (allocator && !['active','legacy'].includes(allocator.state)) throw new SyncError('ALLOCATOR_ADOPTION_INCOMPLETE');
       if (allocator?.state === 'legacy' && !allocator.reversion_validated) throw new SyncError('ALLOCATOR_REVERSION_VALIDATION_REQUIRED');
       if (state.blocked && !['DATABASE_TRANSIENT_FAILURE','CORPORATE_COMMIT_UNKNOWN'].includes(state.last_code)) throw new SyncError('CORPORATE_DELIVERY_BLOCKED');
+      if(state.last_code==='CORPORATE_COMMIT_UNKNOWN')await this.reconcileUncertain(local,state.delivery_uncertain_ids);
       await local.query(`UPDATE olos_http.corporate_control SET paused=false,blocked=false,failure_count=0,
         next_attempt_at=NULL,updated_at=now() WHERE singleton`);
       await local.query('COMMIT');
     } catch (error) { await rollback(local); throw error; }
     this.admitted = true;
+  }
+  // Explicit corporate-resume only: a missing/different row never authorizes
+  // another INSERT after an unknown COMMIT. No receipt is written by this check.
+  private async reconcileUncertain(local: PoolClient, sourceIds: unknown): Promise<void> {
+    if(!Array.isArray(sourceIds)||!sourceIds.length||!sourceIds.every((id:unknown)=>typeof id==='string'))
+      throw new SyncError('CORPORATE_COMMIT_RECONCILIATION_REQUIRED');
+    const entries=(await local.query<{target_id:string;payload:Record<string,unknown>;payload_hash:string}>(
+      `SELECT target_id::text,payload,payload_hash FROM olos_http.corporate_outbox
+       WHERE source_key=$1 AND source_id=ANY($2::text[]) AND state='pending' FOR UPDATE`,[this.source,sourceIds])).rows;
+    if(entries.length!==sourceIds.length)throw new SyncError('CORPORATE_COMMIT_RECONCILIATION_REQUIRED');
+    const remote=await connect(this.cfg.connection,'destination');
+    try{
+      await remote.query('BEGIN');await lockCorporateCalls(remote);await assertLegacyRemote(remote);
+      const state=await this.state(local);
+      const contract=await corporateSchema(remote,this.cfg,false);
+      if(contract.hash!==state.schema_hash)throw new SyncError('CORPORATE_SCHEMA_CHANGED');
+      const found=await matches(remote,entries.map(entry=>deliveryPayload(entry,contract.shape,this.cfg)),contract.shape,this.cfg);
+      if(found.size!==entries.length)throw new SyncError('CORPORATE_COMMIT_RECONCILIATION_REQUIRED');
+      await remote.query('COMMIT');
+      await local.query('UPDATE olos_http.corporate_control SET delivery_uncertain_ids=NULL,last_code=NULL WHERE singleton');
+    }finally{await rollback(remote);await remote.end().catch(()=>{});}
   }
   suspend(): void { this.admitted = false; }
   allow(): void { if (!this.closing && !this.homologationUsed) this.admitted = true; }
@@ -146,6 +171,8 @@ export class CorporateDelivery {
     const legacyIds = !allocator || allocator.state === 'legacy' || !!reversionRequest;
     const idSpace = legacyIds ? await lockLegacyIdSpace(local,this.target) : undefined;
     let queued = 0, skipped = 0, duplicates = 0;
+    let allocationRemote: Client | undefined;
+    try {
     for (const record of input) {
       const previous = (await local.query(`SELECT r.source_hash,r.target_table,r.target_id::text,o.payload_hash
         FROM olos_http.records r LEFT JOIN olos_http.corporate_outbox o USING(source_key,source_id)
@@ -168,12 +195,32 @@ export class CorporateDelivery {
       const assignment = reserved?.get(record.source_id);
       if (allocator && allocator.state !== 'legacy' && !reversionRequest && !assignment) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
       let id:string;
-      if(legacyIds)id=await nextLegacyId(local,sequence,this.target,idSpace!);
+      if(legacyIds){
+        if(!allocationRemote){
+          allocationRemote=await connect(this.cfg.connection,'destination');
+          await allocationRemote.query('BEGIN READ ONLY');
+          await assertLegacyRemote(allocationRemote);
+          const contract=await corporateSchema(allocationRemote,this.cfg,false);
+          if(contract.hash!==state.schema_hash)throw new SyncError('CORPORATE_SCHEMA_CHANGED');
+        }
+        id=await nextAvailableLegacyId(local,allocationRemote,sequence,this.target,idSpace!);
+      }
       else {
         if(!assignment?.id||!assignment.token||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(assignment.token))throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
         id=assignment.id;
       }
       const payload = (await freeze(local, [{ ...record, internal_id_olos: id }], shape, this.cfg))[0]!;
+      if(allocationRemote){
+        const candidates=await matchCandidates(allocationRemote,[payload],shape,this.cfg);
+        if(candidates.rowCount){
+          // Detect real collisions/ambiguity with the unchanged comparison. Even
+          // an exact row cannot be adopted under a different local source_id.
+          await matches(allocationRemote,[payload],shape,this.cfg);
+          throw new SyncError('LOGICAL_CALL_ALREADY_EXISTS');
+        }
+        await local.query("SELECT set_config('olos_http.checked_legacy_candidate',$1,true)",
+          [JSON.stringify([this.source,record.source_id,id])]);
+      }
       const campaignCode=campaignPolicyCode(payload.nome_campanha_olos);
       const deliveryState = campaignCode!=='MANUAL_CAMPAIGN_EXCLUDED'&&eligibleOperator(
         record.agent_id,
@@ -190,7 +237,11 @@ export class CorporateDelivery {
       if (deliveryState === 'pending') queued++;
       else skipped++;
     }
+    if(allocationRemote)await allocationRemote.query('COMMIT');
     return { queued, skipped, duplicates };
+    } finally {
+      if(allocationRemote){await rollback(allocationRemote);await allocationRemote.end().catch(()=>{});}
+    }
   }
 
   // One bounded attempt per existing scheduler cycle/manual command. No timer, retry loop or scheduler here.
@@ -311,7 +362,7 @@ export class CorporateDelivery {
         beforeRemoteEffect();
         remote = await connect(this.cfg.connection, 'destination');
         await remote.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-        await remote.query('LOCK TABLE raw.olos_calls IN ROW EXCLUSIVE MODE');
+        await lockCorporateCalls(remote);
         const { shape, hash, allocatorHash } = await corporateSchema(remote, this.cfg, true);
         if (hash !== state.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
         if (allocator?.state === 'legacy') await assertLegacyRemote(remote);
@@ -351,8 +402,11 @@ export class CorporateDelivery {
         const failures = state.failure_count + 1;
         // Network termination during COMMIT does not always carry a PostgreSQL/Node error code.
         const code = commitIssued ? 'CORPORATE_COMMIT_UNKNOWN' : safeCode(allocatorError(error));
-        const terminal = !(commitIssued || retryable(error)) || failures >= this.cfg.connection.maxRetries;
+        const terminal = commitIssued || !retryable(error) || failures >= this.cfg.connection.maxRetries;
         const delay = Math.min(60000, this.cfg.connection.backoffMs * 2 ** Math.min(failures - 1, 16));
+        if(commitIssued&&(await local.query("SELECT to_regclass('olos_http.corporate_legacy_recovery') IS NOT NULL AS present")).rows[0].present){
+          await local.query('UPDATE olos_http.corporate_control SET delivery_uncertain_ids=$1 WHERE singleton',[entries.map(entry=>String(entry.source_id))]);
+        }
         await local.query(`UPDATE olos_http.corporate_control SET failure_count=$1,blocked=$2,last_code=$3,
           next_attempt_at=now()+($4::integer*interval '1 millisecond'),updated_at=now() WHERE singleton`,
         [failures, terminal, code, delay]);

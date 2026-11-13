@@ -1330,13 +1330,13 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       await assert.rejects(revert(reversionArgs(next)),/REQUEST_REUSED/);
       assert.equal((await entries()).length,1);
     });
-    await t.test('newly materialized legacy collisions are isolated by the existing procedure before delivery resumes', async () => {
-      await reset(0); await insertForeign('1'); const adoption=await prepare(); await stage(8901); await stage(8902); await reversalMigration();
-      await revert(reversionArgs(adoption)); const report=await verify(); assert.equal(report.issues[0]!.code,'INTERNAL_ID_COLLISION');
-      await assert.rejects(recover(args(report.verification_digest)),/PENDING_DIVERGES/); const remoteBefore=(await snapshot()).remote;
-      await quarantine(args(report.verification_digest)); const valid=await verify(); assert.equal(valid.quarantined,1); assert.deepEqual(valid.issues,[]);
-      await recover(args(valid.verification_digest)); await corporateControl(cfg,'corporate-resume'); await store!.delivery!.tick();
-      assert.deepEqual((await entries()).map(e=>e.state),['pending','confirmed']);
+    await t.test('legacy materialization skips occupied corporate IDs without creating new historical quarantines', async () => {
+      await reset(0); await insertForeign('1'); const remoteBefore=(await snapshot()).remote;
+      const adoption=await prepare(); await stage(8901); await stage(8902); await reversalMigration();
+      await revert(reversionArgs(adoption)); const report=await verify(); assert.deepEqual(report.issues,[]);
+      assert.equal(report.quarantined,0); assert((await entries()).every(entry=>entry.target_id!==1));
+      await recover(args(report.verification_digest)); await corporateControl(cfg,'corporate-resume'); await store!.delivery!.tick();
+      assert.deepEqual((await entries()).map(e=>e.state),['confirmed','confirmed']);
       assert.deepEqual((await snapshot()).remote.find(r=>r.internal_id_olos===1),remoteBefore[0]);
     });
     await t.test('finalization rollback is resumable and migrations retain all local triggers and evidence', async () => {
@@ -1607,8 +1607,13 @@ test('collision recovery with disposable PostgreSQL and verified TLS', { skip: !
       const {request}=await reprepare(1,false,false);await remoteAllocatorMigration();const input=await activationRequest(request),cursor=(await snapshot()).allocator;
       await assert.rejects(activateReado(input,{beforeBarrierCommit:async()=>{throw new Error('synthetic barrier rollback');}}),/synthetic/);
       assert.equal((await control()).id_allocator_required,false);assert.equal((await client(db=>readoptionStatus(db,dc,target,source,request.requestId))).state,'ready');
-      await stage(8996);assert.notDeepEqual((await snapshot()).allocator,cursor);
-      assert.equal((await activateReado(input)).registered,'2');assert.deepEqual((await entries()).map(e=>e.target_id),[1,2]);
+      // A remote authority installed during the failed barrier excludes legacy
+      // allocation. Preserve the received journal, rather than freeze an unsafe ID.
+      await assert.rejects(stage(8996),/ALLOCATOR_REVERSION_REMOTE_PRESENT/);
+      assert.deepEqual((await snapshot()).allocator,cursor);
+      assert.equal((await activateReado(input)).registered,'1');assert.deepEqual((await entries()).map(e=>e.target_id),[1]);
+      await store!.drain(references);
+      assert.equal((await admissions()).filter(a=>a.source_id==='8996'&&!a.materialized).length,1);
     });
     await t.test('a fresh collision discovered after the barrier is explicitly quarantined before activation can complete',async()=>{
       const {request}=await reprepare(2,false,false);await remoteAllocatorMigration();const input=await activationRequest(request);

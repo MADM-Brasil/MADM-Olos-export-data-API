@@ -42,6 +42,11 @@ export function deliveryPayload(entry: { payload: Record<string, unknown>; paylo
 export async function matches(db: Client, rows: Row[], shape: Shape, cfg: DeliveryConfig): Promise<Map<string, string>> {
   const expected = new Map(rows.map(row => [row.internal_id_olos, row]));
   const result = await matchCandidates(db, rows, shape, cfg);
+  const identities = result.rows.map(raw => {
+    const row=mapRow(raw,shape,cfg.connection);
+    return JSON.stringify(identityColumns.map(name=>row[name]));
+  });
+  if(new Set(identities).size!==identities.length)throw new SyncError('AMBIGUOUS_LOGICAL_IDENTITY');
   const found = new Map<string, string>();
   for (const raw of result.rows) {
     const wanted = expected.get(raw.internal_id_olos);
@@ -69,4 +74,16 @@ export async function matchCandidates(db: Client, rows: Row[], shape: Shape, cfg
 export function uniqueIdentities(rows: Row[]): void {
   const keys = rows.map(row => JSON.stringify(identityColumns.map(name => row[name])));
   if (new Set(keys).size !== rows.length) throw new SyncError('DUPLICATE_LOGICAL_IDENTITY');
+}
+
+// Ordinary INSERT/UPDATE/DELETE/COPY writers participate in this lock even when
+// they do not use our advisory locks. No DDL or corporate allocator is installed.
+export async function lockCorporateCalls(db: Client): Promise<void> {
+  // This must be the first statement after BEGIN: even a privilege SELECT
+  // would establish a stale SERIALIZABLE snapshot before waiting for a writer.
+  try { await db.query('LOCK TABLE raw.olos_calls IN SHARE ROW EXCLUSIVE MODE'); }
+  catch(error){
+    if(error instanceof Error&&'code' in error&&error.code==='42501')throw new SyncError('CORPORATE_ALLOCATION_LOCK_PRIVILEGE_REQUIRED');
+    throw error;
+  }
 }
