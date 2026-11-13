@@ -10,6 +10,7 @@ import { corporateSchema, deliveryPayload, matches } from './contract.js';
 import { assertLocalConsumersCompatible } from './local-consumers.js';
 import { assertReadoptionSchema, predecessorProof, readoptionDigest, readoptionQuarantine } from './readoption-proof.js';
 import { isReadoptionState } from './readoption-contract.js';
+import {assertAllocationSchema} from './allocation-policy.js';
 import type { ReadoptionRequest, ReadoptionActivation, ReadoptionHooks, ReadoptionProgress, ReadoptionResult } from './readoption-contract.js';
 
 interface Control {ready:boolean;paused:boolean;id_allocator_required:boolean;id_allocator_generation:string|null;source_key:string;target_table:string;binding:string;schema_hash:string;destination_shape:ShapeEntries}
@@ -54,7 +55,8 @@ async function remoteAuthority(cfg:DeliveryConfig) {
   await db.query('BEGIN READ ONLY');
   if(!(await db.query("SELECT to_regnamespace('olos_delivery_ids') IS NOT NULL AS present")).rows[0].present)throw new SyncError('READOPTION_REMOTE_AUTHORITY_ABSENT');
   const contract=await allocatorContract(db),schema=await corporateSchema(db,cfg,true);
-  if(!(await db.query("SELECT has_function_privilege(current_user,'olos_delivery_ids.reserve(text,jsonb,boolean)','EXECUTE') AS ok")).rows[0].ok)throw new SyncError('READOPTION_REMOTE_AUTHORITY_UNAUTHORIZED');
+  if(!(await db.query(`SELECT has_function_privilege(current_user,'olos_delivery_ids.reserve(text,jsonb,boolean)','EXECUTE')
+    AND has_function_privilege(current_user,'olos_delivery_ids.assert_unambiguous(jsonb)','EXECUTE') AS ok`)).rows[0].ok)throw new SyncError('READOPTION_REMOTE_AUTHORITY_UNAUTHORIZED');
   await db.query('COMMIT');return {contract,...schema};
  }finally{await rollback(db);await db.end().catch(()=>{});}
 }
@@ -73,7 +75,7 @@ function validSeal(run:ReadoptionProgress) {
   validationDigest(run,run.predecessor_digest,run.quarantine_manifest,run.remote_contract_hash,run.remote_schema_hash)!==run.validation_digest)throw new SyncError('READOPTION_VALIDATION_CHANGED');
 }
 async function owned<T>(db:PoolClient,cfg:DeliveryConfig,target:string,request:ReadoptionRequest,fn:()=>Promise<T>):Promise<T> {
- requestValid(request,request.source);await assertReadoptionSchema(db);
+ requestValid(request,request.source);await assertReadoptionSchema(db);await assertAllocationSchema(db);
  if(!(await db.query('SELECT pg_try_advisory_lock(17320914,8) AS ok')).rows[0].ok)throw new SyncError('READOPTION_BUSY');
  try{return await fn();}
  catch(error){
@@ -119,7 +121,6 @@ async function establishBarrier(db:PoolClient,cfg:DeliveryConfig,target:string,r
  await begin(db);await intentLocks(db);
  const run=await load(db,cfg,target,request,true);validSeal(run);
  if(run.state!=='ready')throw new SyncError('READOPTION_TRANSITION_INVALID');
- if((await db.query('SELECT 1 FROM olos_http.corporate_id_admissions WHERE source_key=$1 AND NOT materialized LIMIT 1',[request.source])).rowCount)throw new SyncError('READOPTION_ADMISSIONS_PENDING');
  await assertLocalConsumersCompatible(db,request.source);
  const c=await control(db,cfg,target,run,true),predecessor=await predecessorProof(db,cfg,run,true);
  if(predecessor.digest!==run.predecessor_digest)throw new SyncError('READOPTION_PREDECESSOR_CHANGED');
@@ -160,7 +161,7 @@ async function registerBatch(db:PoolClient,cfg:DeliveryConfig,target:string,requ
    if(row.state==='confirmed'?row.remote_raw_id===null||row.confirmed_at===null:row.remote_raw_id!==null||row.confirmed_at!==null)throw new SyncError('CORPORATE_RECEIPT_CHANGED');
    return deliveryPayload(row,schema.shape,cfg);
   });
-  const reserved=await reserveIds(remote,cfg,batch.map(r=>({source_id:r.source_id,source_hash:r.source_hash,id:r.id})),true);
+  const reserved=await reserveIds(remote,cfg,batch.map(r=>({source_key:request.source,source_id:r.source_id,source_hash:r.source_hash,id:r.id,payload:r.payload,isolated:isolated.has(r.source_id)})),true);
   const eligible=batch.filter(r=>!isolated.has(r.source_id)&&r.state!=='skipped');
   const byId=new Map(rows.map(row=>[row.internal_id_olos!,row]));
   const existing=await matches(remote,eligible.map(r=>byId.get(r.id)!),schema.shape,cfg);

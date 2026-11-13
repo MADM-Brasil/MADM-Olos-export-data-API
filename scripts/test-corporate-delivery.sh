@@ -52,5 +52,5 @@ docker run --rm --network "container:$container" --user "$(id -u):$(id -g)" \
   -e OLOS_DIRECT_TEST_DESTINATION_URL=postgresql://postgres@localhost:5432/madm \
   -e OLOS_DIRECT_TEST_CA_FILE=/certs/ca.crt \
   -e TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/olos_admin_homolog \
-  node:24-bookworm-slim node --import tsx --test --test-concurrency=1 \
-  ${OLOS_DIRECT_TEST_FILES:-test/admin.database.ts test/store.integration.ts test/corporate-delivery.integration.ts test/corporate-recovery.integration.ts}
+  node:24-bookworm-slim node --max-old-space-size=256 --import tsx --test --test-concurrency=1 \
+  ${OLOS_DIRECT_TEST_FILES:-test/admin.database.ts test/store.integration.ts test/corporate-delivery.integration.ts test/corporate-recovery.integration.ts test/corporate-authority.integration.ts test/corporate-authority-flow.integration.ts}

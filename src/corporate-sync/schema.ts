@@ -40,8 +40,9 @@ export async function schema(db: Client, side: 'source' | 'destination', cfg: Co
     const guard = triggers.find(t => t.name === 'trg_olos_calls_reserve_internal_id');
     if (triggers.length !== (allocator && guard ? 2 : 1) ||
         phone?.definition !== expectedTrigger || phone.enabled !== 'O' ||
-        (guard && (!allocator || guard.enabled !== 'A' || guard.definition !==
-          'CREATE TRIGGER trg_olos_calls_reserve_internal_id BEFORE INSERT OR UPDATE OF internal_id_olos ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION olos_delivery_ids.guard_internal_id()'))) {
+        (guard && (!allocator || guard.enabled !== 'A' || ![
+          'CREATE TRIGGER trg_olos_calls_reserve_internal_id BEFORE INSERT OR UPDATE OF internal_id_olos ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION olos_delivery_ids.guard_internal_id()',
+          'CREATE TRIGGER trg_olos_calls_reserve_internal_id BEFORE INSERT OR UPDATE ON raw.olos_calls FOR EACH ROW EXECUTE FUNCTION olos_delivery_ids.guard_internal_id()'].includes(guard.definition)))) {
       throw new SyncError('DESTINATION_TRIGGER_REVIEW_REQUIRED');
     }
 

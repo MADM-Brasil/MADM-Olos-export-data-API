@@ -1,5 +1,7 @@
 # Runbook: readoção do alocador OLOS/MADM
 
+> Documento histórico do contrato v1. Para a candidata v2, seguir [autoridade corporativa v2](authority-v2.md). Os passos de alocação/reversão legacy e materialização durante pausa descritos abaixo não se aplicam à v2. Não combinar os procedimentos.
+
 Somente para execução futura após revisão técnica e aprovação do DBA. Nenhum comando deste runbook foi executado em produção. No `compose.dokploy.yaml` versionado, o processo único de admin/coleta/entrega é o serviço **admin**, com WORKDIR `/app`; o serviço `worker` de `compose.yaml` pertence a outra topologia. Usar o ID exato do container admin da aplicação Dokploy aprovada, sem selecionar um projeto Compose diferente ou criar outro worker. Os endpoints/papéis vinculados permanecem os mesmos. A [decisão técnica](id-allocator-readoption.md) e a [evidência local](../evidence/corporate-id-readoption.json) incluem as limitações atuais da suíte geral/typecheck.
 
 ## 1. Pré-condições e ordem de publicação

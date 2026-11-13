@@ -1,5 +1,7 @@
 # Readoção da autoridade corporativa de IDs
 
+> Documento histórico do contrato v1. Para a candidata v2, seguir [autoridade corporativa v2](authority-v2.md). Os passos de alocação/reversão legacy e materialização durante pausa descritos abaixo não se aplicam à v2. Não combinar os procedimentos.
+
 Implementação local no repositório `exportdata-clone/MADM-Olos-export-data-API`, branch preservado `main`. Não foi acessada produção. O [runbook](id-allocator-readoption-runbook.md) depende de revisão técnica, homologação e aprovação do DBA. [Resultados reproduzíveis](../evidence/corporate-id-readoption.json).
 
 ## Causa e escopo

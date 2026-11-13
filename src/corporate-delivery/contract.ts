@@ -54,6 +54,15 @@ export async function matches(db: Client, rows: Row[], shape: Shape, cfg: Delive
 
 // Keep diagnostic candidate lookup identical to the delivery lookup, including logical matches at other IDs.
 export async function matchCandidates(db: Client, rows: Row[], shape: Shape, cfg: DeliveryConfig) {
+  // Reuse the durable authority marker, even if another writer removed a group
+  // member. Observing a single remaining row does not resolve historical ambiguity.
+  if ((await db.query<{present:boolean}>("SELECT to_regnamespace('olos_delivery_ids') IS NOT NULL AS present")).rows[0]?.present) {
+    try { await db.query('SELECT olos_delivery_ids.assert_unambiguous($1::jsonb)',[JSON.stringify(rows)]); }
+    catch (error) {
+      if (error instanceof Error && 'code' in error && error.code==='P3110') throw new SyncError('AMBIGUOUS_LOGICAL_IDENTITY');
+      throw error;
+    }
+  }
   const p = projection(shape, 'd', false, cfg.connection);
   const declarations = columns.map(name => `${quote(name)} ${shape.get(name)!.type}`).join(',');
   // Identity fields are required/non-null in the mapped payload. Equality permits hash joins.

@@ -4,6 +4,7 @@ import { SyncError } from '../corporate-sync/errors.js';
 import type { Shape } from '../corporate-sync/mapping.js';
 import type { DeliveryConfig } from './config.js';
 import { quarantineMembers } from './quarantine.js';
+import {assertAllocationSchema} from './allocation-policy.js';
 import type { ReadoptionRequest, ReadoptionRecord } from './readoption-contract.js';
 
 interface CorporateControlRow {
@@ -59,6 +60,7 @@ export async function prepareCorporateReadoption(
   let committing = false;
 
   try {
+    await assertAllocationSchema(db);
     await db.query('BEGIN');
 
     // Exclude concurrent homologation and administrative operations.
@@ -153,20 +155,7 @@ export async function prepareCorporateReadoption(
       throw new SyncError('READOPTION_REVERSAL_UNVERIFIED');
     }
 
-    const pending = await db.query<{ exists: boolean }>(
-      `SELECT EXISTS (
-         SELECT 1
-         FROM olos_http.corporate_id_admissions
-         WHERE source_key=$1 AND NOT materialized
-       ) AS exists`,
-      [request.source]
-    );
-
     if (request.requestId===allocator.request_id||request.requestId===reversal.request_id)throw new SyncError('READOPTION_REQUEST_CONFLICT');
-    if (pending.rows[0]?.exists !== false) {
-      throw new SyncError('READOPTION_ADMISSIONS_PENDING');
-    }
-
     await db.query(
       `INSERT INTO olos_http.corporate_allocator_readoptions
        (

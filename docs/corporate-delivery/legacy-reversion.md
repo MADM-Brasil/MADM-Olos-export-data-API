@@ -1,5 +1,7 @@
 # Reversão administrativa da preparação do alocador
 
+> Documento histórico do contrato v1. Para a candidata v2, seguir [autoridade corporativa v2](authority-v2.md). Os passos de alocação/reversão legacy e materialização durante pausa descritos abaixo não se aplicam à v2. Não combinar os procedimentos.
+
 Procedimento emergencial para `allocator=adopting`, `paused=true`, `blocked=true`, `last_code=INTERNAL_ID_COLLISION`, **sem alocador corporativo instalado**. Não é um rollback de um alocador já ativo. Nenhum comando deste documento foi executado em produção nesta implementação.
 
 O estado informado foi 12.270 admissões sem ID, 371 pendentes, 221 quarentenados e 54.390 confirmados. Esses números não foram consultados; novas capturas podem aumentar a fila antes/durante a recuperação. O manifesto inicial e os lotes persistidos registram o conjunto realmente encontrado.

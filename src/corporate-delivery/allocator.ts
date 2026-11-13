@@ -5,8 +5,10 @@ import { SyncError } from '../corporate-sync/errors.js';
 import { connect, rollback } from '../corporate-sync/database.js';
 import { integerValue } from '../corporate-sync/mapping.js';
 import type { DeliveryConfig } from './config.js';
-import { corporateSchema, deliveryPayload } from './contract.js';
+import { corporateSchema, deliveryPayload, matches } from './contract.js';
 import { allocatorContract } from './allocator-contract.js';
+import {assertAllocationSchema} from './allocation-policy.js';
+import {quarantineMembers} from './quarantine.js';
 
 export interface IdAssignment { id: string; token: string | null }
 export function admissionHash(mapped: MappedRecord): string {
@@ -24,10 +26,11 @@ export async function allocatorState(local: PoolClient, cfg: DeliveryConfig, sou
     if (required) throw new SyncError('ALLOCATOR_LOCAL_STATE_MISSING');
     return undefined;
   }
-  // Adoption and reversion drain in-flight admissions before switching mode.
+  // The existing authority fence serializes admission with generation transitions.
   const state = (await local.query<AllocatorStatus>('SELECT * FROM olos_http.corporate_id_allocator WHERE source_key=$1', [source])).rows[0];
   if (required && !state) throw new SyncError('ALLOCATOR_LOCAL_STATE_MISSING');
   if (state && (state.binding !== cfg.binding || state.target_table !== target)) throw new SyncError('CORPORATE_BINDING_CHANGED');
+  if(state&&['adopting','active'].includes(state.state)&&!required)throw new SyncError('ALLOCATOR_LOCAL_STATE_MISSING');
   if(authority?.generation){
     const generation=(await local.query<{request_id:string;state:string;binding:string;target_table:string;previous_adoption_id:string;remote_contract_hash:string;validation_digest:string|null}>(
       'SELECT request_id,state,binding,target_table,previous_adoption_id,remote_contract_hash,validation_digest FROM olos_http.corporate_allocator_readoptions WHERE request_id=$1 AND source_key=$2',[authority.generation,source])).rows[0];
@@ -44,15 +47,15 @@ export async function allocatorState(local: PoolClient, cfg: DeliveryConfig, sou
     if (required || state.contract_hash !== null || state.adopted_at !== null || !proof || proof.binding !== cfg.binding
       || proof.target_table !== target || proof.adoption_request_id !== state.request_id
       || proof.state !== (state.state === 'legacy' ? 'completed' : 'materializing')) throw new SyncError('ALLOCATOR_REVERSION_EVIDENCE_CHANGED');
-    if (state.state === 'legacy' && (await local.query(`SELECT 1 FROM olos_http.corporate_id_admissions
-      WHERE source_key=$1 AND NOT materialized LIMIT 1`, [source])).rowCount) throw new SyncError('ALLOCATOR_REVERSION_INCOMPLETE');
+    // New admissions may wait without IDs after a completed reversion. Its frozen
+    // original membership is still checked by predecessorProof before re-adoption.
     state.reversion_request_id = proof.request_id;
     state.reversion_validated = proof.validated_at !== null;
   }
   return state;
 }
-// A prepared-but-never-adopted allocator can be reverted only while the remote namespace is absent.
-// Read-only proof: uncertain or partially installed remote authority is never discarded automatically.
+// Historical read-only proof. Namespace absence does not authorize new legacy IDs.
+// Uncertain or partially installed remote authority is never discarded automatically.
 export async function assertLegacyRemote(remote: Client): Promise<void> {
   if ((await remote.query(`SELECT to_regnamespace('olos_delivery_ids') IS NOT NULL OR EXISTS(
     SELECT 1 FROM pg_trigger WHERE tgrelid='raw.olos_calls'::regclass AND tgname='trg_olos_calls_reserve_internal_id'
@@ -60,7 +63,7 @@ export async function assertLegacyRemote(remote: Client): Promise<void> {
 }
 export function allocatorError(error: unknown): unknown {
   const codes: Record<string, string> = { P3101: 'ALLOCATOR_INT32_EXHAUSTED', P3102: 'ALLOCATOR_REQUEST_CONFLICT',
-    P3103: 'ALLOCATOR_ID_NOT_OWNED', P3104: 'ALLOCATOR_LEGACY_ID_RESERVED', P3105: 'ALLOCATOR_REGISTRY_DIVERGES', P3106: 'ALLOCATOR_REQUEST_INVALID' };
+    P3103: 'ALLOCATOR_ID_NOT_OWNED', P3104: 'ALLOCATOR_LEGACY_ID_RESERVED', P3105: 'ALLOCATOR_REGISTRY_DIVERGES', P3106: 'ALLOCATOR_REQUEST_INVALID', P3107:'LOGICAL_CALL_AT_DIFFERENT_ID', P3108:'ALLOCATOR_IDENTITY_IMMUTABLE', P3109:'INTERNAL_ID_COLLISION', P3110:'AMBIGUOUS_LOGICAL_IDENTITY' };
   const code = (error as { code?: string } | null)?.code;
   return code && codes[code] ? new SyncError(codes[code]) : error;
 }
@@ -98,6 +101,7 @@ export async function adoptAllocator(local: PoolClient, cfg: DeliveryConfig, sou
   let remote: Client | undefined;
   let committing = false;
   try {
+    if(!prepareOnly)await assertAllocationSchema(local);
     await local.query('BEGIN');
     await local.query('SELECT pg_advisory_xact_lock(17320914,5)');
     const control = (await local.query('SELECT * FROM olos_http.corporate_control WHERE singleton FOR UPDATE')).rows[0];
@@ -125,9 +129,10 @@ export async function adoptAllocator(local: PoolClient, cfg: DeliveryConfig, sou
     const contract = await allocatorContract(remote);
     const schema = await corporateSchema(remote, cfg, false);
     if (schema.hash !== control.schema_hash) throw new SyncError('CORPORATE_SCHEMA_CHANGED');
+    const isolated=new Set((await quarantineMembers(local,cfg,source,target,schema.shape)).map(row=>row.source_id));
     let cursor: string | null = null;
     for (;;) {
-      const rows: { source_id: string; source_hash: string; id: string; target_id: string; payload: Record<string, unknown>; payload_hash: string; outbox_hash: string }[] = (await local.query(`SELECT r.source_id,r.source_hash,r.target_id::text AS id,o.target_id::text,o.payload,o.payload_hash,o.source_hash AS outbox_hash
+      const rows: { source_id: string; source_hash: string; id: string; target_id: string; payload: Record<string, unknown>; payload_hash: string; outbox_hash: string;state:string;remote_raw_id:string|null }[] = (await local.query(`SELECT r.source_id,r.source_hash,r.target_id::text AS id,o.target_id::text,o.payload,o.payload_hash,o.source_hash AS outbox_hash,o.state,o.remote_raw_id::text
         FROM olos_http.records r LEFT JOIN olos_http.corporate_outbox o USING(source_key,source_id)
         WHERE r.source_key=$1 AND r.target_table=$2 AND ($3::bigint IS NULL OR r.target_id>$3)
         ORDER BY r.target_id LIMIT $4`, [source, target, cursor, cfg.connection.batchSize])).rows;
@@ -136,7 +141,10 @@ export async function adoptAllocator(local: PoolClient, cfg: DeliveryConfig, sou
         if (row.id !== row.target_id || row.source_hash !== row.outbox_hash) throw new SyncError('ALLOCATOR_LEGACY_MAPPING_CHANGED');
         deliveryPayload(row, schema.shape, cfg);
       }
-      const reserved = await reserveIds(remote, cfg, rows.map(r => ({ source_id: r.source_id, source_hash: r.source_hash, id: r.id })), true);
+      const eligible=rows.filter(row=>!isolated.has(row.source_id)&&row.state!=='skipped');
+      const found=await matches(remote,eligible.map(row=>deliveryPayload(row,schema.shape,cfg)),schema.shape,cfg);
+      for(const row of eligible)if(row.state==='confirmed'&&found.get(row.id)!==row.remote_raw_id)throw new SyncError('CORPORATE_RECEIPT_CHANGED');
+      const reserved = await reserveIds(remote, cfg, rows.map(r => ({ source_key:source,source_id:r.source_id,source_hash:r.source_hash,id:r.id,payload:r.payload,isolated:isolated.has(r.source_id) })), true);
       const assignments = rows.map((row, i) => {
         const reservation = reserved[i]!;
         if (row.id !== reservation.id) throw new SyncError('ALLOCATOR_RESERVATION_INVALID');
