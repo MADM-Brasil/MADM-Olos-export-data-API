@@ -4,20 +4,25 @@ import {fingerprint} from './read-recovery.js';
 
 export const historicalRead='2523225a-a46d-407a-ad5a-d1ff771e576e';
 export const continuitySource='olos-production';
-const assessment='NO_KNOWN_UNSAFE_CURSOR_OR_UNCONTROLLED_OVERLAP';
+const assessment='UNKNOWN';
 export interface ContinuityConsent {
+  version:2;
   authorizationId:string; parentHash:string; actor:string; evidenceRef:string; evidenceSha256:string;
-  expiresAt:string; acceptedHistoricalGap:true; remoteOperationSettled:true; cursorAssessment:typeof assessment;
+  expiresAt:string; acceptedHistoricalGap:true; remoteOperationSettled:false; cursorAssessment:typeof assessment;
+  acceptedUnknownCursorRisk:true; acceptedUnreconciledOperationRisk:true;
 }
 export function continuityConsent(value:unknown):ContinuityConsent {
   if(!value||typeof value!=='object'||Array.isArray(value))throw new WorkerError('CONTINUITY_CONSENT_INVALID');
   const v=value as Record<string,unknown>;
-  if(Object.keys(v).sort().join(',')!=='acceptedHistoricalGap,actor,authorizationId,cursorAssessment,evidenceRef,evidenceSha256,expiresAt,parentHash,remoteOperationSettled'
+  // Risk acceptance is not proof of cursor safety or reconciliation of the original request.
+  // Legacy attestations must never be silently reinterpreted as this consent.
+  if(Object.keys(v).sort().join(',')!=='acceptedHistoricalGap,acceptedUnknownCursorRisk,acceptedUnreconciledOperationRisk,actor,authorizationId,cursorAssessment,evidenceRef,evidenceSha256,expiresAt,parentHash,remoteOperationSettled,version'
+    ||v.version!==2||v.acceptedUnknownCursorRisk!==true||v.acceptedUnreconciledOperationRisk!==true
     ||!['authorizationId','parentHash','actor','evidenceRef','evidenceSha256'].every(k=>typeof v[k]==='string')
     ||!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(String(v.authorizationId))||!/^\w[\w.@:/-]{0,199}$/.test(String(v.actor))
     ||!/^\w[\w.@:/-]{0,199}$/.test(String(v.evidenceRef))||! /^[a-f0-9]{64}$/.test(String(v.evidenceSha256))
     ||! /^[a-f0-9]{64}$/.test(String(v.parentHash))||typeof v.expiresAt!=='string'||!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(v.expiresAt)
-    ||!Number.isFinite(Date.parse(v.expiresAt))||new Date(v.expiresAt).toISOString()!==v.expiresAt||v.acceptedHistoricalGap!==true||v.remoteOperationSettled!==true||v.cursorAssessment!==assessment)
+    ||!Number.isFinite(Date.parse(v.expiresAt))||new Date(v.expiresAt).toISOString()!==v.expiresAt||v.acceptedHistoricalGap!==true||v.remoteOperationSettled!==false||v.cursorAssessment!==assessment)
     throw new WorkerError('CONTINUITY_CONSENT_INVALID');
   return v as unknown as ContinuityConsent;
 }
