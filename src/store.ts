@@ -59,11 +59,67 @@ export class Store {
     return this.delivery.reconcile(this.db(), this.sequence);
   }
   async unresolved() {
-    return (await this.db().query<Read>("SELECT id,spec,state,response_body,processed_count,request_ms FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at", [this.cfg.sourceKey])).rows;
+    return (await this.db().query<Read>("SELECT id,spec,state,response_body,response_spool_read_id,processed_count,request_ms FROM olos_http.reads WHERE source_key=$1 AND state IN ('reading','received') ORDER BY started_at", [this.cfg.sourceKey])).rows;
   }
+
+  // Continuidade excepcional: preserva as duas leituras históricas.
+  // Qualquer divergência ou nova leitura incerta mantém o bloqueio.
+  async pendingForAdmission() {
+    const pending = await this.unresolved();
+
+    if (
+      process.env.OLOS_HISTORICAL_CONTINUITY_20261112 !==
+        'AUTHORIZE_PRESERVE_TWO_HISTORICAL_READS' ||
+      this.cfg.sourceKey !== 'olos-production'
+    ) return pending;
+
+    const parent = '2523225a-a46d-407a-ad5a-d1ff771e576e';
+    const child = 'd798beaf-4d6f-418a-bb2d-b11ef7e48a15';
+
+    const eligible = (read: typeof pending[number], id: string) => {
+      if (read.id !== id ||
+          read.state !== 'reading' ||
+          read.response_body != null ||
+          (read as typeof read & { response_spool_read_id?: string | null })
+            .response_spool_read_id != null ||
+          Number(read.processed_count) !== 0) return false;
+
+      const spec = read.spec as unknown as Record<string, any>;
+
+      if (id === parent) {
+        return spec.kind === 'current' &&
+          spec.recovery_authorization?.hash ===
+            '86ff1113cb92d62a782e1afb471f12eee133ccb9b3b767ecdf3e2c45b63450d7' &&
+          spec.recovery_authorization?.manifest?.date === '2026-11-12' &&
+          spec.recovery_authorization?.manifest?.mode === 'progressive' &&
+          spec.recovery_authorization?.manifest?.parentId === parent &&
+          spec.recovery_authorization?.manifest?.operation?.quantity === '39150';
+      }
+
+      return spec.kind === 'current' &&
+        spec.capture?.storage === 'spool' &&
+        spec.capture?.binding ===
+          '101d6f0e841a205b6063de58ced9e894e2f2bf8c46143b5def8510fa52b89156' &&
+        spec.continuity?.parent_id === parent &&
+        spec.continuity?.authorization_id ===
+          '5fc270a4-35b1-4469-bc70-9f406d78268b' &&
+        spec.continuity?.historical_gap === true;
+    };
+
+    // A exceção só existe enquanto ambas as evidências coincidirem.
+    if (pending.filter(r => r.id === parent).length !== 1 ||
+        pending.filter(r => r.id === child).length !== 1 ||
+        !eligible(pending.find(r => r.id === parent)!, parent) ||
+        !eligible(pending.find(r => r.id === child)!, child)) {
+      return pending;
+    }
+
+    return pending.filter(r => r.id !== parent && r.id !== child);
+  }
+
   async beginRead(spec: ReadSpec, recovery = false) {
     await this.captureReady();
-    const pending = await this.unresolved();
+    const pending = await this.pendingForAdmission();
     if (pending.some(r => r.state === 'received') || (!recovery && pending.length)) throw new WorkerError('RECOVERY_REQUIRED');
     const id = randomUUID();
     await this.db().query('INSERT INTO olos_http.reads(id,source_key,target_table,spec) VALUES ($1,$2,$3,$4)', [id, this.cfg.sourceKey, this.target, JSON.stringify(spec)]);

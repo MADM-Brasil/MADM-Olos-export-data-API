@@ -41,10 +41,10 @@ export async function createScheduledConsumer(cfg: Config,
   };
   try {
     await prepare();
-    if ((await store.unresolved()).length) {
+    if ((await store.pendingForAdmission()).length) {
       await worker!.initialize();
       log('local_recovery_completed', await store.drain(worker!.cache.value));
-      if ((await store.unresolved()).length) throw new WorkerError('RECONCILIATION_REQUIRED');
+      if ((await store.pendingForAdmission()).length) throw new WorkerError('RECONCILIATION_REQUIRED');
     }
   } catch (error) {
     const disconnected = abort.signal.aborted;
@@ -73,7 +73,7 @@ export async function createScheduledConsumer(cfg: Config,
 
 // Durable responses use the existing drain path; uncertainty is never resolved here.
 async function assertRecoverable(store: Store): Promise<void> {
-  const pending = await store.unresolved();
+  const pending = await store.pendingForAdmission();
   if (pending.some(read => read.state === 'reading')) {
     throw new WorkerError('RECONCILIATION_REQUIRED');
   }

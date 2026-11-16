@@ -112,7 +112,7 @@ export class Worker {
       readFields(spec);
       await this.store.ping();
       await this.store.captureReady();
-      const existing = await this.store.unresolved();
+      const existing = await this.store.pendingForAdmission();
       if (existing.some(r => r.state === 'reading') && !recovery) throw new WorkerError('RECOVERY_REQUIRED');
       await this.initialize();
       const recovered = await this.store.drain(this.cache.value);
