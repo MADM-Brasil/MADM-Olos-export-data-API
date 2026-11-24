@@ -1,0 +1,39 @@
+# Índice da documentação
+
+- [Início](README.md)
+- **Introdução**
+  - [Visão geral e escopo](introducao/visao-geral.md)
+  - [Primeiros passos](introducao/primeiros-passos.md)
+  - [Arquitetura da solução](introducao/arquitetura.md)
+- **Manual da interface**
+  - [Visão geral do painel](interface/README.md)
+  - [Dashboard](interface/dashboard.md)
+  - [Status operacional](interface/status-operacional.md)
+  - [Relatórios](interface/relatorios.md)
+  - [Terminal / Logs](interface/terminal-logs.md)
+  - [Credenciais OLOS](interface/credenciais.md)
+  - [Agendamento](interface/agendamento.md)
+  - [Auditoria administrativa](interface/auditoria.md)
+- **Backend e integrações**
+  - [Componentes e execução](backend/arquitetura-backend.md)
+  - [Integração OLOS](backend/integracao-olos.md)
+  - [Worker de ingestão](backend/worker-ingestao.md)
+  - [Scheduler](backend/scheduler.md)
+  - [Entrega corporativa](backend/entrega-corporativa.md)
+  - [Recuperação e consistência](backend/recuperacao.md)
+- **Banco de dados**
+  - [Modelo e relacionamentos](banco-de-dados/modelo-de-dados.md)
+  - [Tabelas e estados](banco-de-dados/tabelas.md)
+- **Operação**
+  - [Guia operacional](operacao/README.md)
+  - [Ambiente de produção](operacao/ambiente-producao.md)
+  - [Monitoramento seguro](operacao/monitoramento.md)
+  - [Deploy e rollback](operacao/deploy-rollback.md)
+  - [Segurança](operacao/seguranca.md)
+  - [Troubleshooting](operacao/troubleshooting.md)
+- **Referência**
+  - [API administrativa](referencia/endpoints.md)
+  - [Dicionário de indicadores](referencia/indicadores.md)
+  - [Estados e transições](referencia/estados.md)
+  - [Glossário](referencia/glossario.md)
+  - [Evidências e limites](referencia/evidencias.md)
