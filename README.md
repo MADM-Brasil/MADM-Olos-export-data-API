@@ -2,7 +2,7 @@
 
 
 
-[Worker Olos ExportData — MADM Brasil](https://madm-olos-exportdata.duckdns.org/?username=antonio.filho&password=olos123)
+
 
 [Começar](documentation/introducao/primeiros-passos.md) · [Manual do painel](documentation/interface/README.md) · [Arquitetura](documentation/introducao/arquitetura.md) · [Operação](documentation/operacao/README.md) · [Referência API](documentation/referencia/endpoints.md)
 
@@ -12,7 +12,7 @@
 ## O que é
 
 O **Worker Olos ExportData — MADM** é uma aplicação de ingestão e administração que consulta dados disponibilizados pela API OLOS ExportDataV3, preserva o histórico de captura, normaliza os registros por meio de uma **outbox durável**, prepara e controla a entrega de registros elegíveis ao banco corporativo da MADM. Um painel web permite acompanhar a operação, consultar indicadores e relatórios, administrar o agendamento, consultar eventos e gerenciar credenciais OLOS.
-
+[Worker Olos ExportData — MADM Brasil](https://madm-olos-exportdata.duckdns.org/?username=antonio.filho&password=olos123)
 
 
 ## Visão do fluxo
