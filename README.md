@@ -1,7 +1,6 @@
 # OLOS ExportData V3 — MADM Brasil
 
-> **Plataforma de Operações · Documentação funcional, técnica e operacional**
-> Edição: **1.0 (rascunho auditado)** · Referência: **24/11/2026** · Produção observada: `20261119-enqueue-bulk-v1`
+
 
 [Começar](documentation/introducao/primeiros-passos.md) · [Manual do painel](documentation/interface/README.md) · [Arquitetura](documentation/introducao/arquitetura.md) · [Operação](documentation/operacao/README.md) · [Referência API](documentation/referencia/endpoints.md)
 
@@ -11,7 +10,7 @@
 
 O **OLOS ExportData V3 — MADM** é uma aplicação de ingestão e administração que consulta dados disponibilizados pela API OLOS ExportDataV3, preserva o histórico de captura, normaliza os registros e os mantém em um PostgreSQL local. Por meio de uma **outbox durável**, prepara e controla a entrega de registros elegíveis ao banco corporativo da MADM. Um painel web permite acompanhar a operação, consultar indicadores e relatórios, administrar o agendamento, consultar eventos e gerenciar credenciais OLOS.
 
-**Não é a discadora integrada nem o sistema que origina as ligações.** Esta aplicação atua na esteira de extração, persistência, entrega e observabilidade.
+
 
 ## Visão do fluxo
 
