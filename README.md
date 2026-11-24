@@ -11,7 +11,7 @@
 
 ## O que é
 
-O **Worker Olos ExportData — MADM** é uma aplicação de ingestão e administração que consulta dados disponibilizados pela API OLOS ExportDataV3, preserva o histórico de captura, normaliza os registros e os mantém em um PostgreSQL local. Por meio de uma **outbox durável**, prepara e controla a entrega de registros elegíveis ao banco corporativo da MADM. Um painel web permite acompanhar a operação, consultar indicadores e relatórios, administrar o agendamento, consultar eventos e gerenciar credenciais OLOS.
+O **Worker Olos ExportData — MADM** é uma aplicação de ingestão e administração que consulta dados disponibilizados pela API OLOS ExportDataV3, preserva o histórico de captura, normaliza os registros por meio de uma **outbox durável**, prepara e controla a entrega de registros elegíveis ao banco corporativo da MADM. Um painel web permite acompanhar a operação, consultar indicadores e relatórios, administrar o agendamento, consultar eventos e gerenciar credenciais OLOS.
 
 
 
