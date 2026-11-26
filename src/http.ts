@@ -60,6 +60,42 @@ export class HttpTransport {
         return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
       } catch (error) {
         if (error instanceof WorkerError) throw error;
+
+        const err = error as {
+          name?: string;
+          code?: string;
+          cause?: {
+            name?: string;
+            code?: string;
+          };
+        };
+
+        const allowedCodes = new Set([
+          'ETIMEDOUT',
+          'ECONNRESET',
+          'ECONNREFUSED',
+          'EPIPE',
+          'ENETUNREACH',
+          'EHOSTUNREACH',
+          'UND_ERR_SOCKET',
+          'UND_ERR_CONNECT_TIMEOUT',
+          'UND_ERR_HEADERS_TIMEOUT',
+          'UND_ERR_BODY_TIMEOUT'
+        ]);
+
+        const code = err.cause?.code ?? err.code;
+
+        log('olos_http_transport_failure', {
+          error_name:
+            ['AbortError', 'TimeoutError', 'TypeError'].includes(err.name ?? '')
+              ? err.name!
+              : 'UNKNOWN',
+          cause_code:
+            code && allowedCodes.has(code)
+              ? code
+              : 'UNKNOWN'
+        });
+
         throw new WorkerError('NETWORK_OR_RESPONSE_FAILURE', true);
       }
     };

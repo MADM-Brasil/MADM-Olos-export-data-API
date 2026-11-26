@@ -114,7 +114,81 @@ export class Store {
       return pending;
     }
 
-    return pending.filter(r => r.id !== parent && r.id !== child);
+    const remaining = pending.filter(
+      r => r.id !== parent && r.id !== child
+    );
+
+    // Continuidade operacional de 24/11.
+    // A leitura original permanece em 'reading'.
+    if (
+      this.cfg.sourceKey !== 'olos-production' ||
+      process.env.OLOS_CONTINUITY_20261124 !==
+        'AUTHORIZE_PRESERVE_UNCERTAIN_READ_5355A8F9'
+    ) return remaining;
+
+    const failedId = '5355a8f9-aad1-46e3-b753-502f7b2a9a02';
+    const recoveryId = 'f14125be-1cd4-48a4-9b18-093ce17f5ece';
+
+    // Nenhuma outra leitura incerta pode receber a excecao.
+    const failed = remaining.length === 1 ? remaining[0] : undefined;
+
+    if (
+      !failed ||
+      failed.id !== failedId ||
+      failed.state !== 'reading' ||
+      failed.spec.kind !== 'current' ||
+      failed.response_body != null ||
+      (failed as typeof failed & {
+        response_spool_read_id?: string | null
+      }).response_spool_read_id != null ||
+      Number(failed.processed_count) !== 0
+    ) return remaining;
+
+    // Evidencias verificadas no banco a cada admissao.
+    const evidence = await this.db().query(
+      `/* RECOVERY_20261124_ADMISSION_EVIDENCE */
+       SELECT (
+         EXISTS (
+           SELECT 1 FROM olos_http.reads
+           WHERE id=$2 AND source_key=$1 AND target_table=$4
+             AND state='reading'
+             AND error_code='NETWORK_OR_RESPONSE_FAILURE'
+             AND spec::jsonb='{"kind":"current"}'::jsonb
+             AND response_body IS NULL
+             AND response_spool_read_id IS NULL
+             AND processed_count=0
+         )
+         AND EXISTS (
+           SELECT 1 FROM olos_http.reads
+           WHERE id=$3 AND source_key=$1 AND target_table=$4
+             AND state='done'
+             AND processed_count=3885
+             AND received_count=3885
+             AND spec::jsonb=
+               '{"kind":"reread","date":"2026-11-24",
+                  "start":"56178534","end":"56182418"}'::jsonb
+         )
+         AND (
+           SELECT COUNT(DISTINCT source_id)
+           FROM olos_http.records
+           WHERE source_key=$1
+             AND target_table=$4
+             AND source_id >= '56172564'
+             AND source_id <= '56182418'
+             AND source_id ~ '^[0-9]{8}$'
+         )=9855
+         AND NOT EXISTS (
+           SELECT 1 FROM olos_http.reads
+           WHERE source_key=$1 AND state='received'
+         )
+       ) AS ok`,
+      [this.cfg.sourceKey, failedId, recoveryId, this.target]
+    );
+
+    if (evidence.rows[0]?.ok !== true) return remaining;
+
+    // Nao altera nem resolve a leitura original.
+    return [];
   }
 
   async beginRead(spec: ReadSpec, recovery = false) {
@@ -135,14 +209,32 @@ export class Store {
     const authorizedStart = 46671511n;
     const authorizedEnd = 46800030n;
 
-    if (parentId !== authorizedParent ||
-        spec.date !== authorizedDate ||
-        BigInt(spec.start) < authorizedStart ||
-        BigInt(spec.end) > authorizedEnd) {
+    // Recuperacao pontual de 24/11/2026.
+    // Exige autorizacao explicita e nao resolve a leitura original.
+    const recovery20261124 =
+      process.env.OLOS_RECOVERY_20261124 ===
+        'AUTHORIZE_CAPTURE_ONLY_56178534_56182418' &&
+      this.cfg.sourceKey === 'olos-production' &&
+      parentId === '5355a8f9-aad1-46e3-b753-502f7b2a9a02' &&
+      spec.date === '2026-11-24' &&
+      BigInt(spec.start) === 56178534n &&
+      BigInt(spec.end) === 56182418n;
+
+    const legacyRecovery =
+      parentId === authorizedParent &&
+      spec.date === authorizedDate &&
+      BigInt(spec.start) >= authorizedStart &&
+      BigInt(spec.end) <= authorizedEnd;
+
+    if (!legacyRecovery && !recovery20261124) {
       throw new WorkerError('RECOVERY_OUTSIDE_AUTHORIZED_RANGE');
     }
 
-    const pending = await this.unresolved();
+    // Na recuperacao nova, aplica a excecao historica ja validada
+    // por pendingForAdmission(). Qualquer outra pendencia bloqueia.
+    const pending = recovery20261124
+      ? await this.pendingForAdmission()
+      : await this.unresolved();
     const original = pending.find(r => r.id === parentId);
 
     if (!original || original.state !== 'reading' ||

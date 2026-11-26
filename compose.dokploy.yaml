@@ -9,33 +9,39 @@ services:
     volumes:
       - exportdata-postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U olos_app -d olos_exportdata"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U olos_app -d olos_exportdata
       interval: 10s
       timeout: 5s
       retries: 10
     networks:
       - backend
     mem_limit: 1g
-
   admin:
     build:
       context: .
       dockerfile: Dockerfile
     extra_hosts:
-      - "oloschannel.com.br:10.196.234.4"
-      - "ip-172-31-1-161.sa-east-1.compute.internal:15.229.217.74"
+      - oloschannel.com.br:10.196.234.4
+      - ip-172-31-1-161.sa-east-1.compute.internal:15.229.217.74
     env_file:
       - path: /etc/dokploy/private/madm-exportdata/credentials.env
         format: raw
     volumes:
       - /opt/madm-corporate-sync/certs/madm-postgres-ca.pem:/run/secrets/madm-postgres-ca.pem:ro
-    command: ["node", "dist/main.js", "admin"]
+    command:
+      - node
+      - dist/main.js
+      - admin
     restart: unless-stopped
     init: true
     depends_on:
       postgres:
         condition: service_healthy
     environment:
+      HTTP_TIMEOUT_MS: "120000"
+      OLOS_CONTINUITY_20261124: "AUTHORIZE_PRESERVE_UNCERTAIN_READ_5355A8F9"
       NODE_ENV: production
       DATABASE_URL: ${DATABASE_URL:?required}
       OLOS_SOURCE_KEY: olos-production
@@ -62,6 +68,7 @@ services:
     networks:
       - backend
       - dokploy-network
+      - default
     read_only: true
     tmpfs:
       - /tmp
@@ -71,12 +78,23 @@ services:
       - no-new-privileges:true
     stop_grace_period: 10m
     mem_limit: 2g
-    cpus: 1.0
-
+    cpus: 1
+    labels:
+      - traefik.docker.network=dokploy-network
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-web.rule=Host(`madm-olos-exportdata.duckdns.org`)
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-web.entrypoints=web
+      - traefik.http.services.olos-export-data-madmolosexportdataapi-vqrnw6-14-web.loadbalancer.server.port=8080
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-web.service=olos-export-data-madmolosexportdataapi-vqrnw6-14-web
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-web.middlewares=redirect-to-https@file
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-websecure.rule=Host(`madm-olos-exportdata.duckdns.org`)
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-websecure.entrypoints=websecure
+      - traefik.http.services.olos-export-data-madmolosexportdataapi-vqrnw6-14-websecure.loadbalancer.server.port=8080
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-websecure.service=olos-export-data-madmolosexportdataapi-vqrnw6-14-websecure
+      - traefik.http.routers.olos-export-data-madmolosexportdataapi-vqrnw6-14-websecure.tls.certresolver=letsencrypt
+      - traefik.enable=true
 networks:
-  backend:
+  backend: null
   dokploy-network:
     external: true
-
 volumes:
-  exportdata-postgres:
+  exportdata-postgres: null
